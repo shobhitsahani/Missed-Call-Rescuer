@@ -87,6 +87,43 @@ Call state machine:
 - No Promised Commitments: The agent never invents prices or promises appointment bookings, explicitly noting that the business owner will confirm.
 - Conciseness: Responses are constrained to a single sentence under 20 words for fast conversational pacing.
 
+## Owner Notifications
+
+When a callback session completes and its structured summary is generated, Missed-Call Rescuer can push a short, scannable plain-text notification straight to the business owner's mobile phone via Telegram or Discord so the owner doesn't need to keep the dashboard open.
+
+### Supported Providers
+Set `NOTIFY_PROVIDER` in your `.env` to one of `telegram`, `discord`, or `none` (default: `none`).
+
+#### 1. Telegram Bot Setup
+1. Open Telegram and search for `@BotFather`.
+2. Send `/newbot`, choose a name and username, and copy the HTTP API token provided (`TELEGRAM_BOT_TOKEN`).
+3. Start a chat with your new bot by clicking `Start` in Telegram.
+4. Get your Telegram numeric Chat ID:
+   - Message `@userinfobot` or `@RawDataBot` in Telegram, which immediately replies with your `id` (e.g. `123456789`).
+   - Alternatively, visit `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates` in your browser after sending `/start` to your bot.
+5. Set the values in `.env`:
+   ```bash
+   NOTIFY_PROVIDER=telegram
+   TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ_1234567
+   TELEGRAM_CHAT_ID=123456789
+   DASHBOARD_URL=http://localhost:3010
+   ```
+
+#### 2. Discord Webhook Setup
+1. In Discord, go to Server Settings -> Integrations -> Webhooks -> New Webhook.
+2. Select your alert channel and click "Copy Webhook URL".
+3. Set the values in `.env`:
+   ```bash
+   NOTIFY_PROVIDER=discord
+   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1234567890/your_webhook_token
+   DASHBOARD_URL=http://localhost:3010
+   ```
+
+### Reliability & Privacy
+- **Non-blocking guarantee**: Notifications run completely fire-and-forget after summaries are persisted and SSE events are broadcast. A failed notification (network timeout, invalid token, or rate limit) is logged safely and **never** blocks the call, the summary, or the dashboard.
+- **Privacy & Masking**: Customer phone numbers are masked in transit (e.g. `+91 ******1234`) and bot tokens or webhook URLs are never logged or exposed in client responses.
+- **Resend & Test Actions**: Test your connection via "Demo options" -> "Send test notification" in the dashboard, or trigger a manual resend from any call drawer (rate-limited to 1 per 30 seconds per call).
+
 ## Setup
 
 ### Prerequisites

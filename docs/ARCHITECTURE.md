@@ -61,6 +61,8 @@ flowchart TD
   - `GET /api/calls`: Returns calls ordered by start time with parsed `latency` and `usage` JSON.
   - `GET /api/calls/:id`: Returns single call record, dialogue turns, and summary.
   - `GET /api/summaries/:callId`: Returns summary record for a call.
+  - `POST /api/notify/test`: Sends a test notification to the configured owner channel (Telegram or Discord).
+  - `POST /api/calls/:id/notify`: Re-triggers owner notification for a specific call (rate limited to 1 per 30s per call).
   - `GET /api/events`: Server-Sent Events (SSE) stream for real-time dashboard updates.
   - `GET /api/health`: Healthcheck endpoint returning `{ ok: true }`.
 - **WebSocket Upgrade (`/ws`)**:
@@ -134,9 +136,16 @@ flowchart TD
   - `businesses`: Business profile (`id`, `name`, `hours`, `services`, `faqs`, `tone`, `voice`, `language`, `owner_email`).
   - `missed_calls`: Inbound missed calls (`id`, `business_id`, `customer_phone`, `time`, `status`). Status values: `new`, `queued`, `calling`, `done`, `opted_out`.
   - `callback_jobs`: Queue rows (`id`, `missed_call_id`, `attempts`, `schedule`, `state`, `last_error`). Rows are recorded upon simulated missed call, but no background scheduler or worker processes them yet.
-  - `calls`: Call sessions (`id`, `missed_call_id`, `business_id`, `customer_phone`, `start_time`, `end_time`, `end_reason`, `latency_json`, `usage_json`).
+  - `calls`: Call sessions (`id`, `missed_call_id`, `business_id`, `customer_phone`, `start_time`, `end_time`, `end_reason`, `latency_json`, `usage_json`, `notified_at`, `notify_status`, `notify_provider`, `notify_error`).
   - `turns`: Turn history (`id`, `call_id`, `order_idx`, `role`, `text`, `interrupted`, `ts`).
   - `summaries`: Extracted summary linked 1:1 to `calls` (`id`, `call_id`, `reason`, `urgency`, `preferred_time`, `contact_details`, `suggested_action`, `short_summary`, `sentiment`, `raw`).
+
+### 3.6. Owner Notification Service ([`server/notify.ts`](file:///c:/projects/Missed-Call-Rescuer/server/notify.ts))
+- Supported providers: `telegram` (Telegram Bot API `sendMessage`), `discord` (Discord Execute Webhook), or `none` (default).
+- Dispatches immediately after summary persistence and SSE broadcast as a fire-and-forget background task.
+- Plain-text message format containing call outcome, urgency, business name, masked customer phone, structured summary points, and a direct dashboard link (`?call={id}`).
+- Reliability: 5-second HTTP timeout with 1 automatic retry on network errors or 5xx server responses; wraps all errors to never throw or block voice call lifecycle.
+- Privacy & Idempotency: Masks customer phone numbers (middle digits replaced with asterisks), sanitizes bot tokens from logs/responses, and prevents duplicate dispatches.
 
 ---
 
