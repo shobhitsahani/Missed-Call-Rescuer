@@ -3,6 +3,7 @@ import db from './db';
 import * as llm from './llm';
 import * as events from './events';
 import { TtsClient } from './tts';
+import { notifyCallSummary } from './notify';
 
 const sessions = new Map<string, any>();
 
@@ -450,6 +451,23 @@ export async function endSession(session: any, reason: string) {
   sessions.delete(session.id);
   events.broadcast('call_ended', { callId: session.id, summary });
   events.broadcast('summary_ready', { callId: session.id, summary });
+
+  // Fire-and-forget owner notification: send nothing if 0 customer turns, unless opted_out
+  const customerTurns = (session.turns || []).filter((t: any) => t.role === 'customer');
+  const shouldNotify = customerTurns.length > 0 || reason === 'opted_out';
+
+  if (shouldNotify && !session.notificationDispatched) {
+    session.notificationDispatched = true;
+    notifyCallSummary({
+      callId: session.id,
+      businessName: session.business?.name || 'Business',
+      customerPhone: session.customerPhone,
+      endReason: reason,
+      summary,
+    }).catch((err: any) => {
+      console.error('[session] Owner notification dispatch error:', err?.message);
+    });
+  }
 }
 
 export function getSession(id: string) { return sessions.get(id); }
