@@ -94,6 +94,11 @@ export function useDashboardData() {
       load();
     };
 
+    es.addEventListener('call_updated', () => {
+      setSseConnected(true);
+      load();
+    });
+
     es.addEventListener('missed_call', () => {
       setSseConnected(true);
       load();
