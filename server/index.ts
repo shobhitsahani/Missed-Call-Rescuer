@@ -9,9 +9,12 @@ import {
   getActiveProvider,
 } from './notify';
 import cors from 'cors';
-import db from './db';
+import db, { parseServices, parseFaqs, DEFAULT_BIZ } from './db';
 import * as events from './events';
 import * as sessionModule from './session';
+import { ASSEMBLYAI_VOICES, VALID_VOICE_IDS, isValidVoiceId } from '../src/lib/voices';
+import { TtsClient } from './tts';
+import { pcmToWav } from './wav';
 import {
   formatPlainTextTranscript,
   formatJsonTranscript,
@@ -24,9 +27,243 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
 
+function isValidTimezone(tz: string): boolean {
+  if (!tz || typeof tz !== 'string') return false;
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 app.get('/api/business', (_req, res) => {
-  const b = db.prepare('SELECT * FROM businesses LIMIT 1').get();
-  res.json(b);
+  const b = db.prepare('SELECT * FROM businesses LIMIT 1').get() as any;
+  if (!b) return res.status(404).json({ error: 'Business config not found' });
+  res.json({
+    ...b,
+    services: parseServices(b.services),
+    faqs: parseFaqs(b.faqs),
+    timezone: b.timezone || 'Asia/Kolkata',
+    voice: b.voice || 'aai-jane',
+  });
+});
+
+app.get('/api/business/voices', (_req, res) => {
+  res.json({ voices: ASSEMBLYAI_VOICES });
+});
+
+const previewRateLimits = new Map<string, number>();
+
+app.post('/api/business/voice-preview', async (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || 'global';
+  const now = Date.now();
+  const last = previewRateLimits.get(ip) || 0;
+  if (now - last < 1500) {
+    return res.status(429).json({ error: 'Too many preview requests. Please wait a moment.' });
+  }
+  previewRateLimits.set(ip, now);
+
+  const { voiceId } = req.body || {};
+  if (!voiceId || !isValidVoiceId(voiceId)) {
+    return res.status(400).json({ error: 'Invalid voice ID.' });
+  }
+
+  const apiKey = process.env.ASSEMBLYAI_API_KEY || '';
+  if (!apiKey) {
+    return res.status(503).json({ error: 'AssemblyAI API key not configured on server.' });
+  }
+
+  try {
+    const tts = new TtsClient({
+      apiKey,
+      voiceId,
+      sampleRate: 24000,
+      encoding: 'pcm_s16le',
+      language: 'english',
+    });
+
+    const previewText = 'Hi, this is a voice sample from Missed-Call Rescuer.';
+    const chunks: Buffer[] = [];
+
+    for await (const chunk of tts.speak(previewText)) {
+      chunks.push(Buffer.from(chunk));
+    }
+
+    await tts.close().catch(() => {});
+
+    if (chunks.length === 0) {
+      return res.status(502).json({ error: 'No audio returned from voice synthesis.' });
+    }
+
+    const pcmBuffer = Buffer.concat(chunks);
+    const wavBuffer = pcmToWav(pcmBuffer, 24000, 1, 16);
+
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Content-Length', wavBuffer.length);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(wavBuffer);
+  } catch (err: any) {
+    console.error('Voice preview error:', err?.message);
+    return res.status(502).json({ error: err?.message || 'Voice synthesis preview failed.' });
+  }
+});
+
+app.put('/api/business', (req, res) => {
+  const body = req.body;
+  if (!body || typeof body !== 'object') {
+    return res.status(400).json({ error: 'Request body must be a JSON object.' });
+  }
+
+  const errors: Record<string, string> = {};
+
+  // Validate name
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name) {
+    errors.name = 'Business name is required.';
+  } else if (name.length > 100) {
+    errors.name = 'Business name must not exceed 100 characters.';
+  }
+
+  // Validate hours
+  const hours = typeof body.hours === 'string' ? body.hours.trim() : '';
+  if (hours.length > 200) {
+    errors.hours = 'Opening hours must not exceed 200 characters.';
+  }
+
+  // Validate services
+  let services = body.services;
+  if (services === undefined || services === null) {
+    services = [];
+  }
+  if (!Array.isArray(services)) {
+    errors.services = 'Services must be a list of strings.';
+  } else if (services.length > 20) {
+    errors.services = 'At most 20 services are allowed.';
+  } else {
+    for (let i = 0; i < services.length; i++) {
+      const s = typeof services[i] === 'string' ? services[i].trim() : '';
+      if (!s) {
+        errors.services = `Service item #${i + 1} cannot be empty.`;
+        break;
+      }
+      if (s.length > 80) {
+        errors.services = `Service item #${i + 1} exceeds 80 characters.`;
+        break;
+      }
+    }
+  }
+
+  // Validate FAQs
+  let faqs = body.faqs;
+  if (faqs === undefined || faqs === null) {
+    faqs = [];
+  }
+  if (!Array.isArray(faqs)) {
+    errors.faqs = 'FAQs must be a list of question and answer pairs.';
+  } else if (faqs.length > 20) {
+    errors.faqs = 'At most 20 FAQs are allowed.';
+  } else {
+    for (let i = 0; i < faqs.length; i++) {
+      const item = faqs[i];
+      if (!item || typeof item !== 'object') {
+        errors.faqs = `FAQ item #${i + 1} must be an object with question and answer.`;
+        break;
+      }
+      const q = typeof item.question === 'string' ? item.question.trim() : '';
+      const a = typeof item.answer === 'string' ? item.answer.trim() : '';
+      if (!q || !a) {
+        errors.faqs = `FAQ #${i + 1} must have both a question and an answer.`;
+        break;
+      }
+      if (q.length > 120) {
+        errors.faqs = `FAQ #${i + 1} question exceeds 120 characters.`;
+        break;
+      }
+      if (a.length > 250) {
+        errors.faqs = `FAQ #${i + 1} answer exceeds 250 characters.`;
+        break;
+      }
+    }
+  }
+
+  // Validate tone
+  const tone = typeof body.tone === 'string' ? body.tone.trim() : '';
+  if (tone.length > 100) {
+    errors.tone = 'Tone must not exceed 100 characters.';
+  }
+
+  // Validate voice
+  const voice = typeof body.voice === 'string' ? body.voice.trim() : '';
+  if (!voice || !isValidVoiceId(voice)) {
+    errors.voice = 'Please select a valid voice from the available list.';
+  }
+
+  // Validate timezone
+  const timezone = typeof body.timezone === 'string' ? body.timezone.trim() : '';
+  if (!timezone || !isValidTimezone(timezone)) {
+    errors.timezone = 'Please specify a valid IANA timezone (e.g. Asia/Kolkata, America/New_York).';
+  }
+
+  if (Object.keys(errors).length > 0) {
+    return res.status(400).json({ errors });
+  }
+
+  const cleanedServices = (services as string[]).map((s: string) => s.trim());
+  const cleanedFaqs = (faqs as Array<{ question: string; answer: string }>).map((f: { question: string; answer: string }) => ({
+    question: f.question.trim(),
+    answer: f.answer.trim(),
+  }));
+
+  const existingBiz = db.prepare('SELECT id FROM businesses LIMIT 1').get() as any;
+  const bizId = existingBiz?.id || DEFAULT_BIZ.id;
+
+  db.prepare(`UPDATE businesses SET name=?, hours=?, services=?, faqs=?, tone=?, voice=?, timezone=? WHERE id=?`)
+    .run(
+      name,
+      hours,
+      JSON.stringify(cleanedServices),
+      JSON.stringify(cleanedFaqs),
+      tone,
+      voice,
+      timezone,
+      bizId
+    );
+
+  const updated = db.prepare('SELECT * FROM businesses WHERE id=?').get(bizId) as any;
+  return res.json({
+    ...updated,
+    services: cleanedServices,
+    faqs: cleanedFaqs,
+    timezone: updated.timezone || timezone,
+  });
+});
+
+app.post('/api/business/reset', (_req, res) => {
+  const existingBiz = db.prepare('SELECT id FROM businesses LIMIT 1').get() as any;
+  const bizId = existingBiz?.id || DEFAULT_BIZ.id;
+
+  db.prepare(`UPDATE businesses SET name=?, hours=?, services=?, faqs=?, tone=?, voice=?, language=?, timezone=? WHERE id=?`)
+    .run(
+      DEFAULT_BIZ.name,
+      DEFAULT_BIZ.hours,
+      DEFAULT_BIZ.services,
+      DEFAULT_BIZ.faqs,
+      DEFAULT_BIZ.tone,
+      DEFAULT_BIZ.voice,
+      DEFAULT_BIZ.language,
+      DEFAULT_BIZ.timezone,
+      bizId
+    );
+
+  res.json({
+    ok: true,
+    business: {
+      ...DEFAULT_BIZ,
+      services: parseServices(DEFAULT_BIZ.services),
+      faqs: parseFaqs(DEFAULT_BIZ.faqs),
+    },
+  });
 });
 
 app.get('/api/missed-calls', (_req, res) => {

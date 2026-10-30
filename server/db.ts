@@ -94,21 +94,79 @@ ensureColumn('calls', 'notify_status', 'TEXT');
 ensureColumn('calls', 'notify_provider', 'TEXT');
 ensureColumn('calls', 'notify_error', 'TEXT');
 
-const seedBiz = {
+// Business settings columns
+ensureColumn('businesses', 'timezone', 'TEXT');
+
+export const DEFAULT_BIZ = {
   id: 'biz_1',
   name: 'Acme Plumbing',
   hours: 'Mon-Fri 8am-6pm, Sat 9am-1pm',
-  services: 'Emergency plumbing, leak repair, drain cleaning, water heater install',
-  faqs: 'We offer 24/7 emergency service. Free estimates. Licensed and insured.',
+  services: JSON.stringify([
+    'Emergency plumbing',
+    'Leak repair',
+    'Drain cleaning',
+    'Water heater install',
+  ]),
+  faqs: JSON.stringify([
+    { question: 'Do you offer 24/7 emergency service?', answer: 'Yes, we are available 24/7 for urgent plumbing emergencies.' },
+    { question: 'Do you provide free estimates?', answer: 'Yes, we offer free written estimates before any work begins.' },
+    { question: 'Are you licensed and insured?', answer: 'Yes, all our plumbers are fully licensed and insured.' },
+  ]),
   tone: 'friendly, professional, concise',
-  voice: 'en-US',
+  voice: 'aai-jane',
   language: 'en',
+  timezone: 'Asia/Kolkata',
   owner_email: 'owner@acmeplumbing.example',
 };
-const exists = db.prepare('SELECT id FROM businesses WHERE id=?').get(seedBiz.id);
-if (!exists) {
-  db.prepare(`INSERT INTO businesses (id,name,hours,services,faqs,tone,voice,language,owner_email) VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(seedBiz.id, seedBiz.name, seedBiz.hours, seedBiz.services, seedBiz.faqs, seedBiz.tone, seedBiz.voice, seedBiz.language, seedBiz.owner_email);
+
+export function parseServices(raw: any): string[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.map(s => String(s).trim()).filter(Boolean);
+  } catch {}
+  return String(raw).split(',').map(s => s.trim()).filter(Boolean);
+}
+
+export function parseFaqs(raw: any): Array<{ question: string; answer: string }> {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.filter(item => item && typeof item === 'object').map(item => ({
+        question: String(item.question || '').trim(),
+        answer: String(item.answer || '').trim(),
+      }));
+    }
+  } catch {}
+  return [{ question: 'General inquiry', answer: String(raw).trim() }];
+}
+
+const existingBiz = db.prepare('SELECT * FROM businesses WHERE id=?').get(DEFAULT_BIZ.id) as any;
+if (!existingBiz) {
+  db.prepare(`INSERT INTO businesses (id,name,hours,services,faqs,tone,voice,language,timezone,owner_email) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(
+      DEFAULT_BIZ.id,
+      DEFAULT_BIZ.name,
+      DEFAULT_BIZ.hours,
+      DEFAULT_BIZ.services,
+      DEFAULT_BIZ.faqs,
+      DEFAULT_BIZ.tone,
+      DEFAULT_BIZ.voice,
+      DEFAULT_BIZ.language,
+      DEFAULT_BIZ.timezone,
+      DEFAULT_BIZ.owner_email
+    );
+} else {
+  // Normalize legacy voice or missing timezone if needed
+  if (!existingBiz.voice || existingBiz.voice === 'en-US') {
+    db.prepare('UPDATE businesses SET voice=? WHERE id=?').run('aai-jane', DEFAULT_BIZ.id);
+  }
+  if (!existingBiz.timezone) {
+    db.prepare('UPDATE businesses SET timezone=? WHERE id=?').run('Asia/Kolkata', DEFAULT_BIZ.id);
+  }
 }
 
 export default db;
