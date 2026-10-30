@@ -5,6 +5,8 @@ import {
   NotifyPayload,
   getActiveProvider,
   notifyCallSummary,
+  sendTestNotification,
+  resendCallNotification,
 } from '../server/notify';
 import db from '../server/db';
 
@@ -212,6 +214,28 @@ async function runSafetyTests() {
 
   // Clean up test records
   db.prepare('DELETE FROM calls WHERE id IN (?, ?)').run(testCallId, failCallId);
+
+  // Test I: sendTestNotification behavior
+  process.env.NOTIFY_PROVIDER = 'none';
+  const testNone = await sendTestNotification();
+  assert(!testNone.ok && testNone.error?.includes('none'), 'sendTestNotification returns error when provider is none');
+
+  process.env.NOTIFY_PROVIDER = 'telegram';
+  process.env.TELEGRAM_BOT_TOKEN = 'test_token';
+  process.env.TELEGRAM_CHAT_ID = 'test_chat';
+  const testTg = await sendTestNotification();
+  assert(!testTg.ok, 'sendTestNotification fails gracefully with mock credentials');
+  assert(!testTg.error?.includes('test_token'), 'sendTestNotification redacts token in error output');
+
+  // Test J: resendCallNotification behavior
+  process.env.NOTIFY_PROVIDER = 'none';
+  const resendNone = await resendCallNotification('non_existent_call');
+  assert(!resendNone.ok && resendNone.error?.includes('none'), 'resend fails when provider is none');
+
+  process.env.NOTIFY_PROVIDER = 'telegram';
+  const resendNotFound = await resendCallNotification('non_existent_call');
+  assert(!resendNotFound.ok && resendNotFound.error?.includes('Call not found'), 'resend returns not found for missing call');
+  console.log('✓ sendTestNotification and resendCallNotification tests passed');
 
   // Restore env
   process.env.NOTIFY_PROVIDER = 'none';
