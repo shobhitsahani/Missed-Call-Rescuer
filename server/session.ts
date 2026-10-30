@@ -1,0 +1,457 @@
+import { v4 as uuidv4 } from 'uuid';
+import db from './db';
+import * as llm from './llm';
+import * as events from './events';
+import { TtsClient } from './tts';
+
+const sessions = new Map<string, any>();
+
+const OPT_OUT_PHRASES = ['stop calling', 'do not call', "don't call", 'remove me', 'opt out', 'opt-out', 'no more calls', 'leave me alone'];
+const WRONG_NUMBER = ['wrong number', 'not the right person', 'you have the wrong'];
+
+function getBusinessRow() {
+  return db.prepare('SELECT * FROM businesses LIMIT 1').get();
+}
+
+function rowToBiz(r: any) {
+  return { id: r.id, name: r.name, hours: r.hours, services: r.services, faqs: r.faqs, tone: r.tone, voice: r.voice, language: r.language, owner_email: r.owner_email };
+}
+
+function detectOptOut(text: string) {
+  const t = (text || '').toLowerCase();
+  return OPT_OUT_PHRASES.some(p => t.includes(p));
+}
+function detectWrongNumber(text: string) {
+  const t = (text || '').toLowerCase();
+  return WRONG_NUMBER.some(p => t.includes(p));
+}
+
+const FIRST_CHUNK_MIN_WORDS = parseInt(process.env.FIRST_CHUNK_MIN_WORDS || '6', 10);
+
+function extractNextChunk(buf: string, isFirst: boolean): { chunk: string; remaining: string } | null {
+  if (isFirst) {
+    // 1. Look for comma or clause boundary or sentence end: , ; : — -- . ! ?
+    const puncMatch = buf.match(/^([\s\S]*?([,;:!?]|—|--))(\s+|$)/);
+    // 2. Look for at least FIRST_CHUNK_MIN_WORDS words followed by whitespace
+    const wordsRegex = new RegExp(`^(\\s*(?:\\S+\\s+){${Math.max(1, FIRST_CHUNK_MIN_WORDS - 1)}}\\S+)\\s+`);
+    const wordsMatch = buf.match(wordsRegex);
+
+    if (puncMatch && wordsMatch) {
+      if (puncMatch[1].length <= wordsMatch[1].length) {
+        return {
+          chunk: puncMatch[1].trim(),
+          remaining: buf.slice(puncMatch[0].length),
+        };
+      } else {
+        return {
+          chunk: wordsMatch[1].trim(),
+          remaining: buf.slice(wordsMatch[0].length),
+        };
+      }
+    } else if (puncMatch) {
+      return {
+        chunk: puncMatch[1].trim(),
+        remaining: buf.slice(puncMatch[0].length),
+      };
+    } else if (wordsMatch) {
+      return {
+        chunk: wordsMatch[1].trim(),
+        remaining: buf.slice(wordsMatch[0].length),
+      };
+    }
+    return null;
+  } else {
+    // Standard sentence boundary: sentence ending in . ! ? followed by whitespace or end
+    const sentenceMatch = buf.match(/^([\s\S]*?[.!?]+)(\s+|$)/);
+    if (sentenceMatch) {
+      return {
+        chunk: sentenceMatch[1].trim(),
+        remaining: buf.slice(sentenceMatch[0].length),
+      };
+    }
+    return null;
+  }
+}
+
+function send(session: any, msg: any) {
+  if (session.ws && session.ws.readyState === 1) {
+    try { session.ws.send(JSON.stringify(msg)); } catch (e) {}
+  }
+}
+
+function sendBinary(session: any, data: Uint8Array) {
+  if (session.ws && session.ws.readyState === 1) {
+    try { session.ws.send(data, { binary: true }); } catch (e) {}
+  }
+}
+
+function setState(session: any, state: string) {
+  session.state = state;
+  send(session, { type: 'state', state });
+}
+
+function addTurn(session: any, role: string, text: string, interrupted = false, deferDb = false) {
+  session.turnOrder += 1;
+  const orderIdx = session.turnOrder;
+  const turnId = uuidv4();
+  const ts = new Date().toISOString();
+  session.turns.push({ role, text, interrupted });
+
+  const persist = () => {
+    try {
+      db.prepare('INSERT INTO turns (id, call_id, order_idx, role, text, interrupted, ts) VALUES (?,?,?,?,?,?,?)')
+        .run(turnId, session.id, orderIdx, role, text, interrupted ? 1 : 0, ts);
+    } catch (e: any) {
+      console.error('Failed to insert turn:', e?.message);
+    }
+  };
+
+  if (deferDb) {
+    setImmediate(persist);
+  } else {
+    persist();
+  }
+}
+
+async function speakSentence(
+  session: any,
+  sentence: string,
+  onFirstAudio?: () => void,
+  onGenerateSent?: () => void
+): Promise<boolean> {
+  if (session.ended || session.cancelGeneration) return false;
+  send(session, { type: 'agent_text', text: sentence });
+  session.usage.ttsChars += sentence.length;
+
+  const trySpeak = async (): Promise<boolean> => {
+    let firstChunk = true;
+    for await (const chunk of session.tts.speak(sentence, onGenerateSent)) {
+      if (session.cancelGeneration || session.ended) {
+        try { session.tts.cancel(); } catch {}
+        return true; // cancelled, not a failure
+      }
+      if (firstChunk) {
+        firstChunk = false;
+        if (onFirstAudio) onFirstAudio();
+      }
+      sendBinary(session, chunk);
+    }
+    return true;
+  };
+
+  try {
+    return await trySpeak();
+  } catch (err: any) {
+    if (session.cancelGeneration || session.ended) return true;
+    console.error('TTS error:', err?.message);
+    // retry once
+    try {
+      await session.tts.connectWithRetry();
+      return await trySpeak();
+    } catch (err2: any) {
+      console.error('TTS retry failed:', err2?.message);
+      send(session, { type: 'error', message: 'Voice synthesis failed. Ending call.' });
+      await endSession(session, 'error');
+      return false;
+    }
+  }
+}
+
+export async function startSession(ws: any, missedCallId?: string) {
+  const missed: any = missedCallId ? db.prepare('SELECT * FROM missed_calls WHERE id=?').get(missedCallId) : null;
+  const business = rowToBiz(getBusinessRow());
+  const callId = uuidv4();
+  const customerPhone = missed ? missed.customer_phone : 'unknown';
+  const businessId = missed ? missed.business_id : business.id;
+  db.prepare('INSERT INTO calls (id, missed_call_id, business_id, customer_phone, start_time) VALUES (?,?,?,?,?)')
+    .run(callId, missed ? missed.id : null, businessId, customerPhone, new Date().toISOString());
+  if (missed) {
+    db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run('calling', missed.id);
+  }
+
+  const voiceId = process.env.ASSEMBLYAI_VOICE_ID || 'aai-jane';
+  const apiKey = process.env.ASSEMBLYAI_API_KEY || '';
+  const tts = new TtsClient({ apiKey, voiceId, sampleRate: 24000, encoding: 'pcm_s16le', language: 'english' });
+
+  const session: any = {
+    id: callId,
+    ws,
+    business,
+    missedCallId: missed ? missed.id : null,
+    customerPhone,
+    state: 'GREETING',
+    turns: [],
+    turnOrder: 0,
+    generating: false,
+    cancelGeneration: false,
+    abortController: null,
+    ended: false,
+    startedAt: Date.now(),
+    latencies: [],
+    usage: { ttsChars: 0, sttSeconds: 0, llmTokens: 0 },
+    silenceTimer: null,
+    maxTimer: null,
+    tts,
+    keepAliveTimer: null,
+    ttsFailed: false,
+  };
+  sessions.set(callId, session);
+
+  // connect TTS
+  try {
+    await tts.connectWithRetry();
+  } catch (err: any) {
+    console.error('TTS connect failed:', err?.message);
+    try { ws.send(JSON.stringify({ type: 'error', message: 'Voice service unavailable.' })); } catch {}
+    await endSession(session, 'error');
+    return session;
+  }
+
+  session.maxTimer = setTimeout(() => endSession(session, 'timeout'), 5 * 60 * 1000);
+  session.keepAliveTimer = setInterval(() => {
+    if (!session.ended) {
+      try { session.tts.keepAlive(); } catch {}
+    }
+  }, 30000);
+
+  setState(session, 'GREETING');
+  const greeting = `Hi, this is an automated assistant calling on behalf of ${business.name}. We noticed we missed your call earlier. Is now a good time to chat?`;
+  session.state = 'SPEAKING';
+  send(session, { type: 'state', state: 'SPEAKING' });
+  const ok = await speakSentence(session, greeting, () => {});
+  if (!ok || session.ended) return session;
+  addTurn(session, 'agent', greeting, false);
+  if (!session.ended) {
+    setState(session, 'LISTENING');
+  }
+  return session;
+}
+
+export async function handleCustomerUtterance(session: any, text: string) {
+  if (session.ended) return;
+  text = (text || '').trim();
+  if (!text) return;
+  if (session.generating) {
+    // drop overlapping utterances to avoid garbled turns
+    return;
+  }
+
+  const t_turn_end = Date.now();
+
+  if (detectOptOut(text)) {
+    addTurn(session, 'customer', text, false);
+    const reply = "I understand. I'll make sure we stop calling. Sorry for the inconvenience. Goodbye.";
+    session.state = 'SPEAKING';
+    send(session, { type: 'state', state: 'SPEAKING' });
+    await speakSentence(session, reply, () => {});
+    addTurn(session, 'agent', reply, false);
+    setTimeout(() => endSession(session, 'opted_out'), 1500);
+    return;
+  }
+  if (detectWrongNumber(text)) {
+    addTurn(session, 'customer', text, false);
+    const reply = "I'm sorry about that. I'll update our records. Have a good day. Goodbye.";
+    session.state = 'SPEAKING';
+    send(session, { type: 'state', state: 'SPEAKING' });
+    await speakSentence(session, reply, () => {});
+    addTurn(session, 'agent', reply, false);
+    setTimeout(() => endSession(session, 'wrong_number'), 1500);
+    return;
+  }
+
+  // Add turn in memory immediately, defer SQLite DB write off critical path
+  addTurn(session, 'customer', text, false, true);
+
+  setState(session, 'THINKING');
+  session.generating = true;
+  session.cancelGeneration = false;
+  const controller = new AbortController();
+  session.abortController = controller;
+
+  let firstAudioSent = false;
+  let t_llm_first_token: number | null = null;
+  let t_tts_generate_sent: number | null = null;
+  let t_tts_first_audio: number | null = null;
+
+  const markFirstAudio = () => {
+    if (firstAudioSent || session.cancelGeneration) return;
+    firstAudioSent = true;
+    t_tts_first_audio = Date.now();
+    const llmFirstTokenMs = t_llm_first_token !== null ? t_llm_first_token - t_turn_end : null;
+    const ttsFirstAudioMs = (t_tts_generate_sent !== null && t_tts_first_audio !== null) ? t_tts_first_audio - t_tts_generate_sent : null;
+    const totalMs = t_tts_first_audio - t_turn_end;
+
+    session.latencies.push({ totalMs, llmFirstTokenMs, ttsFirstAudioMs });
+    send(session, {
+      type: 'metrics',
+      totalMs,
+      llmFirstTokenMs,
+      ttsFirstAudioMs,
+      timeToFirstAudio: totalMs,
+    });
+    console.log(`[turn] llm_first_token=${llmFirstTokenMs ?? '-'}ms tts_first_audio=${ttsFirstAudioMs ?? '-'}ms total=${totalMs}ms`);
+  };
+
+  const messages = session.turns
+    .filter((t: any) => t.role === 'customer' || t.role === 'agent')
+    .map((t: any) => ({ role: t.role === 'agent' ? 'assistant' : 'user', content: t.text }));
+
+  // chunk queue consumer
+  const chunkQueue: string[] = [];
+  let llmDone = false;
+  let buffer = '';
+  let fullReply = '';
+
+  const llmPromise = (async () => {
+    let isFirstChunk = true;
+    try {
+      await llm.streamChat(messages, session.business, (delta: string) => {
+        if (session.cancelGeneration) return;
+        if (t_llm_first_token === null) t_llm_first_token = Date.now();
+        buffer += delta;
+        fullReply += delta;
+
+        let res;
+        while ((res = extractNextChunk(buffer, isFirstChunk))) {
+          buffer = res.remaining;
+          if (res.chunk) {
+            chunkQueue.push(res.chunk);
+            isFirstChunk = false;
+          }
+        }
+      }, controller.signal);
+    } catch (e: any) {
+      if (!session.cancelGeneration) console.error('LLM error:', e?.message);
+    } finally {
+      const rest = buffer.trim();
+      if (rest && !session.cancelGeneration) {
+        chunkQueue.push(rest);
+      }
+      llmDone = true;
+    }
+  })();
+
+  // consumer
+  let isFirstConsumerChunk = true;
+  while (!session.ended && !session.cancelGeneration) {
+    if (chunkQueue.length === 0) {
+      if (llmDone) break;
+      await new Promise((r) => setTimeout(r, 15));
+      continue;
+    }
+    const chunk = chunkQueue.shift()!;
+    session.state = 'SPEAKING';
+    send(session, { type: 'state', state: 'SPEAKING' });
+
+    const onGenSent = isFirstConsumerChunk ? () => {
+      if (t_tts_generate_sent === null) t_tts_generate_sent = Date.now();
+    } : undefined;
+
+    const ok = await speakSentence(session, chunk, markFirstAudio, onGenSent);
+    isFirstConsumerChunk = false;
+    if (!ok || session.ended || session.cancelGeneration) break;
+  }
+
+  // wait for llm to finish (if not cancelled)
+  if (!session.cancelGeneration) {
+    try { await llmPromise; } catch {}
+  } else {
+    controller.abort();
+  }
+
+  session.generating = false;
+  session.abortController = null;
+
+  if (session.cancelGeneration) {
+    // barge-in: discard
+    return;
+  }
+
+  if (!session.ended) {
+    // record agent turn
+    const finalText = fullReply.trim();
+    if (finalText) addTurn(session, 'agent', finalText, false);
+    setState(session, 'LISTENING');
+  }
+}
+
+export function bargeIn(session: any) {
+  if (session.ended) return;
+  session.cancelGeneration = true;
+  session.generating = false;
+  if (session.abortController) {
+    try { session.abortController.abort(); } catch {}
+  }
+  try { session.tts.cancel(); } catch {}
+  const row = db.prepare('SELECT id FROM turns WHERE call_id=? AND role=? ORDER BY order_idx DESC LIMIT 1').get(session.id, 'agent');
+  if (row) db.prepare('UPDATE turns SET interrupted=1 WHERE id=?').run((row as any).id);
+  const last = session.turns.slice().reverse().find((t: any) => t.role === 'agent');
+  if (last) last.interrupted = true;
+  send(session, { type: 'stop_audio' });
+  setState(session, 'LISTENING');
+}
+
+export async function endSession(session: any, reason: string) {
+  if (session.ended) return;
+  session.ended = true;
+  if (session.silenceTimer) clearTimeout(session.silenceTimer);
+  if (session.maxTimer) clearTimeout(session.maxTimer);
+  if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
+  session.cancelGeneration = true;
+  session.generating = false;
+  if (session.abortController) {
+    try { session.abortController.abort(); } catch {}
+  }
+
+  setState(session, 'ENDING');
+  db.prepare('UPDATE calls SET end_time=?, end_reason=?, latency_json=?, usage_json=? WHERE id=?')
+    .run(new Date().toISOString(), reason, JSON.stringify(session.latencies), JSON.stringify(session.usage), session.id);
+  if (session.missedCallId) {
+    const status = reason === 'opted_out' ? 'opted_out' : 'done';
+    db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run(status, session.missedCallId);
+  }
+
+  setState(session, 'SUMMARIZING');
+  const transcript = session.turns.map((t: any) => `${t.role === 'agent' ? 'Agent' : 'Customer'}: ${t.text}`).join('\n');
+  const { parsed, raw } = await llm.summarize(transcript, session.business);
+  const summaryId = uuidv4();
+  const s = parsed || {};
+  db.prepare(`INSERT INTO summaries (id, call_id, reason, urgency, preferred_time, contact_details, suggested_action, short_summary, sentiment, raw) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(summaryId, session.id,
+      s.reason || 'not specified',
+      s.urgency || 'medium',
+      s.preferred_time || 'not specified',
+      s.contact_details || 'not provided',
+      s.suggested_action || 'Follow up with customer',
+      s.short_summary || transcript.slice(0, 120),
+      s.sentiment || 'neutral',
+      raw);
+  const summary = {
+    id: summaryId,
+    callId: session.id,
+    reason: s.reason || 'not specified',
+    urgency: s.urgency || 'medium',
+    preferred_time: s.preferred_time || 'not specified',
+    contact_details: s.contact_details || 'not provided',
+    suggested_action: s.suggested_action || 'Follow up with customer',
+    short_summary: s.short_summary || '',
+    sentiment: s.sentiment || 'neutral',
+  };
+
+  // close TTS
+  try { await session.tts.close(); } catch {}
+
+  setState(session, 'DONE');
+  send(session, { type: 'summary', summary });
+  setTimeout(() => {
+    try { session.ws.close(); } catch (e) {}
+  }, 500);
+
+  sessions.delete(session.id);
+  events.broadcast('call_ended', { callId: session.id, summary });
+  events.broadcast('summary_ready', { callId: session.id, summary });
+}
+
+export function getSession(id: string) { return sessions.get(id); }
+
+export function getBusiness() { return rowToBiz(getBusinessRow()); }
