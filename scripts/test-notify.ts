@@ -218,7 +218,7 @@ async function runSafetyTests() {
   // Test I: sendTestNotification behavior
   process.env.NOTIFY_PROVIDER = 'none';
   const testNone = await sendTestNotification();
-  assert(!testNone.ok && testNone.error?.includes('none'), 'sendTestNotification returns error when provider is none');
+  assert(!testNone.ok && Boolean(testNone.error?.includes('none')), 'sendTestNotification returns error when provider is none');
 
   process.env.NOTIFY_PROVIDER = 'telegram';
   process.env.TELEGRAM_BOT_TOKEN = 'test_token';
@@ -230,11 +230,11 @@ async function runSafetyTests() {
   // Test J: resendCallNotification behavior
   process.env.NOTIFY_PROVIDER = 'none';
   const resendNone = await resendCallNotification('non_existent_call');
-  assert(!resendNone.ok && resendNone.error?.includes('none'), 'resend fails when provider is none');
+  assert(!resendNone.ok && Boolean(resendNone.error?.includes('none')), 'resend fails when provider is none');
 
   process.env.NOTIFY_PROVIDER = 'telegram';
   const resendNotFound = await resendCallNotification('non_existent_call');
-  assert(!resendNotFound.ok && resendNotFound.error?.includes('Call not found'), 'resend returns not found for missing call');
+  assert(!resendNotFound.ok && Boolean(resendNotFound.error?.includes('Call not found')), 'resend returns not found for missing call');
   console.log('✓ sendTestNotification and resendCallNotification tests passed');
 
   // Restore env
