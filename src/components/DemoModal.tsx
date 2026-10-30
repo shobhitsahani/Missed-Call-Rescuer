@@ -1,12 +1,46 @@
 'use client';
 
+import { useState } from 'react';
+import { API_BASE } from '@/lib/api';
+
 interface DemoModalProps {
   isOpen: boolean;
   onClose: () => void;
 }
 
 export function DemoModal({ isOpen, onClose }: DemoModalProps) {
+  const [testingNotify, setTestingNotify] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+
   if (!isOpen) return null;
+
+  const handleSendTestNotification = async () => {
+    setTestingNotify(true);
+    setTestResult(null);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/notify/test`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setTestResult({
+          ok: false,
+          message: data?.error || `Failed to send test notification (HTTP ${res.status})`,
+        });
+      } else {
+        setTestResult({
+          ok: true,
+          message: `Success! Test alert sent via ${data.provider}. Check your phone.`,
+        });
+      }
+    } catch (err: any) {
+      setTestResult({
+        ok: false,
+        message: err?.message || 'Network error sending test notification',
+      });
+    } finally {
+      setTestingNotify(false);
+    }
+  };
 
   return (
     <div
@@ -32,7 +66,45 @@ export function DemoModal({ isOpen, onClose }: DemoModalProps) {
           </button>
         </div>
 
-        <div className="space-y-3 text-xs text-slate-300">
+        <div className="space-y-4 text-xs text-slate-300">
+          {/* Owner Notifications Section */}
+          <div className="rounded-lg bg-slate-900/60 border border-slate-800/80 p-3.5 space-y-3">
+            <div>
+              <p className="font-semibold text-white text-xs">Owner Notification Alert</p>
+              <p className="text-[11px] text-slate-400 mt-0.5">
+                Test the phone push notification flow to Telegram or Discord configured in <code className="bg-slate-850 px-1 py-0.5 rounded font-mono">.env</code>.
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleSendTestNotification}
+              disabled={testingNotify}
+              className="inline-flex items-center justify-center gap-2 px-3.5 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-500 text-white font-medium text-xs transition-colors disabled:opacity-50"
+            >
+              {testingNotify ? (
+                <>
+                  <span className="h-3 w-3 rounded-full border-2 border-white/30 border-t-white animate-spin" />
+                  <span>Sending alert...</span>
+                </>
+              ) : (
+                <span>Send test notification</span>
+              )}
+            </button>
+
+            {testResult && (
+              <div
+                className={`p-2.5 rounded-lg text-xs leading-normal border ${
+                  testResult.ok
+                    ? 'bg-teal-950/40 border-teal-800/50 text-teal-200'
+                    : 'bg-rose-950/40 border-rose-800/50 text-rose-200'
+                }`}
+              >
+                {testResult.message}
+              </div>
+            )}
+          </div>
+
           <p>
             You can generate incoming missed calls and live AI voice callback sessions using the primary{' '}
             <strong className="text-teal-300">&ldquo;Simulate missed call&rdquo;</strong> action.
