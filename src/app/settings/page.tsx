@@ -117,14 +117,37 @@ export default function SettingsPage() {
   const exampleMismatch = checkExampleMismatch(name, services, faqs, hours);
 
   // Voice preview state
+  const [loadingVoiceId, setLoadingVoiceId] = useState<string | null>(null);
   const [previewingVoiceId, setPreviewingVoiceId] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [cooldownVoiceId, setCooldownVoiceId] = useState<string | null>(null);
   const [cooldownSeconds, setCooldownSeconds] = useState(0);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const previewAbortRef = useRef<AbortController | null>(null);
+  const blobUrlCacheRef = useRef<Map<string, string>>(new Map());
   const cooldownTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  const startVoiceCooldown = (voiceId: string, durationSec = 5) => {
+  useEffect(() => {
+    return () => {
+      if (previewAbortRef.current) {
+        previewAbortRef.current.abort();
+        previewAbortRef.current = null;
+      }
+      if (activeAudioRef.current) {
+        activeAudioRef.current.pause();
+        activeAudioRef.current = null;
+      }
+      blobUrlCacheRef.current.forEach((url) => {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {}
+      });
+      blobUrlCacheRef.current.clear();
+      if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
+    };
+  }, []);
+
+  const startVoiceCooldown = (voiceId: string, durationSec = 3) => {
     setCooldownVoiceId(voiceId);
     setCooldownSeconds(durationSec);
     if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
@@ -388,49 +411,83 @@ export default function SettingsPage() {
   };
 
   const handlePreviewVoice = async (targetVoiceId: string) => {
+    // If clicking on currently playing or loading voice, stop/abort it
+    if (previewingVoiceId === targetVoiceId || loadingVoiceId === targetVoiceId) {
+      if (previewAbortRef.current) {
+        previewAbortRef.current.abort();
+        previewAbortRef.current = null;
+      }
+      if (activeAudioRef.current) {
+        activeAudioRef.current.pause();
+        activeAudioRef.current = null;
+      }
+      setLoadingVoiceId(null);
+      setPreviewingVoiceId(null);
+      startVoiceCooldown(targetVoiceId, 3);
+      return;
+    }
+
     if (cooldownVoiceId === targetVoiceId && cooldownSeconds > 0) {
       toast.error(`Please wait ${cooldownSeconds}s before previewing this voice again.`);
       return;
     }
 
-    if (previewingVoiceId) {
-      if (activeAudioRef.current) {
-        activeAudioRef.current.pause();
-        activeAudioRef.current = null;
-      }
-      if (previewingVoiceId === targetVoiceId) {
-        setPreviewingVoiceId(null);
-        startVoiceCooldown(targetVoiceId, 5);
-        return;
-      }
+    // Stop any existing playback or in-flight preview request
+    if (previewAbortRef.current) {
+      previewAbortRef.current.abort();
+      previewAbortRef.current = null;
     }
+    if (activeAudioRef.current) {
+      activeAudioRef.current.pause();
+      activeAudioRef.current = null;
+    }
+    setLoadingVoiceId(null);
+    setPreviewingVoiceId(null);
 
-    setPreviewingVoiceId(targetVoiceId);
+    const controller = new AbortController();
+    previewAbortRef.current = controller;
+
+    // 10 second client timeout
+    const timeoutTimer = setTimeout(() => {
+      controller.abort(new Error('TIMEOUT'));
+    }, 10000);
+
+    setLoadingVoiceId(targetVoiceId);
     setPreviewError(null);
 
     try {
-      const res = await fetch(`${API_BASE}/api/business/voice-preview`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ voiceId: targetVoiceId }),
-      });
+      let audioUrl = blobUrlCacheRef.current.get(targetVoiceId);
 
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        const errMsg = errJson.error || `Voice preview failed (HTTP ${res.status})`;
-        throw new Error(errMsg);
+      if (!audioUrl) {
+        const res = await fetch(`${API_BASE}/api/business/voice-preview`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ voiceId: targetVoiceId }),
+          signal: controller.signal,
+        });
+
+        if (!res.ok) {
+          const errJson = await res.json().catch(() => ({}));
+          const errMsg = errJson.error || `Voice preview failed (HTTP ${res.status})`;
+          throw new Error(errMsg);
+        }
+
+        const blob = await res.blob();
+        if (controller.signal.aborted) return;
+        audioUrl = URL.createObjectURL(blob);
+        blobUrlCacheRef.current.set(targetVoiceId, audioUrl);
       }
 
-      const blob = await res.blob();
-      const audioUrl = URL.createObjectURL(blob);
+      if (controller.signal.aborted) return;
+
       const audio = new Audio(audioUrl);
       activeAudioRef.current = audio;
 
       audio.onended = () => {
         setPreviewingVoiceId(null);
+        setLoadingVoiceId(null);
         activeAudioRef.current = null;
-        URL.revokeObjectURL(audioUrl);
-        startVoiceCooldown(targetVoiceId, 5);
+        startVoiceCooldown(targetVoiceId, 3);
       };
 
       audio.onerror = () => {
@@ -438,18 +495,41 @@ export default function SettingsPage() {
         setPreviewError(errMsg);
         toast.error(errMsg);
         setPreviewingVoiceId(null);
+        setLoadingVoiceId(null);
         activeAudioRef.current = null;
-        URL.revokeObjectURL(audioUrl);
-        startVoiceCooldown(targetVoiceId, 5);
+        startVoiceCooldown(targetVoiceId, 3);
       };
 
       await audio.play();
+
+      if (controller.signal.aborted) {
+        audio.pause();
+        return;
+      }
+
+      setLoadingVoiceId(null);
+      setPreviewingVoiceId(targetVoiceId);
     } catch (err: any) {
+      if (controller.signal.aborted) {
+        const isTimeout = controller.signal.reason?.message === 'TIMEOUT' || controller.signal.reason === 'TIMEOUT';
+        if (isTimeout) {
+          const errMsg = 'Voice preview request timed out. Please try again.';
+          setPreviewError(errMsg);
+          toast.error(errMsg);
+          startVoiceCooldown(targetVoiceId, 3);
+        }
+        return;
+      }
       const errMsg = err?.message || 'Voice synthesis preview unavailable.';
       setPreviewError(errMsg);
       toast.error(errMsg);
-      setPreviewingVoiceId(null);
-      startVoiceCooldown(targetVoiceId, 5);
+      startVoiceCooldown(targetVoiceId, 3);
+    } finally {
+      clearTimeout(timeoutTimer);
+      if (previewAbortRef.current === controller) {
+        previewAbortRef.current = null;
+      }
+      setLoadingVoiceId(null);
     }
   };
 
@@ -945,7 +1025,9 @@ export default function SettingsPage() {
                           {ASSEMBLYAI_VOICES.map((v: VoiceOption) => {
                             const isSelected = voice === v.id;
                             const isPlaying = previewingVoiceId === v.id;
+                            const isLoading = loadingVoiceId === v.id;
                             const isCoolingDown = cooldownVoiceId === v.id && cooldownSeconds > 0;
+                            const isBusy = (previewingVoiceId !== null || loadingVoiceId !== null) && !isPlaying && !isLoading;
                             return (
                               <div
                                 key={v.id}
@@ -969,8 +1051,8 @@ export default function SettingsPage() {
                                     <Button
                                       type="button"
                                       size="sm"
-                                      variant={isPlaying ? 'default' : 'outline'}
-                                      disabled={isCoolingDown || (previewingVoiceId !== null && !isPlaying)}
+                                      variant={isPlaying ? 'default' : isLoading ? 'secondary' : 'outline'}
+                                      disabled={isCoolingDown || isBusy}
                                       onClick={(e) => {
                                         e.stopPropagation();
                                         handlePreviewVoice(v.id);
@@ -981,10 +1063,17 @@ export default function SettingsPage() {
                                           ? `Please wait ${cooldownSeconds}s before previewing again`
                                           : isPlaying
                                           ? 'Stop audio preview'
+                                          : isLoading
+                                          ? 'Loading audio preview...'
                                           : 'Preview voice audio sample'
                                       }
                                     >
-                                      {isPlaying ? (
+                                      {isLoading ? (
+                                        <>
+                                          <Loader2 className="h-2.5 w-2.5 animate-spin shrink-0" />
+                                          <span className="truncate">Loading</span>
+                                        </>
+                                      ) : isPlaying ? (
                                         <>
                                           <Square className="h-2.5 w-2.5 fill-current animate-pulse shrink-0" />
                                           <span className="truncate">Playing</span>
