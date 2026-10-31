@@ -21,6 +21,43 @@ export type FinalTurnCallback = (
 ) => void;
 export type SpeechStartCallback = (audioStartMs?: number) => void;
 export type ErrorCallback = (err: Error) => void;
+export type ReconnectingCallback = (attempt: number) => void;
+export type ReconnectedCallback = () => void;
+
+// 16kHz 16-bit mono PCM: 32 bytes = 1ms. 20ms = 640 bytes. 1000ms = 32000 bytes.
+const MIN_CHUNK_BYTES = 640;
+const MAX_CHUNK_BYTES = 32000;
+const PREFERRED_CHUNK_BYTES = 1600; // 50ms chunks
+// 1.5 seconds audio buffer for replay on reconnect (48,000 bytes)
+const RECENT_AUDIO_BUFFER_LIMIT = 48000;
+
+export function isFatalAuthOrParamError(code?: number, message?: string): boolean {
+  const msg = (message || '').toLowerCase();
+  // Concurrency or rate limits are retryable with backoff, even if text says "Unauthorized Connection: Too many concurrent sessions"
+  if (msg.includes('concurrent') || msg.includes('rate limit') || msg.includes('too many') || msg.includes('allowance')) {
+    return false;
+  }
+  if (code === 1008) {
+    return true; // Fatal auth / policy rejection
+  }
+  if (code === 1007 || (typeof code === 'number' && code >= 4000 && code <= 4003)) {
+    return true;
+  }
+  if (
+    msg.includes('unauthorized') ||
+    msg.includes('invalid api key') ||
+    msg.includes('forbidden') ||
+    msg.includes('insufficient funds') ||
+    msg.includes('disabled key') ||
+    msg.includes('invalid parameter') ||
+    msg.includes('unknown parameter') ||
+    msg.includes('unsupported sample rate') ||
+    msg.includes('unsupported encoding')
+  ) {
+    return true;
+  }
+  return false;
+}
 
 export class SttClient {
   private ws: WebSocket | null = null;
@@ -33,14 +70,27 @@ export class SttClient {
 
   private connected = false;
   private connecting: Promise<void> | null = null;
-  private reconnectAttempted = false;
   private closed = false;
+  private isExplicitClose = false;
+
+  private reconnectAttempts = 0;
+  private isReconnecting = false;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+
+  // Recent audio ring buffer for reconnect replay (1.5 seconds)
+  private recentAudioBuffer: Buffer[] = [];
+  private recentAudioBytes = 0;
+
+  // Chunk duration normalization buffer (ensures frames sent to AAI are >= 20ms / 640 bytes)
+  private pendingChunkBuffer: Buffer = Buffer.alloc(0);
 
   private partialCallback?: PartialCallback;
   private finalTurnCallback?: FinalTurnCallback;
   private speechStartCallback?: SpeechStartCallback;
   private errorCallback?: ErrorCallback;
   private closeCallback?: () => void;
+  private reconnectingCallback?: ReconnectingCallback;
+  private reconnectedCallback?: ReconnectedCallback;
 
   private totalAudioBytesSent = 0;
 
@@ -88,6 +138,14 @@ export class SttClient {
     this.closeCallback = cb;
   }
 
+  onReconnecting(cb: ReconnectingCallback) {
+    this.reconnectingCallback = cb;
+  }
+
+  onReconnected(cb: ReconnectedCallback) {
+    this.reconnectedCallback = cb;
+  }
+
   async connect(): Promise<void> {
     if (this.connected) return;
     if (this.connecting) return this.connecting;
@@ -106,6 +164,14 @@ export class SttClient {
       const ws = new WebSocket(url, { headers: { Authorization: this.apiKey } });
       this.ws = ws;
 
+      const connectTimeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          try { ws.terminate(); } catch {}
+          reject(new Error('AssemblyAI STT connection handshake timed out after 10000ms'));
+        }
+      }, 10000);
+
       ws.on('open', () => {
         // Transport connection established; wait for Begin message
       });
@@ -119,6 +185,7 @@ export class SttClient {
         }
 
         if (msg.type === 'Begin') {
+          clearTimeout(connectTimeout);
           this.connected = true;
           if (!settled) {
             settled = true;
@@ -135,6 +202,7 @@ export class SttClient {
         if (msg.type === 'Turn') {
           const transcript = (msg.transcript || '').trim();
           if (msg.end_of_turn) {
+            this.clearRecentAudio();
             const totalAudioMs = Math.round(this.totalAudioBytesSent / 32);
             let turnDetectionMs: number | null = null;
             if (Array.isArray(msg.words) && msg.words.length > 0) {
@@ -157,12 +225,14 @@ export class SttClient {
         }
 
         if (msg.type === 'Error') {
-          const err = new Error(`AssemblyAI STT error: ${msg.error || JSON.stringify(msg)}`);
+          const errMsg = `AssemblyAI STT error: ${msg.error || JSON.stringify(msg)}`;
+          const err = new Error(errMsg);
           if (!settled) {
+            clearTimeout(connectTimeout);
             settled = true;
             reject(err);
           } else {
-            this.errorCallback?.(err);
+            this.handleSocketFailure(errMsg);
           }
           return;
         }
@@ -177,74 +247,257 @@ export class SttClient {
 
       ws.on('error', (err: Error) => {
         if (!settled) {
+          clearTimeout(connectTimeout);
           settled = true;
           reject(err);
         } else {
-          this.errorCallback?.(err);
+          this.handleSocketFailure(err.message);
         }
-        this.connected = false;
       });
 
-      ws.on('close', () => {
+      ws.on('close', (code: number, reason: Buffer) => {
+        clearTimeout(connectTimeout);
         this.connected = false;
-        this.ws = null;
-        this.closeCallback?.();
+        if (!settled) {
+          settled = true;
+          const reasonStr = reason?.toString() || '';
+          reject(new Error(`AssemblyAI STT closed before Begin: code ${code} (${reasonStr})`));
+          return;
+        }
+        if (!this.closed && !this.isExplicitClose) {
+          this.handleSocketFailure(`Socket closed unexpectedly (code: ${code}, reason: ${reason?.toString()})`, code);
+        } else {
+          this.closeCallback?.();
+        }
       });
     });
   }
 
-  async connectWithRetry(): Promise<void> {
+  private handleSocketFailure(reason: string, code?: number): void {
+    if (this.closed || this.isExplicitClose) return;
+
+    if (isFatalAuthOrParamError(code, reason)) {
+      this.closed = true;
+      this.connected = false;
+      this.cleanupWs();
+      this.errorCallback?.(new Error(`AssemblyAI STT fatal error: ${reason}`));
+      return;
+    }
+
+    this.triggerReconnect(reason);
+  }
+
+  private triggerReconnect(reason: string): void {
+    if (this.closed || this.isExplicitClose) return;
+    if (this.isReconnecting) return;
+
+    if (this.reconnectAttempts >= 2) {
+      this.closed = true;
+      this.connected = false;
+      this.cleanupWs();
+      this.errorCallback?.(
+        new Error(`AssemblyAI STT reconnect exhausted after 2 attempts. Last error: ${reason}`)
+      );
+      return;
+    }
+
+    this.isReconnecting = true;
+    this.connected = false;
+    this.cleanupWs();
+
+    const attempt = ++this.reconnectAttempts;
+    const delay = attempt === 1 ? 250 : 750;
+
+    console.log(`[SttClient] Triggering STT reconnect attempt ${attempt}/2 in ${delay}ms (reason: ${reason})`);
+    this.reconnectingCallback?.(attempt);
+
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (this.closed || this.isExplicitClose) return;
+
+      try {
+        await this.doConnect();
+        this.isReconnecting = false;
+        this.reconnectAttempts = 0;
+        this.totalAudioBytesSent = 0;
+
+        console.log(`[SttClient] Reconnected to AssemblyAI STT successfully. Replaying recent audio...`);
+        await this.replayRecentAudio();
+        this.flushPendingChunks();
+
+        this.reconnectedCallback?.();
+      } catch (err: any) {
+        this.isReconnecting = false;
+        if (isFatalAuthOrParamError(undefined, err?.message)) {
+          this.closed = true;
+          this.errorCallback?.(err);
+          return;
+        }
+        this.triggerReconnect(err?.message || 'Reconnect connection failed');
+      }
+    }, delay);
+  }
+
+  private appendRecentAudio(buf: Buffer): void {
+    this.recentAudioBuffer.push(buf);
+    this.recentAudioBytes += buf.length;
+    while (this.recentAudioBytes > RECENT_AUDIO_BUFFER_LIMIT && this.recentAudioBuffer.length > 1) {
+      const removed = this.recentAudioBuffer.shift()!;
+      this.recentAudioBytes -= removed.length;
+    }
+  }
+
+  clearRecentAudio(): void {
+    this.recentAudioBuffer = [];
+    this.recentAudioBytes = 0;
+  }
+
+  private async replayRecentAudio(): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (this.recentAudioBuffer.length === 0) return;
+
+    const toReplay = this.recentAudioBuffer;
+    this.recentAudioBuffer = [];
+    this.recentAudioBytes = 0;
+
+    const combined = Buffer.concat(toReplay);
+    if (combined.length === 0) return;
+
+    for (let offset = 0; offset < combined.length; offset += PREFERRED_CHUNK_BYTES) {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) break;
+      let chunk = combined.subarray(offset, Math.min(offset + PREFERRED_CHUNK_BYTES, combined.length));
+      if (chunk.length < MIN_CHUNK_BYTES) {
+        const padded = Buffer.alloc(MIN_CHUNK_BYTES);
+        chunk.copy(padded);
+        chunk = padded;
+      }
+      this.sendRawChunk(chunk);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
+  private flushPendingChunks(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    while (this.pendingChunkBuffer.length >= MIN_CHUNK_BYTES) {
+      let sliceSize = Math.min(this.pendingChunkBuffer.length, PREFERRED_CHUNK_BYTES);
+      const remainder = this.pendingChunkBuffer.length - sliceSize;
+      if (remainder > 0 && remainder < MIN_CHUNK_BYTES) {
+        if (this.pendingChunkBuffer.length <= MAX_CHUNK_BYTES) {
+          sliceSize = this.pendingChunkBuffer.length;
+        }
+      }
+
+      const chunk = this.pendingChunkBuffer.subarray(0, sliceSize);
+      this.pendingChunkBuffer = this.pendingChunkBuffer.subarray(sliceSize);
+      this.sendRawChunk(chunk);
+    }
+  }
+
+  private sendRawChunk(chunk: Buffer): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.totalAudioBytesSent += chunk.length;
     try {
-      await this.connect();
-      this.reconnectAttempted = false;
-    } catch (err: any) {
-      if (!this.reconnectAttempted) {
-        this.reconnectAttempted = true;
-        this.connected = false;
-        this.ws = null;
+      this.ws.send(chunk, { binary: true });
+    } catch (e: any) {
+      this.handleSocketFailure(e?.message || 'Send audio error');
+    }
+  }
+
+  async connectWithRetry(): Promise<void> {
+    this.closed = false;
+    this.isExplicitClose = false;
+    this.reconnectAttempts = 0;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
         await this.connect();
-        this.reconnectAttempted = false;
-      } else {
-        throw err;
+        return;
+      } catch (err: any) {
+        if (isFatalAuthOrParamError(undefined, err?.message)) {
+          throw err;
+        }
+        if (attempt === 3) {
+          throw err;
+        }
+        const delay = attempt === 1 ? 500 : 1500;
+        console.log(`[SttClient] Initial connect attempt ${attempt} failed (${err?.message}). Retrying in ${delay}ms...`);
+        await new Promise((r) => setTimeout(r, delay));
       }
     }
   }
 
-  async reconnect(): Promise<void> {
-    if (this.closed) return;
-    this.connected = false;
-    this.ws = null;
-    await this.connectWithRetry();
-  }
-
   sendAudio(data: Buffer | Uint8Array | ArrayBuffer): void {
-    if (this.closed || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (this.closed) return;
     const buf = Buffer.isBuffer(data)
       ? data
       : data instanceof Uint8Array
       ? Buffer.from(data.buffer, data.byteOffset, data.byteLength)
       : Buffer.from(data);
 
-    this.totalAudioBytesSent += buf.length;
-    try {
-      this.ws.send(buf, { binary: true });
-    } catch (e: any) {
-      this.errorCallback?.(e);
+    if (buf.length === 0) return;
+
+    this.appendRecentAudio(buf);
+
+    if (this.isReconnecting || !this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return;
     }
+
+    this.pendingChunkBuffer = Buffer.concat([this.pendingChunkBuffer, buf]);
+    this.flushPendingChunks();
+  }
+
+  forceDisconnectForTesting(): void {
+    if (this.ws) {
+      console.log('[SttClient] Force disconnecting upstream STT WebSocket for testing');
+      try {
+        const sock = (this.ws as any)._socket;
+        if (sock && typeof sock.destroy === 'function') {
+          sock.destroy(new Error('ECONNRESET: connection reset by peer'));
+        } else {
+          this.ws.close(1006, 'forced_disconnect');
+        }
+      } catch {}
+      this.handleSocketFailure('Forced disconnect for testing');
+    }
+  }
+
+  private cleanupWs(): void {
+    if (this.ws) {
+      try {
+        this.ws.removeAllListeners();
+        const sock = (this.ws as any)._socket;
+        if (sock && typeof sock.destroy === 'function') {
+          sock.destroy();
+        } else {
+          this.ws.close();
+        }
+      } catch {}
+      this.ws = null;
+    }
+    this.connected = false;
   }
 
   async close(): Promise<void> {
     this.closed = true;
+    this.isExplicitClose = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.isReconnecting = false;
+    this.recentAudioBuffer = [];
+    this.recentAudioBytes = 0;
+    this.pendingChunkBuffer = Buffer.alloc(0);
+
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
         this.ws.send(JSON.stringify({ type: 'Terminate' }));
       } catch {}
       await new Promise((r) => setTimeout(r, 150));
       try {
-        this.ws.close();
+        this.ws.close(1000);
       } catch {}
     }
-    this.ws = null;
-    this.connected = false;
+    this.cleanupWs();
   }
 }

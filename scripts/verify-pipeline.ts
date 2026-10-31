@@ -68,17 +68,31 @@ async function prepareFixtures(items: { name: string; text: string }[]): Promise
 }
 
 // Stream PCM audio in 50ms (1600 byte) frames, followed by silence for turn detection
-async function streamPcmAudio(ws: WebSocket, pcm: Buffer, chunkSize = 1600, intervalMs = 50) {
+async function streamPcmAudio(
+  ws: WebSocket,
+  pcm: Buffer,
+  chunkSize = 1600,
+  intervalMs = 50,
+  shouldStop?: () => boolean
+) {
   for (let offset = 0; offset < pcm.length; offset += chunkSize) {
     if (ws.readyState !== WebSocket.OPEN) break;
-    const chunk = pcm.subarray(offset, Math.min(offset + chunkSize, pcm.length));
+    let chunk = pcm.subarray(offset, Math.min(offset + chunkSize, pcm.length));
+    if (chunk.length < 640) {
+      // pad with silence to at least 20ms (640 bytes) to respect AssemblyAI min frame size
+      const padded = Buffer.alloc(640);
+      chunk.copy(padded);
+      chunk = padded;
+    }
     ws.send(chunk);
     await new Promise((r) => setTimeout(r, intervalMs));
   }
-  // Send 30 chunks (1500ms) of silence so AssemblyAI STT hits max_turn_silence (1000ms) reliably
+  // Send silence chunks so AssemblyAI STT hits max_turn_silence (1000ms) reliably
+  // Max 40 chunks (2000ms), stops early once turn is finalized
   const silence = Buffer.alloc(chunkSize);
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < 40; i++) {
     if (ws.readyState !== WebSocket.OPEN) break;
+    if (shouldStop && shouldStop()) break;
     ws.send(silence);
     await new Promise((r) => setTimeout(r, intervalMs));
   }
@@ -105,9 +119,34 @@ async function run5Turns(fixtures: Record<string, Buffer>): Promise<TurnMetric[]
   return new Promise<TurnMetric[]>((resolve, reject) => {
     let currentTurnIndex = -1;
     let turnInProgress = false;
+    let turnFinalReceived = false;
     let activeMetric: Partial<TurnMetric> | null = null;
     let currentAgentText = '';
     let greetingDone = false;
+    let turnTimer: NodeJS.Timeout | null = null;
+
+    const globalTimeout = setTimeout(() => {
+      cleanup();
+      try { ws.close(); } catch {}
+      reject(new Error('run5Turns test timed out after 180s'));
+    }, 180000);
+
+    function cleanup() {
+      clearTimeout(globalTimeout);
+      if (turnTimer) {
+        clearTimeout(turnTimer);
+        turnTimer = null;
+      }
+    }
+
+    function resetTurnTimer() {
+      if (turnTimer) clearTimeout(turnTimer);
+      turnTimer = setTimeout(() => {
+        cleanup();
+        try { ws.close(); } catch {}
+        reject(new Error(`Turn ${currentTurnIndex + 1} timed out waiting for agent response after 45s`));
+      }, 45000);
+    }
 
     ws.on('open', () => {
       ws.send(JSON.stringify({ type: 'join', missedCallId }));
@@ -127,6 +166,8 @@ async function run5Turns(fixtures: Record<string, Buffer>): Promise<TurnMetric[]
       if (msg.type === 'partial' && msg.text) {
         process.stdout.write(`\r  [STT Live Partial]: "${msg.text}"`);
       } else if (msg.type === 'customer_transcript') {
+        turnFinalReceived = true;
+        resetTurnTimer();
         console.log(`\n  [STT Final Turn]: "${msg.text}"`);
       } else if (msg.type === 'state') {
         if (msg.state === 'LISTENING') {
@@ -134,8 +175,12 @@ async function run5Turns(fixtures: Record<string, Buffer>): Promise<TurnMetric[]
             greetingDone = true;
             console.log('Greeting completed. Starting customer audio streaming...');
             sendNextTurn();
-          } else if (turnInProgress) {
+          } else if (turnInProgress && currentAgentText.trim().length > 0) {
             turnInProgress = false;
+            if (turnTimer) {
+              clearTimeout(turnTimer);
+              turnTimer = null;
+            }
             if (activeMetric) {
               activeMetric.agentText = currentAgentText;
               turnMetrics.push(activeMetric as TurnMetric);
@@ -146,7 +191,7 @@ async function run5Turns(fixtures: Record<string, Buffer>): Promise<TurnMetric[]
               console.log(`  Audio   -> ${activeMetric.audioFrames} frames, ${activeMetric.audioBytes} bytes`);
             }
             if (currentTurnIndex + 1 < prompts.length) {
-              setTimeout(sendNextTurn, 600);
+              setTimeout(sendNextTurn, 1000);
             } else {
               console.log('All 5 turns completed. Ending call...');
               ws.send(JSON.stringify({ type: 'end', reason: 'user_ended' }));
@@ -164,6 +209,7 @@ async function run5Turns(fixtures: Record<string, Buffer>): Promise<TurnMetric[]
         }
       } else if (msg.type === 'summary') {
         console.log('Summary received:', msg.summary?.short_summary);
+        cleanup();
         ws.close();
         resolve(turnMetrics);
       } else if (msg.type === 'error') {
@@ -172,12 +218,14 @@ async function run5Turns(fixtures: Record<string, Buffer>): Promise<TurnMetric[]
     });
 
     ws.on('error', (err) => {
+      cleanup();
       reject(err);
     });
 
     async function sendNextTurn() {
       currentTurnIndex++;
       turnInProgress = true;
+      turnFinalReceived = false;
       currentAgentText = '';
       activeMetric = {
         totalMs: 0,
@@ -188,10 +236,11 @@ async function run5Turns(fixtures: Record<string, Buffer>): Promise<TurnMetric[]
         audioBytes: 0,
         agentText: '',
       };
+      resetTurnTimer();
       const p = prompts[currentTurnIndex];
       const audio = fixtures[p.name];
       console.log(`\nStreaming Audio (Turn ${currentTurnIndex + 1}): "${p.text}"`);
-      await streamPcmAudio(ws, audio);
+      await streamPcmAudio(ws, audio, 1600, 50, () => turnFinalReceived);
     }
   });
 }
@@ -207,11 +256,22 @@ async function testBargeIn(fixtures: Record<string, Buffer>): Promise<boolean> {
 
   return new Promise<boolean>((resolve, reject) => {
     let greetingDone = false;
+    let questionSent = false;
+    let agentAudioStarted = false;
     let barged = false;
     let stopAudioReceived = false;
     let followUpSent = false;
     let audioFramesBetweenStopAndFollowup = 0;
     let followUpDone = false;
+
+    const timeout = setTimeout(() => {
+      try { ws.close(); } catch {}
+      reject(new Error('testBargeIn timed out after 45s'));
+    }, 45000);
+
+    function cleanup() {
+      clearTimeout(timeout);
+    }
 
     ws.on('open', () => {
       ws.send(JSON.stringify({ type: 'join', missedCallId }));
@@ -221,26 +281,27 @@ async function testBargeIn(fixtures: Record<string, Buffer>): Promise<boolean> {
       if (isBinary) {
         if (stopAudioReceived && !followUpSent) {
           audioFramesBetweenStopAndFollowup++;
-        } else if (greetingDone && !barged) {
+        } else if (questionSent && !barged) {
+          agentAudioStarted = true;
           barged = true;
-          console.log('First audio chunk arrived during turn! Waiting 450ms for guard and streaming barge-in...');
-          setTimeout(() => {
-            streamPcmAudio(ws, bargeInPcm, 1600, 30).catch(console.error);
-          }, 450);
+          console.log('Agent speech audio chunk arrived after question! Streaming barge-in audio immediately...');
+          streamPcmAudio(ws, bargeInPcm, 1600, 20).catch(console.error);
         }
         return;
       }
 
       const msg = JSON.parse(data.toString());
+      console.log(`  [Barge-in test received]: type=${msg.type}${msg.state ? ' state=' + msg.state : ''}${msg.text ? ' text="' + msg.text.slice(0, 50) + '..."' : ''}`);
 
       if (msg.type === 'partial' && msg.text) {
         console.log(`  [Barge-in partial STT]: "${msg.text}"`);
       } else if (msg.type === 'state' && msg.state === 'LISTENING') {
         if (!greetingDone) {
           greetingDone = true;
+          questionSent = true;
           console.log('Greeting completed. Sending question to trigger agent speech...');
           // Trigger a long explanation
-          ws.send(JSON.stringify({ type: 'transcript', final: true, text: 'Can you tell me all the plumbing services you provide in detail?' }));
+          ws.send(JSON.stringify({ type: 'transcript', final: true, text: 'Can you tell me all the plumbing services you provide and describe each in detail?' }));
         } else if (stopAudioReceived && !followUpSent) {
           followUpSent = true;
           console.log('Session back in LISTENING state after barge-in!');
@@ -254,17 +315,25 @@ async function testBargeIn(fixtures: Record<string, Buffer>): Promise<boolean> {
         }
       } else if (msg.type === 'stop_audio') {
         console.log('Received { type: "stop_audio" } from server.');
-        stopAudioReceived = true;
+        if (agentAudioStarted) {
+          stopAudioReceived = true;
+        } else {
+          console.log('Note: stop_audio arrived before agent turn audio started');
+        }
       } else if (msg.type === 'agent_text' && followUpSent) {
         console.log(`Follow-up agent response received: "${msg.text}"`);
       } else if (msg.type === 'summary') {
         console.log('Call ended cleanly after barge-in test.');
+        cleanup();
         ws.close();
         resolve(stopAudioReceived && audioFramesBetweenStopAndFollowup === 0 && followUpDone);
       }
     });
 
-    ws.on('error', reject);
+    ws.on('error', (err) => {
+      cleanup();
+      reject(err);
+    });
   });
 }
 
@@ -279,7 +348,17 @@ async function testOptOut(fixtures: Record<string, Buffer>): Promise<boolean> {
 
   return new Promise<boolean>((resolve, reject) => {
     let greetingDone = false;
+    let optOutFinalReceived = false;
     let optOutAckReceived = false;
+
+    const timeout = setTimeout(() => {
+      try { ws.close(); } catch {}
+      reject(new Error('testOptOut timed out after 45s'));
+    }, 45000);
+
+    function cleanup() {
+      clearTimeout(timeout);
+    }
 
     ws.on('open', () => {
       ws.send(JSON.stringify({ type: 'join', missedCallId }));
@@ -293,12 +372,13 @@ async function testOptOut(fixtures: Record<string, Buffer>): Promise<boolean> {
       if (msg.type === 'partial' && msg.text) {
         process.stdout.write(`\r  [Opt-out partial]: "${msg.text}"`);
       } else if (msg.type === 'customer_transcript') {
+        optOutFinalReceived = true;
         console.log(`\n  [Opt-out final STT]: "${msg.text}"`);
       } else if (msg.type === 'state' && msg.state === 'LISTENING') {
         if (!greetingDone) {
           greetingDone = true;
           console.log('Greeting completed. Streaming opt-out audio: "Please stop calling me and remove my number."');
-          streamPcmAudio(ws, optOutPcm);
+          streamPcmAudio(ws, optOutPcm, 1600, 50, () => optOutFinalReceived);
         }
       } else if (msg.type === 'agent_text') {
         console.log(`Agent reply: "${msg.text}"`);
@@ -307,6 +387,7 @@ async function testOptOut(fixtures: Record<string, Buffer>): Promise<boolean> {
         }
       } else if (msg.type === 'summary') {
         console.log('Call completed with summary.');
+        cleanup();
         ws.close();
         // check DB status for this missed call
         setTimeout(async () => {
@@ -319,7 +400,10 @@ async function testOptOut(fixtures: Record<string, Buffer>): Promise<boolean> {
       }
     });
 
-    ws.on('error', reject);
+    ws.on('error', (err) => {
+      cleanup();
+      reject(err);
+    });
   });
 }
 
@@ -338,7 +422,13 @@ async function main() {
     const fixtures = await prepareFixtures(fixtureItems);
 
     const turns = await run5Turns(fixtures);
+    console.log('\nWaiting 3s for session teardown before barge-in test...');
+    await new Promise((r) => setTimeout(r, 3000));
+
     const bargeInSuccess = await testBargeIn(fixtures);
+    console.log('\nWaiting 3s for session teardown before opt-out test...');
+    await new Promise((r) => setTimeout(r, 3000));
+
     const optOutSuccess = await testOptOut(fixtures);
 
     console.log('\n=============================================');

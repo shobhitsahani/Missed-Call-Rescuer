@@ -339,6 +339,27 @@ app.post('/api/missed-calls/simulate', (req, res) => {
   res.json({ missedCallId: id, jobId });
 });
 
+app.post('/api/test/force-stt-disconnect', (req, res) => {
+  const { callId, missedCallId } = req.body || {};
+  let targetSession: any = null;
+  if (callId) {
+    targetSession = sessionModule.getSession(callId);
+  } else if (missedCallId) {
+    const all = sessionModule.getAllSessions();
+    targetSession = all.find((s: any) => s.missedCallId === missedCallId && !s.ended && s.stt);
+  } else {
+    const all = sessionModule.getAllSessions();
+    targetSession = all.find((s: any) => !s.ended && s.stt);
+  }
+
+  if (targetSession && targetSession.stt) {
+    targetSession.stt.forceDisconnectForTesting();
+    return res.json({ ok: true, message: `STT forcibly disconnected for session ${targetSession.id}` });
+  }
+
+  return res.status(404).json({ ok: false, error: 'No active session with STT found' });
+});
+
 app.get('/api/calls', (_req, res) => {
   const rows = db.prepare('SELECT * FROM calls ORDER BY start_time DESC').all();
   res.json(rows.map((r: any) => ({ ...r, latency: r.latency_json ? JSON.parse(r.latency_json) : [], usage: r.usage_json ? JSON.parse(r.usage_json) : {} })));

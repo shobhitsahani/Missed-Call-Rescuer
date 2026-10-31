@@ -258,6 +258,7 @@ export async function startSession(ws: any, missedCallId?: string) {
 
     stt.onFinalTurn((text, _words, _turnOrder, _confidence, turnDetectionMs) => {
       if (session.ended) return;
+      session.stt?.clearRecentAudio();
       const cleaned = (text || '').trim();
       if (!cleaned) return;
       send(session, { type: 'partial', text: '' });
@@ -267,6 +268,18 @@ export async function startSession(ws: any, missedCallId?: string) {
         return;
       }
       handleCustomerUtterance(session, cleaned, turnDetectionMs);
+    });
+
+    stt.onReconnecting((attempt) => {
+      if (session.ended) return;
+      console.log(`[session ${session.id}] STT reconnecting (attempt ${attempt})...`);
+      send(session, { type: 'state', state: 'RECONNECTING' });
+    });
+
+    stt.onReconnected(() => {
+      if (session.ended) return;
+      console.log(`[session ${session.id}] STT reconnected`);
+      send(session, { type: 'state', state: session.state });
     });
 
     stt.onError(async (err) => {
@@ -565,5 +578,7 @@ export async function endSession(session: any, reason: string) {
 }
 
 export function getSession(id: string) { return sessions.get(id); }
+
+export function getAllSessions() { return Array.from(sessions.values()); }
 
 export function getBusiness() { return rowToBiz(getBusinessRow()); }
