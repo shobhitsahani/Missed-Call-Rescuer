@@ -21,7 +21,7 @@ interface TopBarProps {
 
 export function TopBar({
   title,
-  businessName = 'Acme Plumbing',
+  businessName = 'Business',
   searchQuery,
   onSearchChange,
   onSimulate,

@@ -99,7 +99,7 @@ export default function DashboardPage() {
         callsCount={calls.length}
         missedCount={missed.length}
         sseConnected={sseConnected}
-        businessName={business?.name || 'Acme Plumbing'}
+        businessName={business?.name || 'Business'}
         collapsed={collapsed}
         onToggleCollapse={() => setCollapsed(!collapsed)}
         mobileOpen={mobileOpen}

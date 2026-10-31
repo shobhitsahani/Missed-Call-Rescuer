@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import { DEFAULT_PRESET, BUSINESS_PRESETS } from '../src/lib/presets';
 
 const dataDir = path.join(process.cwd(), 'data');
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
@@ -98,26 +99,19 @@ ensureColumn('calls', 'notify_error', 'TEXT');
 ensureColumn('businesses', 'timezone', 'TEXT');
 
 export const DEFAULT_BIZ = {
-  id: 'biz_1',
-  name: 'Acme Plumbing',
-  hours: 'Mon-Fri 8am-6pm, Sat 9am-1pm',
-  services: JSON.stringify([
-    'Emergency plumbing',
-    'Leak repair',
-    'Drain cleaning',
-    'Water heater install',
-  ]),
-  faqs: JSON.stringify([
-    { question: 'Do you offer 24/7 emergency service?', answer: 'Yes, we are available 24/7 for urgent plumbing emergencies.' },
-    { question: 'Do you provide free estimates?', answer: 'Yes, we offer free written estimates before any work begins.' },
-    { question: 'Are you licensed and insured?', answer: 'Yes, all our plumbers are fully licensed and insured.' },
-  ]),
-  tone: 'friendly, professional, concise',
-  voice: 'aai-jane',
-  language: 'en',
-  timezone: 'Asia/Kolkata',
-  owner_email: 'owner@acmeplumbing.example',
+  id: DEFAULT_PRESET.id,
+  name: DEFAULT_PRESET.name,
+  hours: DEFAULT_PRESET.hours,
+  services: JSON.stringify(DEFAULT_PRESET.services),
+  faqs: JSON.stringify(DEFAULT_PRESET.faqs),
+  tone: DEFAULT_PRESET.tone,
+  voice: DEFAULT_PRESET.voice,
+  language: DEFAULT_PRESET.language,
+  timezone: DEFAULT_PRESET.timezone,
+  owner_email: DEFAULT_PRESET.owner_email,
 };
+
+export { BUSINESS_PRESETS };
 
 export function parseServices(raw: any): string[] {
   if (!raw) return [];

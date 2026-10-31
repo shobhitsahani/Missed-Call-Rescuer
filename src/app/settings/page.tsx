@@ -6,6 +6,7 @@ import Link from 'next/link';
 import { Sidebar, DashboardView } from '@/components/Sidebar';
 import { ASSEMBLYAI_VOICES, VoiceOption } from '@/lib/voices';
 import { API_BASE } from '@/lib/api';
+import { BUSINESS_PRESETS, checkExampleMismatch } from '@/lib/presets';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -85,6 +86,7 @@ export default function SettingsPage() {
   const [tone, setTone] = useState('');
   const [voice, setVoice] = useState('aai-jane');
   const [timezone, setTimezone] = useState('Asia/Kolkata');
+  const exampleMismatch = checkExampleMismatch(name, services, faqs, hours);
 
   // Voice preview state
   const [previewingVoiceId, setPreviewingVoiceId] = useState<string | null>(null);
@@ -393,7 +395,7 @@ export default function SettingsPage() {
         setVoice(b.voice || 'aai-jane');
         setTimezone(b.timezone || 'Asia/Kolkata');
         setShowResetConfirm(false);
-        const msg = 'Settings reset to Acme Plumbing defaults.';
+        const msg = 'Settings reset to Example: Acme Plumbing defaults.';
         setSaveSuccessMsg(msg);
         toast.success(msg);
         setTimeout(() => setSaveSuccessMsg(null), 4000);
@@ -421,7 +423,7 @@ export default function SettingsPage() {
         callsCount={callsCount}
         missedCount={missedCount}
         sseConnected={sseConnected}
-        businessName={name || 'Acme Plumbing'}
+        businessName={name || 'Business'}
         collapsed={collapsed}
         onToggleCollapse={() => setCollapsed(!collapsed)}
         mobileOpen={mobileOpen}
@@ -515,6 +517,80 @@ export default function SettingsPage() {
           </div>
         ) : (
           <form onSubmit={handleSave} className="space-y-6">
+            {/* Presets Card */}
+            <Card className="border-border">
+              <CardContent className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="space-y-0.5">
+                  <div className="text-xs font-semibold flex items-center gap-1.5 text-foreground">
+                    <Sparkles className="h-3.5 w-3.5 text-primary" />
+                    <span>Quick-Load Business Presets</span>
+                  </div>
+                  <p className="text-[11px] text-muted-foreground">
+                    Load preconfigured profiles for industry examples.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {Object.entries(BUSINESS_PRESETS).map(([key, preset]) => (
+                    <Button
+                      key={key}
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setName(preset.name);
+                        setHours(preset.hours);
+                        setServices([...preset.services]);
+                        setFaqs(preset.faqs.map((f) => ({ ...f })));
+                        setTone(preset.tone);
+                        setVoice(preset.voice);
+                        setTimezone(preset.timezone);
+                        toast.info(`Loaded preset: ${preset.label}`);
+                      }}
+                      className="h-7 text-[11px] px-2.5 font-normal"
+                    >
+                      {preset.label}
+                    </Button>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Example Mismatch Warning Hint */}
+            {exampleMismatch.hasMismatch && (
+              <div className="rounded-lg bg-amber-500/10 border border-amber-500/30 p-3.5 text-xs text-amber-700 dark:text-amber-300 flex items-start gap-3 animate-in fade-in">
+                <AlertCircle className="h-4 w-4 text-amber-500 shrink-0 mt-0.5" />
+                <div className="space-y-1.5 flex-1">
+                  <p className="font-semibold text-amber-900 dark:text-amber-200">
+                    These still match the example business, review them.
+                  </p>
+                  <p className="text-[11px] text-amber-800/90 dark:text-amber-300 leading-relaxed">
+                    You changed the business name to &quot;{name}&quot;, but your{' '}
+                    {exampleMismatch.servicesMatch ? 'services' : ''}
+                    {exampleMismatch.servicesMatch && exampleMismatch.faqsMatch ? ', ' : ''}
+                    {exampleMismatch.faqsMatch ? 'FAQs' : ''}
+                    {(exampleMismatch.servicesMatch || exampleMismatch.faqsMatch) && exampleMismatch.hoursMatch ? ', and ' : ''}
+                    {exampleMismatch.hoursMatch ? 'operating hours' : ''}{' '}
+                    still match the Example: Acme Plumbing preset. Review them so your voice agent does not mention plumbing services.
+                  </p>
+                  <div className="pt-1 flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        setServices([]);
+                        setFaqs([]);
+                        toast.info('Example services and FAQs cleared. Add your business services below.');
+                      }}
+                      className="h-6 text-[11px] px-2.5 bg-background border-amber-500/40 hover:bg-amber-500/10 text-amber-950 dark:text-amber-100"
+                    >
+                      Clear example services &amp; FAQs
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* General Information Card */}
             <Card>
               <CardHeader className="p-5 pb-3 border-b border-border">
@@ -543,7 +619,7 @@ export default function SettingsPage() {
                       value={name}
                       onChange={(e) => setName(e.target.value)}
                       maxLength={100}
-                      placeholder="e.g. Acme Plumbing"
+                      placeholder="e.g. Acme Plumbing, team flow, or your company"
                       className={`text-xs h-9 ${errors.name ? 'border-destructive' : ''}`}
                     />
                     {errors.name && <p className="text-[11px] text-destructive">{errors.name}</p>}
@@ -785,7 +861,7 @@ export default function SettingsPage() {
                       }
                     }}
                     maxLength={80}
-                    placeholder="e.g. Water heater installation (press Enter)"
+                    placeholder="e.g. Consultation, Repair, or Project review (press Enter)"
                     disabled={services.length >= 20}
                     className="text-xs h-9 flex-1"
                   />
@@ -876,7 +952,7 @@ export default function SettingsPage() {
                           value={faq.question}
                           onChange={(e) => handleUpdateFaq(idx, 'question', e.target.value)}
                           maxLength={120}
-                          placeholder="Question (e.g. Do you offer 24/7 emergency service?)"
+                          placeholder="Question (e.g. Do you offer emergency service?)"
                           className="text-xs h-8 bg-card"
                         />
                       </div>
@@ -887,7 +963,7 @@ export default function SettingsPage() {
                           onChange={(e) => handleUpdateFaq(idx, 'answer', e.target.value)}
                           maxLength={250}
                           rows={2}
-                          placeholder="Answer (e.g. Yes, we are available 24/7 for urgent plumbing calls.)"
+                          placeholder="Answer (e.g. Yes, our team is available for urgent inquiries.)"
                           className="text-xs bg-card resize-none"
                         />
                       </div>
@@ -979,7 +1055,7 @@ export default function SettingsPage() {
               Reset all settings to default?
             </DialogTitle>
             <DialogDescription className="text-xs text-muted-foreground leading-relaxed pt-1">
-              This will restore the business name to <strong className="text-foreground">Acme Plumbing</strong>, default opening hours, standard plumbing services, FAQs, and the <strong className="text-foreground">Jane</strong> neural voice. Custom modifications will be replaced.
+              This will restore the business profile to <strong className="text-foreground">Example: Acme Plumbing</strong> defaults (including standard example services and FAQs) and the <strong className="text-foreground">Jane</strong> neural voice. Custom modifications will be replaced.
             </DialogDescription>
           </DialogHeader>
 

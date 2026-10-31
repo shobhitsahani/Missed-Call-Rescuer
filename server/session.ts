@@ -18,7 +18,7 @@ function getBusinessRow() {
 }
 
 function rowToBiz(r: any) {
-  return { id: r.id, name: r.name, hours: r.hours, services: r.services, faqs: r.faqs, tone: r.tone, voice: r.voice, language: r.language, owner_email: r.owner_email };
+  return { id: r.id, name: r.name, hours: r.hours, services: r.services, faqs: r.faqs, tone: r.tone, voice: r.voice, language: r.language, timezone: r.timezone, owner_email: r.owner_email };
 }
 
 function detectOptOut(text: string) {

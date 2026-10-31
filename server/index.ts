@@ -10,6 +10,7 @@ import {
 } from './notify';
 import cors from 'cors';
 import db, { parseServices, parseFaqs, DEFAULT_BIZ } from './db';
+import { BUSINESS_PRESETS, DEFAULT_PRESET } from '../src/lib/presets';
 import * as events from './events';
 import * as sessionModule from './session';
 import { ASSEMBLYAI_VOICES, VALID_VOICE_IDS, isValidVoiceId } from '../src/lib/voices';
@@ -284,29 +285,36 @@ app.put('/api/business', (req, res) => {
   });
 });
 
-app.post('/api/business/reset', (_req, res) => {
+app.get('/api/business/presets', (_req, res) => {
+  res.json({ presets: BUSINESS_PRESETS });
+});
+
+app.post('/api/business/reset', (req, res) => {
   const existingBiz = db.prepare('SELECT id FROM businesses LIMIT 1').get() as any;
   const bizId = existingBiz?.id || DEFAULT_BIZ.id;
 
+  const presetKey = req.body?.preset || req.query?.preset;
+  const chosenPreset = (presetKey && BUSINESS_PRESETS[String(presetKey)]) ? BUSINESS_PRESETS[String(presetKey)] : DEFAULT_PRESET;
+
   db.prepare(`UPDATE businesses SET name=?, hours=?, services=?, faqs=?, tone=?, voice=?, language=?, timezone=? WHERE id=?`)
     .run(
-      DEFAULT_BIZ.name,
-      DEFAULT_BIZ.hours,
-      DEFAULT_BIZ.services,
-      DEFAULT_BIZ.faqs,
-      DEFAULT_BIZ.tone,
-      DEFAULT_BIZ.voice,
-      DEFAULT_BIZ.language,
-      DEFAULT_BIZ.timezone,
+      chosenPreset.name,
+      chosenPreset.hours,
+      JSON.stringify(chosenPreset.services),
+      JSON.stringify(chosenPreset.faqs),
+      chosenPreset.tone,
+      chosenPreset.voice,
+      chosenPreset.language,
+      chosenPreset.timezone,
       bizId
     );
 
   res.json({
     ok: true,
     business: {
-      ...DEFAULT_BIZ,
-      services: parseServices(DEFAULT_BIZ.services),
-      faqs: parseFaqs(DEFAULT_BIZ.faqs),
+      ...chosenPreset,
+      services: chosenPreset.services,
+      faqs: chosenPreset.faqs,
     },
   });
 });

@@ -46,7 +46,7 @@ export function Sidebar({
   callsCount,
   missedCount,
   sseConnected,
-  businessName = 'Acme Plumbing',
+  businessName = 'Business',
   collapsed,
   onToggleCollapse,
   mobileOpen,
