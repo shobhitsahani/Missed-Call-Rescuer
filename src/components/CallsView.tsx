@@ -1,23 +1,71 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import * as React from 'react';
+import {
+  ColumnDef,
+  flexRender,
+  getCoreRowModel,
+  getPaginationRowModel,
+  getSortedRowModel,
+  getFilteredRowModel,
+  SortingState,
+  VisibilityState,
+  useReactTable,
+} from '@tanstack/react-table';
+import {
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  ChevronRight,
+  SlidersHorizontal,
+  Search,
+  ChevronLeft,
+  ChevronsLeft,
+  ChevronsRight,
+  PhoneCall,
+  Calendar,
+} from 'lucide-react';
 import { CallDetails, SummaryDetails } from './Drawer';
 import { computeAverages } from '@/lib/useDashboardData';
 import { StatusBadge } from './StatusBadge';
 import { RelativeTime } from './RelativeTime';
-import { TableRowSkeleton } from './Skeleton';
 import { EmptyState } from './EmptyState';
+import { TableRowSkeleton } from './Skeleton';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
 
-interface CallsViewProps {
+export interface CallsViewProps {
   calls: CallDetails[];
   summaries: Record<string, SummaryDetails>;
   initialLoading: boolean;
   onSelectCall: (call: CallDetails) => void;
   onSimulate: () => void;
   simulating: boolean;
+  externalSearch?: string;
 }
-
-const ITEMS_PER_PAGE = 15;
 
 export function CallsView({
   calls,
@@ -26,155 +74,337 @@ export function CallsView({
   onSelectCall,
   onSimulate,
   simulating,
+  externalSearch = '',
 }: CallsViewProps) {
-  const [search, setSearch] = useState('');
-  const [outcomeFilter, setOutcomeFilter] = useState('all');
-  const [urgencyFilter, setUrgencyFilter] = useState('all');
-  const [page, setPage] = useState(1);
+  const [sorting, setSorting] = React.useState<SortingState>([
+    { id: 'start_time', desc: true },
+  ]);
+  const [columnVisibility, setColumnVisibility] = React.useState<VisibilityState>({});
+  const [globalFilter, setGlobalFilter] = React.useState(externalSearch);
+  const [outcomeFilter, setOutcomeFilter] = React.useState('all');
+  const [urgencyFilter, setUrgencyFilter] = React.useState('all');
 
-  // Client-side filtering
-  const filteredCalls = useMemo(() => {
-    return calls.filter(call => {
-      const s = summaries[call.id];
-      const outcome = (call.end_reason || 'in progress').toLowerCase();
-      const urgency = (s?.urgency || '').toLowerCase();
+  // Sync external search from TopBar if provided
+  React.useEffect(() => {
+    if (externalSearch !== undefined) {
+      setGlobalFilter(externalSearch);
+    }
+  }, [externalSearch]);
 
-      // Search match
-      if (search.trim()) {
-        const query = search.toLowerCase().trim();
-        const phoneMatch = (call.customer_phone || '').toLowerCase().includes(query);
-        const reasonMatch = (s?.reason || '').toLowerCase().includes(query);
-        const summaryMatch = (s?.short_summary || '').toLowerCase().includes(query);
-        const idMatch = (call.id || '').toLowerCase().includes(query);
-        if (!phoneMatch && !reasonMatch && !summaryMatch && !idMatch) {
-          return false;
-        }
-      }
+  // Define table data with joined summaries
+  const data = React.useMemo(() => {
+    return calls.map((c) => ({
+      ...c,
+      summary: summaries[c.id] || null,
+      avgLatency: computeAverages(c.latency)?.avgTotal ?? null,
+    }));
+  }, [calls, summaries]);
 
-      // Outcome match
-      if (outcomeFilter !== 'all') {
-        if (outcomeFilter === 'in_progress') {
-          if (outcome !== 'in progress' && outcome !== 'in_progress') return false;
-        } else if (!outcome.includes(outcomeFilter.toLowerCase())) {
-          return false;
-        }
-      }
+  // Define columns
+  const columns = React.useMemo<ColumnDef<typeof data[0]>[]>(() => [
+    {
+      accessorKey: 'start_time',
+      header: ({ column }) => {
+        const isSorted = column.getIsSorted();
+        return (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => column.toggleSorting(column.getIsSorted() === 'asc')}
+            className="-ml-3 h-8 text-xs font-semibold hover:text-foreground"
+          >
+            <span>Time</span>
+            {isSorted === 'asc' ? (
+              <ArrowUp className="ml-1 h-3.5 w-3.5" />
+            ) : isSorted === 'desc' ? (
+              <ArrowDown className="ml-1 h-3.5 w-3.5" />
+            ) : (
+              <ArrowUpDown className="ml-1 h-3.5 w-3.5 text-muted-foreground/60" />
+            )}
+          </Button>
+        );
+      },
+      cell: ({ row }) => (
+        <span className="text-muted-foreground whitespace-nowrap text-xs">
+          <RelativeTime date={row.original.start_time} />
+        </span>
+      ),
+    },
+    {
+      accessorKey: 'customer_phone',
+      header: ({ column }) => {
+        const isSorted = column.getIsSorted();
+        return (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => column.toggleSorting(column.getIsSorted() === 'asc')}
+            className="-ml-3 h-8 text-xs font-semibold hover:text-foreground"
+          >
+            <span>Customer Phone</span>
+            {isSorted === 'asc' ? (
+              <ArrowUp className="ml-1 h-3.5 w-3.5" />
+            ) : isSorted === 'desc' ? (
+              <ArrowDown className="ml-1 h-3.5 w-3.5" />
+            ) : (
+              <ArrowUpDown className="ml-1 h-3.5 w-3.5 text-muted-foreground/60" />
+            )}
+          </Button>
+        );
+      },
+      cell: ({ row }) => (
+        <span className="font-medium text-foreground whitespace-nowrap">
+          {row.original.customer_phone || 'unknown'}
+        </span>
+      ),
+    },
+    {
+      accessorKey: 'end_reason',
+      header: 'Outcome',
+      cell: ({ row }) => {
+        const reason = row.original.end_reason || 'in progress';
+        return <StatusBadge status={reason} />;
+      },
+      filterFn: (row, id, value) => {
+        if (!value || value === 'all') return true;
+        const reason = (row.getValue(id) as string || 'in progress').toLowerCase();
+        if (value === 'in_progress') return reason === 'in progress' || reason === 'in_progress';
+        return reason.includes(value.toLowerCase());
+      },
+    },
+    {
+      id: 'urgency',
+      accessorFn: (row) => row.summary?.urgency || 'none',
+      header: 'Urgency',
+      cell: ({ row }) => {
+        const urgency = row.original.summary?.urgency;
+        if (!urgency) return <span className="text-muted-foreground">—</span>;
+        return <StatusBadge status={urgency} />;
+      },
+      filterFn: (row, id, value) => {
+        if (!value || value === 'all') return true;
+        const urgency = (row.getValue(id) as string || '').toLowerCase();
+        return urgency === value.toLowerCase();
+      },
+    },
+    {
+      id: 'reason',
+      accessorFn: (row) => row.summary?.reason || row.summary?.short_summary || '',
+      header: 'Reason',
+      cell: ({ row }) => {
+        const text =
+          row.original.summary?.reason ||
+          row.original.summary?.short_summary ||
+          (row.original.end_reason ? 'No summary' : 'In progress...');
+        return (
+          <div className="max-w-xs truncate text-muted-foreground" title={text}>
+            {text}
+          </div>
+        );
+      },
+    },
+    {
+      accessorKey: 'avgLatency',
+      header: ({ column }) => {
+        const isSorted = column.getIsSorted();
+        return (
+          <div className="text-right">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => column.toggleSorting(column.getIsSorted() === 'asc')}
+              className="-mr-3 h-8 text-xs font-semibold hover:text-foreground"
+            >
+              <span>Latency</span>
+              {isSorted === 'asc' ? (
+                <ArrowUp className="ml-1 h-3.5 w-3.5" />
+              ) : isSorted === 'desc' ? (
+                <ArrowDown className="ml-1 h-3.5 w-3.5" />
+              ) : (
+                <ArrowUpDown className="ml-1 h-3.5 w-3.5 text-muted-foreground/60" />
+              )}
+            </Button>
+          </div>
+        );
+      },
+      cell: ({ row }) => {
+        const val = row.original.avgLatency;
+        return (
+          <div className="text-right font-mono tabular-nums text-foreground">
+            {val !== null ? `${val} ms` : '—'}
+          </div>
+        );
+      },
+    },
+    {
+      id: 'actions',
+      enableHiding: false,
+      cell: () => (
+        <div className="flex justify-end">
+          <ChevronRight className="h-4 w-4 text-muted-foreground" />
+        </div>
+      ),
+    },
+  ], []);
 
-      // Urgency match
-      if (urgencyFilter !== 'all') {
-        if (urgency !== urgencyFilter.toLowerCase()) return false;
-      }
+  // Multi-field global filter
+  const globalFilterFn = React.useCallback(
+    (row: any, _columnId: string, filterValue: string) => {
+      if (!filterValue) return true;
+      const search = filterValue.toLowerCase().trim();
+      const phone = (row.original.customer_phone || '').toLowerCase();
+      const reason = (row.original.summary?.reason || '').toLowerCase();
+      const summary = (row.original.summary?.short_summary || '').toLowerCase();
+      const id = (row.original.id || '').toLowerCase();
+      return (
+        phone.includes(search) ||
+        reason.includes(search) ||
+        summary.includes(search) ||
+        id.includes(search)
+      );
+    },
+    []
+  );
 
-      return true;
-    });
-  }, [calls, summaries, search, outcomeFilter, urgencyFilter]);
+  const table = useReactTable({
+    data,
+    columns,
+    state: {
+      sorting,
+      columnVisibility,
+      globalFilter,
+    },
+    onSortingChange: setSorting,
+    onColumnVisibilityChange: setColumnVisibility,
+    onGlobalFilterChange: setGlobalFilter,
+    globalFilterFn,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+    getFilteredRowModel: getFilteredRowModel(),
+    getPaginationRowModel: getPaginationRowModel(),
+    initialState: {
+      pagination: {
+        pageSize: 15,
+      },
+    },
+  });
 
-  // Reset page when filter changes
-  const totalPages = Math.max(1, Math.ceil(filteredCalls.length / ITEMS_PER_PAGE));
-  const currentPage = Math.min(page, totalPages);
+  // Apply column filters when outcome/urgency state changes
+  React.useEffect(() => {
+    table.getColumn('end_reason')?.setFilterValue(outcomeFilter);
+  }, [outcomeFilter, table]);
 
-  const paginatedCalls = useMemo(() => {
-    const start = (currentPage - 1) * ITEMS_PER_PAGE;
-    return filteredCalls.slice(start, start + ITEMS_PER_PAGE);
-  }, [filteredCalls, currentPage]);
+  React.useEffect(() => {
+    table.getColumn('urgency')?.setFilterValue(urgencyFilter);
+  }, [urgencyFilter, table]);
 
-  const startIndex = filteredCalls.length === 0 ? 0 : (currentPage - 1) * ITEMS_PER_PAGE + 1;
-  const endIndex = Math.min(filteredCalls.length, currentPage * ITEMS_PER_PAGE);
+  const rowCount = table.getFilteredRowModel().rows.length;
 
   return (
     <div className="space-y-4">
-      {/* Filter and Search Bar */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-[#0e131f] border border-slate-800/80 p-3 rounded-xl">
-        <div className="flex-1 flex flex-wrap items-center gap-2.5">
+      {/* Table Toolbar */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 p-3 bg-card border border-border rounded-xl shadow-xs">
+        <div className="flex flex-1 flex-wrap items-center gap-2.5">
           {/* Search Input */}
           <div className="relative min-w-[200px] flex-1 sm:max-w-xs">
-            <span className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none text-slate-500">
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-              </svg>
-            </span>
-            <input
-              type="text"
-              value={search}
-              onChange={e => {
-                setSearch(e.target.value);
-                setPage(1);
-              }}
-              placeholder="Search by phone, reason..."
-              className="w-full pl-8 pr-3 py-1.5 bg-[#090d16] border border-slate-800 rounded-lg text-xs text-white placeholder-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 focus-visible:border-transparent transition-colors"
+            <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground pointer-events-none" />
+            <Input
+              type="search"
+              value={globalFilter ?? ''}
+              onChange={(e) => setGlobalFilter(e.target.value)}
+              placeholder="Filter calls..."
+              className="pl-8 h-8 text-xs bg-background"
             />
           </div>
 
           {/* Outcome Filter */}
-          <div className="flex items-center gap-1.5 text-xs text-slate-400">
-            <label htmlFor="outcome-select" className="text-[11px] uppercase tracking-wider text-slate-500 font-medium">
-              Outcome:
-            </label>
-            <select
-              id="outcome-select"
-              value={outcomeFilter}
-              onChange={e => {
-                setOutcomeFilter(e.target.value);
-                setPage(1);
-              }}
-              className="bg-[#090d16] border border-slate-800 rounded-lg text-xs text-slate-200 px-2 py-1.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-400"
-            >
-              <option value="all">All Outcomes</option>
-              <option value="completed">Completed</option>
-              <option value="opted_out">Opted Out</option>
-              <option value="wrong_number">Wrong Number</option>
-              <option value="user_ended">User Ended</option>
-              <option value="in_progress">In Progress</option>
-            </select>
+          <div className="w-36">
+            <Select value={outcomeFilter} onValueChange={setOutcomeFilter}>
+              <SelectTrigger className="h-8 text-xs bg-background">
+                <SelectValue placeholder="Outcome" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Outcomes</SelectItem>
+                <SelectItem value="completed">Completed</SelectItem>
+                <SelectItem value="opted_out">Opted Out</SelectItem>
+                <SelectItem value="wrong_number">Wrong Number</SelectItem>
+                <SelectItem value="user_ended">User Ended</SelectItem>
+                <SelectItem value="in_progress">In Progress</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
 
           {/* Urgency Filter */}
-          <div className="flex items-center gap-1.5 text-xs text-slate-400">
-            <label htmlFor="urgency-select" className="text-[11px] uppercase tracking-wider text-slate-500 font-medium">
-              Urgency:
-            </label>
-            <select
-              id="urgency-select"
-              value={urgencyFilter}
-              onChange={e => {
-                setUrgencyFilter(e.target.value);
-                setPage(1);
-              }}
-              className="bg-[#090d16] border border-slate-800 rounded-lg text-xs text-slate-200 px-2 py-1.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-400"
-            >
-              <option value="all">All Urgencies</option>
-              <option value="high">High</option>
-              <option value="medium">Medium</option>
-              <option value="low">Low</option>
-            </select>
+          <div className="w-32">
+            <Select value={urgencyFilter} onValueChange={setUrgencyFilter}>
+              <SelectTrigger className="h-8 text-xs bg-background">
+                <SelectValue placeholder="Urgency" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Urgency</SelectItem>
+                <SelectItem value="high">High</SelectItem>
+                <SelectItem value="medium">Medium</SelectItem>
+                <SelectItem value="low">Low</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
         </div>
 
-        {/* Counter */}
-        <div className="text-xs text-slate-400 whitespace-nowrap self-end sm:self-auto">
-          {filteredCalls.length} {filteredCalls.length === 1 ? 'call' : 'calls'}
+        <div className="flex items-center gap-2 self-end sm:self-auto">
+          {/* Column Visibility Selector */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs">
+                <SlidersHorizontal className="h-3.5 w-3.5" />
+                <span>Columns</span>
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-40">
+              <DropdownMenuLabel className="text-xs">Toggle columns</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              {table
+                .getAllColumns()
+                .filter((column) => column.getCanHide())
+                .map((column) => {
+                  return (
+                    <DropdownMenuCheckboxItem
+                      key={column.id}
+                      className="capitalize text-xs"
+                      checked={column.getIsVisible()}
+                      onCheckedChange={(value) => column.toggleVisibility(!!value)}
+                    >
+                      {column.id.replace('_', ' ')}
+                    </DropdownMenuCheckboxItem>
+                  );
+                })}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          <span className="text-xs text-muted-foreground whitespace-nowrap font-mono tabular-nums">
+            {rowCount} {rowCount === 1 ? 'call' : 'calls'}
+          </span>
         </div>
       </div>
 
-      {/* Calls Table Container */}
-      <div className="rounded-xl border border-slate-800/80 bg-[#0e131f] overflow-hidden">
+      {/* Main Table Container */}
+      <div className="rounded-xl border border-border bg-card overflow-hidden shadow-xs">
         {initialLoading ? (
           <div className="p-4">
             <table className="w-full">
               <tbody>
-                <TableRowSkeleton columns={7} />
-                <TableRowSkeleton columns={7} />
-                <TableRowSkeleton columns={7} />
-                <TableRowSkeleton columns={7} />
+                <TableRowSkeleton columns={6} />
+                <TableRowSkeleton columns={6} />
+                <TableRowSkeleton columns={6} />
+                <TableRowSkeleton columns={6} />
               </tbody>
             </table>
           </div>
-        ) : filteredCalls.length === 0 ? (
+        ) : rowCount === 0 ? (
           <EmptyState
             title="No calls found"
             description={
-              search || outcomeFilter !== 'all' || urgencyFilter !== 'all'
-                ? 'Try adjusting your search query or filters.'
+              globalFilter || outcomeFilter !== 'all' || urgencyFilter !== 'all'
+                ? 'Try adjusting your filters or search terms.'
                 : 'No calls recorded yet. Trigger a simulated call to create your first session.'
             }
             actionText="Simulate missed call"
@@ -182,100 +412,101 @@ export function CallsView({
             loading={simulating}
           />
         ) : (
-          <div className="overflow-x-auto max-h-[650px] overflow-y-auto">
-            <table className="w-full text-left text-xs border-collapse">
-              <thead className="sticky top-0 bg-[#0c101a] text-slate-400 uppercase tracking-wider text-[11px] font-medium border-b border-slate-800/80 z-10 shadow-xs">
-                <tr>
-                  <th scope="col" className="py-2.5 px-4">Time</th>
-                  <th scope="col" className="py-2.5 px-4">Customer Phone</th>
-                  <th scope="col" className="py-2.5 px-4">Outcome</th>
-                  <th scope="col" className="py-2.5 px-4">Urgency</th>
-                  <th scope="col" className="py-2.5 px-4">Reason</th>
-                  <th scope="col" className="py-2.5 px-4 text-right">Latency</th>
-                  <th scope="col" className="py-2.5 px-3 w-8" />
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60">
-                {paginatedCalls.map(c => {
-                  const s = summaries[c.id];
-                  const avgs = computeAverages(c.latency);
-                  return (
-                    <tr
-                      key={c.id}
-                      onClick={() => onSelectCall(c)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault();
-                          onSelectCall(c);
-                        }
-                      }}
-                      tabIndex={0}
-                      className="hover:bg-slate-850/40 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-slate-850/60"
-                      role="button"
-                      aria-label={`View call details for ${c.customer_phone}`}
-                    >
-                      <td className="py-2.5 px-4 text-slate-400 whitespace-nowrap">
-                        <RelativeTime date={c.start_time} />
-                      </td>
-                      <td className="py-2.5 px-4 font-medium text-slate-200 whitespace-nowrap">
-                        {c.customer_phone}
-                      </td>
-                      <td className="py-2.5 px-4 whitespace-nowrap">
-                        <StatusBadge status={c.end_reason || 'in progress'} />
-                      </td>
-                      <td className="py-2.5 px-4 whitespace-nowrap">
-                        {s?.urgency ? (
-                          <StatusBadge status={s.urgency} />
-                        ) : (
-                          <span className="text-slate-400">—</span>
-                        )}
-                      </td>
-                      <td className="py-2.5 px-4 max-w-xs truncate text-slate-300">
-                        {s?.reason || s?.short_summary || (c.end_reason ? 'No summary' : 'In progress...')}
-                      </td>
-                      <td className="py-2.5 px-4 text-right font-mono text-slate-300 tabular-nums whitespace-nowrap">
-                        {avgs?.avgTotal ? `${avgs.avgTotal} ms` : '—'}
-                      </td>
-                      <td className="py-2.5 px-3 text-slate-400 text-right">
-                        ›
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+          <Table>
+            <TableHeader>
+              {table.getHeaderGroups().map((headerGroup) => (
+                <TableRow key={headerGroup.id}>
+                  {headerGroup.headers.map((header) => (
+                    <TableHead key={header.id} className="text-xs">
+                      {header.isPlaceholder
+                        ? null
+                        : flexRender(
+                            header.column.columnDef.header,
+                            header.getContext()
+                          )}
+                    </TableHead>
+                  ))}
+                </TableRow>
+              ))}
+            </TableHeader>
+            <TableBody>
+              {table.getRowModel().rows.map((row) => (
+                <TableRow
+                  key={row.id}
+                  onClick={() => onSelectCall(row.original)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      onSelectCall(row.original);
+                    }
+                  }}
+                  tabIndex={0}
+                  className="cursor-pointer transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:bg-muted/70 h-11"
+                  role="button"
+                  aria-label={`View call details for ${row.original.customer_phone}`}
+                >
+                  {row.getVisibleCells().map((cell) => (
+                    <TableCell key={cell.id} className="py-2.5">
+                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                    </TableCell>
+                  ))}
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
         )}
 
-        {/* Pagination Bar */}
-        {filteredCalls.length > 0 && (
-          <div className="px-4 py-3 bg-[#0c101a] border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
-            <span>
-              Showing <strong className="text-slate-200">{startIndex}</strong> to{' '}
-              <strong className="text-slate-200">{endIndex}</strong> of{' '}
-              <strong className="text-slate-200">{filteredCalls.length}</strong> calls
-            </span>
+        {/* TanStack Pagination Controls */}
+        {rowCount > 0 && (
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-3 px-4 py-3 border-t border-border bg-card/50 text-xs text-muted-foreground">
+            <div className="flex items-center gap-1">
+              <span>Page</span>
+              <strong className="text-foreground font-mono">
+                {table.getState().pagination.pageIndex + 1}
+              </strong>
+              <span>of</span>
+              <strong className="text-foreground font-mono">
+                {table.getPageCount() || 1}
+              </strong>
+            </div>
 
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setPage(p => Math.max(1, p - 1))}
-                disabled={currentPage <= 1}
-                className="px-2.5 py-1 rounded bg-[#090d16] border border-slate-800 text-slate-300 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-400"
+            <div className="flex items-center gap-1.5">
+              <Button
+                variant="outline"
+                size="icon-sm"
+                onClick={() => table.setPageIndex(0)}
+                disabled={!table.getCanPreviousPage()}
+                title="First page"
+              >
+                <ChevronsLeft className="h-3.5 w-3.5" />
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => table.previousPage()}
+                disabled={!table.getCanPreviousPage()}
+                className="h-7 text-xs px-2.5"
               >
                 Previous
-              </button>
-              <span className="text-slate-400 tabular-nums">
-                Page {currentPage} of {totalPages}
-              </span>
-              <button
-                type="button"
-                onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-                disabled={currentPage >= totalPages}
-                className="px-2.5 py-1 rounded bg-[#090d16] border border-slate-800 text-slate-300 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-400"
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => table.nextPage()}
+                disabled={!table.getCanNextPage()}
+                className="h-7 text-xs px-2.5"
               >
                 Next
-              </button>
+              </Button>
+              <Button
+                variant="outline"
+                size="icon-sm"
+                onClick={() => table.setPageIndex(table.getPageCount() - 1)}
+                disabled={!table.getCanNextPage()}
+                title="Last page"
+              >
+                <ChevronsRight className="h-3.5 w-3.5" />
+              </Button>
             </div>
           </div>
         )}
