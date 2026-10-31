@@ -289,6 +289,7 @@ export function Drawer({
   const totals: number[] = [];
   const llms: number[] = [];
   const ttss: number[] = [];
+  const turnDetections: number[] = [];
   for (const item of call.latency || []) {
     if (typeof item === 'number') {
       totals.push(item);
@@ -296,12 +297,14 @@ export function Drawer({
       if (typeof item.totalMs === 'number') totals.push(item.totalMs);
       if (typeof item.llmFirstTokenMs === 'number') llms.push(item.llmFirstTokenMs);
       if (typeof item.ttsFirstAudioMs === 'number') ttss.push(item.ttsFirstAudioMs);
+      if (typeof item.turnDetectionMs === 'number') turnDetections.push(item.turnDetectionMs);
     }
   }
 
   const avgTotal = totals.length ? Math.round(totals.reduce((a, b) => a + b, 0) / totals.length) : null;
   const avgLlm = llms.length ? Math.round(llms.reduce((a, b) => a + b, 0) / llms.length) : null;
   const avgTts = ttss.length ? Math.round(ttss.reduce((a, b) => a + b, 0) / ttss.length) : null;
+  const avgTurn = turnDetections.length ? Math.round(turnDetections.reduce((a, b) => a + b, 0) / turnDetections.length) : null;
 
   return (
     <Sheet open={isOpen} onOpenChange={(open) => !open && onClose()}>
@@ -372,6 +375,11 @@ export function Drawer({
               {avgTotal ? `${avgTotal} ms` : '—'}
             </span>
           </div>
+          {avgTurn !== null && (
+            <div className="inline-flex items-center px-2 py-0.5 rounded-md bg-muted text-muted-foreground border border-border/60 text-xs tabular-nums">
+              Turn: <span className="ml-1 font-medium text-foreground">{avgTurn} ms</span>
+            </div>
+          )}
           {avgLlm !== null && (
             <div className="inline-flex items-center px-2 py-0.5 rounded-md bg-muted text-muted-foreground border border-border/60 text-xs tabular-nums">
               LLM: <span className="ml-1 font-medium text-foreground">{avgLlm} ms</span>
