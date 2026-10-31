@@ -3,9 +3,12 @@ import db from './db';
 import * as llm from './llm';
 import * as events from './events';
 import { TtsClient } from './tts';
+import { SttClient } from './stt';
 import { notifyCallSummary } from './notify';
 
 const sessions = new Map<string, any>();
+
+export const STT_PROVIDER = process.env.STT_PROVIDER || 'assemblyai';
 
 const OPT_OUT_PHRASES = ['stop calling', 'do not call', "don't call", 'remove me', 'opt out', 'opt-out', 'no more calls', 'leave me alone'];
 const WRONG_NUMBER = ['wrong number', 'not the right person', 'you have the wrong'];
@@ -25,6 +28,19 @@ function detectOptOut(text: string) {
 function detectWrongNumber(text: string) {
   const t = (text || '').toLowerCase();
   return WRONG_NUMBER.some(p => t.includes(p));
+}
+
+export function similar(a: string, b: string) {
+  const na = a.toLowerCase().replace(/[^\w\s]/g, '').trim();
+  const nb = b.toLowerCase().replace(/[^\w\s]/g, '').trim();
+  if (!na || !nb) return false;
+  if (nb.includes(na) || na.includes(nb)) return true;
+  const wa = new Set(na.split(/\s+/));
+  const wb = new Set(nb.split(/\s+/));
+  let overlap = 0;
+  for (const w of wa) if (wb.has(w)) overlap++;
+  const ratio = overlap / Math.max(wa.size, wb.size, 1);
+  return ratio > 0.6;
 }
 
 const FIRST_CHUNK_MIN_WORDS = parseInt(process.env.FIRST_CHUNK_MIN_WORDS || '6', 10);
@@ -121,6 +137,8 @@ async function speakSentence(
   onGenerateSent?: () => void
 ): Promise<boolean> {
   if (session.ended || session.cancelGeneration) return false;
+  session.currentAgentText = sentence;
+  session.agentSpeakingStartTime = Date.now();
   send(session, { type: 'agent_text', text: sentence });
   session.usage.ttsChars += sentence.length;
 
@@ -193,10 +211,17 @@ export async function startSession(ws: any, missedCallId?: string) {
     silenceTimer: null,
     maxTimer: null,
     tts,
+    stt: null,
     keepAliveTimer: null,
     ttsFailed: false,
+    currentAgentText: '',
+    agentSpeakingStartTime: 0,
+    sttProvider: STT_PROVIDER,
   };
   sessions.set(callId, session);
+
+  // Inform client of session config and STT provider
+  send(session, { type: 'config', sttProvider: STT_PROVIDER });
 
   // connect TTS
   try {
@@ -206,6 +231,59 @@ export async function startSession(ws: any, missedCallId?: string) {
     try { ws.send(JSON.stringify({ type: 'error', message: 'Voice service unavailable.' })); } catch {}
     await endSession(session, 'error');
     return session;
+  }
+
+  // connect AssemblyAI STT if enabled
+  if (STT_PROVIDER === 'assemblyai') {
+    const stt = new SttClient({ apiKey });
+    session.stt = stt;
+
+    stt.onSpeechStart((_audioStartMs) => {
+      // Speech started signal available if needed
+    });
+
+    stt.onPartial((text) => {
+      if (session.ended) return;
+      send(session, { type: 'partial', text });
+
+      // Server-side barge-in decision
+      if (session.state === 'SPEAKING' || session.state === 'THINKING') {
+        const words = text.trim().split(/\s+/).filter(Boolean).length;
+        const speakingFor = Date.now() - (session.agentSpeakingStartTime || 0);
+        if (words >= 2 && speakingFor >= 400 && !similar(text, session.currentAgentText || '')) {
+          bargeIn(session);
+        }
+      }
+    });
+
+    stt.onFinalTurn((text, _words, _turnOrder, _confidence, turnDetectionMs) => {
+      if (session.ended) return;
+      const cleaned = (text || '').trim();
+      if (!cleaned) return;
+      send(session, { type: 'partial', text: '' });
+      send(session, { type: 'customer_transcript', text: cleaned });
+      if (session.generating) {
+        // drop overlapping utterances while reply is generating
+        return;
+      }
+      handleCustomerUtterance(session, cleaned, turnDetectionMs);
+    });
+
+    stt.onError(async (err) => {
+      if (session.ended) return;
+      console.error('STT error:', err?.message);
+      send(session, { type: 'error', message: 'Speech recognition service error. Ending call.' });
+      await endSession(session, 'error');
+    });
+
+    try {
+      await stt.connectWithRetry();
+    } catch (err: any) {
+      console.error('STT connect failed:', err?.message);
+      send(session, { type: 'error', message: 'Speech recognition service unavailable.' });
+      await endSession(session, 'error');
+      return session;
+    }
   }
 
   session.maxTimer = setTimeout(() => endSession(session, 'timeout'), 5 * 60 * 1000);
@@ -218,6 +296,8 @@ export async function startSession(ws: any, missedCallId?: string) {
   setState(session, 'GREETING');
   const greeting = `Hi, this is an automated assistant calling on behalf of ${business.name}. We noticed we missed your call earlier. Is now a good time to chat?`;
   session.state = 'SPEAKING';
+  session.currentAgentText = greeting;
+  session.agentSpeakingStartTime = Date.now();
   send(session, { type: 'state', state: 'SPEAKING' });
   const ok = await speakSentence(session, greeting, () => {});
   if (!ok || session.ended) return session;
@@ -228,7 +308,7 @@ export async function startSession(ws: any, missedCallId?: string) {
   return session;
 }
 
-export async function handleCustomerUtterance(session: any, text: string) {
+export async function handleCustomerUtterance(session: any, text: string, turnDetectionMs?: number | null) {
   if (session.ended) return;
   text = (text || '').trim();
   if (!text) return;
@@ -243,6 +323,8 @@ export async function handleCustomerUtterance(session: any, text: string) {
     addTurn(session, 'customer', text, false);
     const reply = "I understand. I'll make sure we stop calling. Sorry for the inconvenience. Goodbye.";
     session.state = 'SPEAKING';
+    session.currentAgentText = reply;
+    session.agentSpeakingStartTime = Date.now();
     send(session, { type: 'state', state: 'SPEAKING' });
     await speakSentence(session, reply, () => {});
     addTurn(session, 'agent', reply, false);
@@ -253,6 +335,8 @@ export async function handleCustomerUtterance(session: any, text: string) {
     addTurn(session, 'customer', text, false);
     const reply = "I'm sorry about that. I'll update our records. Have a good day. Goodbye.";
     session.state = 'SPEAKING';
+    session.currentAgentText = reply;
+    session.agentSpeakingStartTime = Date.now();
     send(session, { type: 'state', state: 'SPEAKING' });
     await speakSentence(session, reply, () => {});
     addTurn(session, 'agent', reply, false);
@@ -282,15 +366,21 @@ export async function handleCustomerUtterance(session: any, text: string) {
     const ttsFirstAudioMs = (t_tts_generate_sent !== null && t_tts_first_audio !== null) ? t_tts_first_audio - t_tts_generate_sent : null;
     const totalMs = t_tts_first_audio - t_turn_end;
 
-    session.latencies.push({ totalMs, llmFirstTokenMs, ttsFirstAudioMs });
+    session.latencies.push({
+      totalMs,
+      llmFirstTokenMs,
+      ttsFirstAudioMs,
+      turnDetectionMs: turnDetectionMs ?? null,
+    });
     send(session, {
       type: 'metrics',
       totalMs,
       llmFirstTokenMs,
       ttsFirstAudioMs,
+      turnDetectionMs: turnDetectionMs ?? null,
       timeToFirstAudio: totalMs,
     });
-    console.log(`[turn] llm_first_token=${llmFirstTokenMs ?? '-'}ms tts_first_audio=${ttsFirstAudioMs ?? '-'}ms total=${totalMs}ms`);
+    console.log(`[turn] turn_detection=${turnDetectionMs ?? '-'}ms llm_first_token=${llmFirstTokenMs ?? '-'}ms tts_first_audio=${ttsFirstAudioMs ?? '-'}ms total=${totalMs}ms`);
   };
 
   const messages = session.turns
@@ -439,7 +529,11 @@ export async function endSession(session: any, reason: string) {
     sentiment: s.sentiment || 'neutral',
   };
 
-  // close TTS
+  // close STT and TTS
+  if (session.stt) {
+    try { await session.stt.close(); } catch {}
+    session.stt = null;
+  }
   try { await session.tts.close(); } catch {}
 
   setState(session, 'DONE');

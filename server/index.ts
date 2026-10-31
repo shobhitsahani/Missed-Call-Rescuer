@@ -46,6 +46,7 @@ app.get('/api/business', (_req, res) => {
     faqs: parseFaqs(b.faqs),
     timezone: b.timezone || 'Asia/Kolkata',
     voice: b.voice || 'aai-jane',
+    sttProvider: sessionModule.STT_PROVIDER,
   });
 });
 
@@ -444,7 +445,14 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', (ws) => {
   let session: any = null;
   ws.on('message', async (data, isBinary) => {
-    if (isBinary) return;
+    if (isBinary) {
+      if (session && session.stt && !session.ended) {
+        session.stt.sendAudio(data as Buffer);
+        if (!session.usage.sttSeconds) session.usage.sttSeconds = 0;
+        session.usage.sttSeconds += (data as Buffer).length / 32000;
+      }
+      return;
+    }
     let msg: any;
     try { msg = JSON.parse(data.toString()); } catch (e) { return; }
     if (msg.type === 'join') {
