@@ -8,7 +8,6 @@ import {
   Settings,
   ChevronLeft,
   ChevronRight,
-  SlidersHorizontal,
 } from 'lucide-react';
 import { Logomark } from './Logomark';
 import { ThemeToggle } from './ThemeToggle';
@@ -203,24 +202,9 @@ export function Sidebar({
             )}
           </div>
 
-          {/* Theme Toggle & Demo Options */}
+          {/* Theme Toggle */}
           <div className="flex flex-col gap-1">
             <ThemeToggle collapsed={isIconOnly} />
-
-            {onOpenDemoSettings && (
-              <Button
-                variant="ghost"
-                size={isIconOnly ? 'icon-sm' : 'sm'}
-                onClick={onOpenDemoSettings}
-                className={`text-muted-foreground hover:text-foreground ${
-                  isIconOnly ? 'w-9 h-9 p-0 justify-center mx-auto' : 'w-full justify-start gap-2'
-                }`}
-                title="Simulation options & webhook tests"
-              >
-                <SlidersHorizontal className="h-4 w-4 shrink-0" />
-                {!isIconOnly && <span className="text-xs">Demo options</span>}
-              </Button>
-            )}
           </div>
 
           <Separator />
