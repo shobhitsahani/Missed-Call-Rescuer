@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: missed-call-rescuer-api
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm install
+    startCommand: npx tsx server/index.ts
+    envVars:
+      - key: PORT
+        value: 4000
+      - key: OPENAI_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: OPENAI_MODEL
+        value: qwen/qwen3.8-27b
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ASSEMBLYAI_API_KEY
+        sync: false
