@@ -1,10 +1,15 @@
 'use client';
 
+import * as React from 'react';
+import { cn } from '@/lib/utils';
+import { Badge } from '@/components/ui/badge';
+
 interface TranscriptBubbleProps {
   role: 'agent' | 'customer' | string;
   text: string;
   interrupted?: boolean;
   timestamp?: string;
+  className?: string;
 }
 
 export function TranscriptBubble({
@@ -12,21 +17,24 @@ export function TranscriptBubble({
   text,
   interrupted,
   timestamp,
+  className,
 }: TranscriptBubbleProps) {
   const isCustomer = role === 'customer';
 
   return (
     <div
-      className={`flex flex-col mb-3.5 ${
-        isCustomer ? 'items-end' : 'items-start'
-      }`}
+      className={cn(
+        'flex flex-col mb-3',
+        isCustomer ? 'items-end' : 'items-start',
+        className
+      )}
     >
       <div className="flex items-center gap-2 mb-1 px-1">
-        <span className="text-[11px] font-medium tracking-wide uppercase text-slate-400">
+        <span className="text-[10px] font-semibold tracking-wider uppercase text-muted-foreground font-mono">
           {isCustomer ? 'Customer' : 'Voice Agent'}
         </span>
         {timestamp && (
-          <span className="text-[10px] text-slate-500">
+          <span className="text-[10px] text-muted-foreground font-mono">
             {new Date(timestamp).toLocaleTimeString([], {
               hour: '2-digit',
               minute: '2-digit',
@@ -37,19 +45,20 @@ export function TranscriptBubble({
       </div>
 
       <div
-        className={`max-w-[85%] sm:max-w-[75%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+        className={cn(
+          'max-w-[85%] sm:max-w-[80%] rounded-2xl px-3.5 py-2 text-xs leading-relaxed transition-colors',
           isCustomer
-            ? 'bg-teal-600 text-white rounded-tr-xs'
-            : 'bg-slate-800/90 text-slate-200 border border-slate-700/60 rounded-tl-xs'
-        }`}
+            ? 'bg-primary text-primary-foreground rounded-tr-xs shadow-xs font-normal'
+            : 'bg-muted/80 text-foreground border border-border rounded-tl-xs shadow-xs'
+        )}
       >
         <p className="whitespace-pre-wrap break-words">{text}</p>
 
         {interrupted && !isCustomer && (
           <div className="mt-1.5 flex items-center gap-1">
-            <span className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300 border border-amber-500/25">
+            <Badge variant="warning" className="text-[9px] px-1.5 py-0">
               interrupted
-            </span>
+            </Badge>
           </div>
         )}
       </div>

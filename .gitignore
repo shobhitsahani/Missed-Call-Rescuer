@@ -47,6 +47,9 @@ data/
 /data/*.db-shm
 /data/*.db-wal
 
+# audio fixtures
+scripts/fixtures/
+
 # vercel
 .vercel
 

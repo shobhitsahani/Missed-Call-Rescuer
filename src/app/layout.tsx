@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { ThemeProvider } from "@/components/theme-provider";
+import { Toaster } from "sonner";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -13,8 +15,11 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Missed-Call Rescuer",
-  description: "Automated callback assistant for missed calls",
+  title: "Missed-Call Rescuer | Autonomous Voice AI Callbacks",
+  description: "B2B autonomous voice agent platform that calls back missed customers with natural neural conversation, urgency classification, and structured appointment booking.",
+  icons: {
+    icon: "/icon",
+  },
 };
 
 export default function RootLayout({
@@ -25,10 +30,25 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased dark`}
+      suppressHydrationWarning
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-[#090d16] text-slate-100 font-sans selection:bg-teal-500/30 selection:text-teal-200">
-        {children}
+      <body className="min-h-full flex flex-col bg-background text-foreground font-sans selection:bg-primary/20 selection:text-primary">
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="dark"
+          enableSystem={false}
+          disableTransitionOnChange
+        >
+          {children}
+          <Toaster
+            position="bottom-right"
+            theme="system"
+            toastOptions={{
+              className: "border border-border bg-card text-card-foreground shadow-lg text-xs",
+            }}
+          />
+        </ThemeProvider>
       </body>
     </html>
   );

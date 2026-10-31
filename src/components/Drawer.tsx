@@ -1,6 +1,18 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import * as React from 'react';
+import { useState, useEffect, useRef } from 'react';
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetDescription,
+} from '@/components/ui/sheet';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Separator } from '@/components/ui/separator';
+import { ScrollArea } from '@/components/ui/scroll-area';
 import { StatusBadge } from './StatusBadge';
 import { TranscriptBubble } from './TranscriptBubble';
 import { RelativeTime } from './RelativeTime';
@@ -10,10 +22,34 @@ import {
   formatJsonTranscript,
   getTranscriptFilename,
 } from '@/lib/transcript';
+import {
+  Copy,
+  Check,
+  Download,
+  Send,
+  Phone,
+  Clock,
+  Activity,
+  AlertCircle,
+  CheckCircle2,
+  Calendar,
+  User,
+  HeartHandshake,
+  Lightbulb,
+  FileText,
+  Loader2,
+  Sparkles,
+  MessageSquare,
+} from 'lucide-react';
 
 export type LatencyItem =
   | number
-  | { totalMs: number; llmFirstTokenMs?: number | null; ttsFirstAudioMs?: number | null };
+  | {
+      totalMs: number;
+      llmFirstTokenMs?: number | null;
+      ttsFirstAudioMs?: number | null;
+      turnDetectionMs?: number | null;
+    };
 
 export interface CallDetails {
   id: string;
@@ -21,6 +57,7 @@ export interface CallDetails {
   start_time: string;
   end_time: string | null;
   end_reason: string | null;
+  outcome?: string | null;
   latency: LatencyItem[];
   usage?: any;
   notified_at?: string | null;
@@ -34,6 +71,7 @@ export interface SummaryDetails {
   reason: string;
   urgency: string;
   preferred_time: string;
+  callback_time?: string | null;
   contact_details: string;
   suggested_action: string;
   short_summary: string;
@@ -87,8 +125,8 @@ export function Drawer({
   turns,
   loadingTurns,
 }: DrawerProps) {
-  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copiedId, setCopiedId] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
   const copyTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [resending, setResending] = useState(false);
@@ -114,6 +152,15 @@ export function Drawer({
       });
     }
   }, [call?.id, call?.notified_at, call?.notify_status, call?.notify_error, call?.notify_provider]);
+
+  useEffect(() => {
+    setCopied(false);
+    setCopiedId(false);
+    setCopyError(null);
+    return () => {
+      if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
+    };
+  }, [call?.id, isOpen]);
 
   const handleResend = async () => {
     if (!call) return;
@@ -147,58 +194,14 @@ export function Drawer({
     }
   };
 
-  // Clear copy state on call change or close
-  useEffect(() => {
-    setCopied(false);
-    setCopyError(null);
-    return () => {
-      if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
-    };
-  }, [call?.id, isOpen]);
-
-  // Handle ESC key and focus management
-  useEffect(() => {
-    if (!isOpen) return;
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onClose();
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    // Focus close button on open
-    setTimeout(() => closeButtonRef.current?.focus(), 50);
-
-    // Prevent body scroll when drawer is open
-    const prevOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      document.body.style.overflow = prevOverflow;
-    };
-  }, [isOpen, onClose]);
-
-  if (!isOpen || !call) return null;
-
-  // Compute latency stats for chips
-  const totals: number[] = [];
-  const llms: number[] = [];
-  const ttss: number[] = [];
-  for (const item of call.latency || []) {
-    if (typeof item === 'number') {
-      totals.push(item);
-    } else if (item && typeof item === 'object') {
-      if (typeof item.totalMs === 'number') totals.push(item.totalMs);
-      if (typeof item.llmFirstTokenMs === 'number') llms.push(item.llmFirstTokenMs);
-      if (typeof item.ttsFirstAudioMs === 'number') ttss.push(item.ttsFirstAudioMs);
-    }
-  }
-
-  const avgTotal = totals.length ? Math.round(totals.reduce((a, b) => a + b, 0) / totals.length) : null;
-  const avgLlm = llms.length ? Math.round(llms.reduce((a, b) => a + b, 0) / llms.length) : null;
-  const avgTts = ttss.length ? Math.round(ttss.reduce((a, b) => a + b, 0) / ttss.length) : null;
+  const handleCopyId = async () => {
+    if (!call) return;
+    try {
+      await navigator.clipboard.writeText(call.id);
+      setCopiedId(true);
+      setTimeout(() => setCopiedId(false), 1500);
+    } catch {}
+  };
 
   const hasTurns = Boolean(turns && turns.length > 0);
 
@@ -280,281 +283,328 @@ export function Drawer({
     URL.revokeObjectURL(url);
   };
 
-  return (
-    <div
-      className="fixed inset-0 z-50 overflow-hidden"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="drawer-title"
-    >
-      {/* Backdrop */}
-      <div
-        className="fixed inset-0 bg-black/60 backdrop-blur-xs transition-opacity duration-200"
-        onClick={onClose}
-        aria-hidden="true"
-      />
+  if (!call) return null;
 
-      {/* Drawer Panel */}
-      <div className="fixed inset-y-0 right-0 flex max-w-full pl-6 pointer-events-none">
-        <div className="w-screen max-w-lg pointer-events-auto bg-[#0d121e] border-l border-slate-800/90 shadow-2xl flex flex-col transform transition-transform duration-200 ease-in-out">
-          {/* Header */}
-          <div className="p-5 border-b border-slate-800 bg-[#0e1422] flex items-start justify-between gap-4">
-            <div className="min-w-0">
-              <h2
-                id="drawer-title"
-                className="text-lg font-semibold text-white tracking-tight"
-              >
-                {call.customer_phone}
-              </h2>
-              <div className="flex items-center gap-2 mt-1 text-xs text-slate-400">
-                <RelativeTime date={call.start_time} />
-                <span>·</span>
-                <span className="font-mono text-slate-400 truncate max-w-[140px]">
-                  {call.id}
-                </span>
+  // Compute latency stats
+  const totals: number[] = [];
+  const llms: number[] = [];
+  const ttss: number[] = [];
+  const turnDetections: number[] = [];
+  for (const item of call.latency || []) {
+    if (typeof item === 'number') {
+      totals.push(item);
+    } else if (item && typeof item === 'object') {
+      if (typeof item.totalMs === 'number') totals.push(item.totalMs);
+      if (typeof item.llmFirstTokenMs === 'number') llms.push(item.llmFirstTokenMs);
+      if (typeof item.ttsFirstAudioMs === 'number') ttss.push(item.ttsFirstAudioMs);
+      if (typeof item.turnDetectionMs === 'number') turnDetections.push(item.turnDetectionMs);
+    }
+  }
+
+  const avgTotal = totals.length ? Math.round(totals.reduce((a, b) => a + b, 0) / totals.length) : null;
+  const avgLlm = llms.length ? Math.round(llms.reduce((a, b) => a + b, 0) / llms.length) : null;
+  const avgTts = ttss.length ? Math.round(ttss.reduce((a, b) => a + b, 0) / ttss.length) : null;
+  const avgTurn = turnDetections.length ? Math.round(turnDetections.reduce((a, b) => a + b, 0) / turnDetections.length) : null;
+
+  return (
+    <Sheet open={isOpen} onOpenChange={(open) => !open && onClose()}>
+      <SheetContent
+        side="right"
+        className="p-0 flex flex-col h-full bg-card border-l border-border w-full sm:max-w-xl md:max-w-2xl overflow-hidden focus:outline-none"
+      >
+        {/* Header */}
+        <SheetHeader className="p-5 pb-4 border-b border-border bg-card/60 text-left">
+          <div className="flex items-start justify-between gap-4 pr-6">
+            <div className="space-y-1.5 min-w-0">
+              <div className="flex items-center gap-2">
+                <div className="h-8 w-8 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center shrink-0 text-primary">
+                  <Phone className="h-4 w-4" />
+                </div>
+                <SheetTitle className="text-lg font-semibold tracking-tight text-foreground font-mono">
+                  {call.customer_phone}
+                </SheetTitle>
               </div>
 
-              {/* Badges */}
-              <div className="flex flex-wrap items-center gap-2 mt-2.5">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground pt-0.5">
+                <div className="flex items-center gap-1 font-sans">
+                  <Clock className="h-3 w-3 text-muted-foreground/70" />
+                  <RelativeTime date={call.start_time} />
+                </div>
+                <span>·</span>
+                <button
+                  type="button"
+                  onClick={handleCopyId}
+                  title="Click to copy call ID"
+                  className="inline-flex items-center gap-1 font-mono text-[11px] hover:text-foreground text-muted-foreground transition-colors group cursor-pointer"
+                >
+                  <span className="truncate max-w-[120px]">{call.id}</span>
+                  {copiedId ? (
+                    <Check className="h-3 w-3 text-emerald-400" />
+                  ) : (
+                    <Copy className="h-3 w-3 opacity-0 group-hover:opacity-100 transition-opacity" />
+                  )}
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5 pt-1">
                 <StatusBadge status={call.end_reason || 'in progress'} />
                 {summary?.urgency && (
                   <StatusBadge status={summary.urgency} label={`Urgency: ${summary.urgency}`} />
                 )}
+                {call.outcome && (
+                  <Badge variant="outline" className="text-[11px] capitalize font-mono">
+                    {call.outcome.replace(/_/g, ' ')}
+                  </Badge>
+                )}
               </div>
             </div>
-
-            {/* Close Button */}
-            <button
-              ref={closeButtonRef}
-              type="button"
-              onClick={onClose}
-              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
-              aria-label="Close call details drawer"
-            >
-              <svg
-                className="w-5 h-5"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                strokeWidth={2}
-                aria-hidden="true"
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            </button>
           </div>
+          <SheetDescription className="sr-only">
+            Call inspection drawer with AI summary and conversation transcript.
+          </SheetDescription>
+        </SheetHeader>
 
-          {/* Latency chips bar */}
-          <div className="px-5 py-2.5 bg-slate-900/40 border-b border-slate-800/60 flex flex-wrap items-center gap-2 text-xs">
-            <span className="text-slate-400 text-[11px] uppercase tracking-wider font-medium">
-              Latency:
+        {/* Latency Chips Bar */}
+        <div className="px-5 py-2.5 bg-muted/40 border-b border-border flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-1">
+            <Activity className="h-3 w-3 text-primary" /> Latency:
+          </span>
+          <div className="inline-flex items-center px-2 py-0.5 rounded-md bg-card text-foreground border border-border shadow-xs text-xs tabular-nums">
+            Total:
+            <span className="font-semibold text-primary ml-1">
+              {avgTotal ? `${avgTotal} ms` : '—'}
             </span>
-            <span className="inline-flex items-center px-2 py-0.5 rounded bg-slate-800 text-slate-200 border border-slate-700/60 tabular-nums">
-              Total: <span className="font-semibold text-teal-300 ml-1">{avgTotal ? `${avgTotal} ms` : '—'}</span>
-            </span>
-            {avgLlm !== null && (
-              <span className="inline-flex items-center px-2 py-0.5 rounded bg-slate-800/60 text-slate-400 border border-slate-700/40 tabular-nums">
-                LLM: {avgLlm} ms
-              </span>
-            )}
-            {avgTts !== null && (
-              <span className="inline-flex items-center px-2 py-0.5 rounded bg-slate-800/60 text-slate-400 border border-slate-700/40 tabular-nums">
-                TTS: {avgTts} ms
-              </span>
-            )}
           </div>
+          {avgTurn !== null && (
+            <div className="inline-flex items-center px-2 py-0.5 rounded-md bg-muted text-muted-foreground border border-border/60 text-xs tabular-nums">
+              Turn: <span className="ml-1 font-medium text-foreground">{avgTurn} ms</span>
+            </div>
+          )}
+          {avgLlm !== null && (
+            <div className="inline-flex items-center px-2 py-0.5 rounded-md bg-muted text-muted-foreground border border-border/60 text-xs tabular-nums">
+              LLM: <span className="ml-1 font-medium text-foreground">{avgLlm} ms</span>
+            </div>
+          )}
+          {avgTts !== null && (
+            <div className="inline-flex items-center px-2 py-0.5 rounded-md bg-muted text-muted-foreground border border-border/60 text-xs tabular-nums">
+              TTS: <span className="ml-1 font-medium text-foreground">{avgTts} ms</span>
+            </div>
+          )}
+        </div>
 
-          {/* Scrollable Content */}
-          <div className="flex-1 overflow-y-auto p-5 space-y-6">
+        {/* Scrollable Body */}
+        <ScrollArea className="flex-1 p-5 space-y-6">
+          <div className="space-y-6 pb-6">
             {/* Owner Notification Status Banner */}
-            <div className="rounded-lg bg-slate-900/60 border border-slate-800/80 p-3 flex items-center justify-between gap-3 text-xs">
-              <div className="flex items-center gap-2.5 min-w-0">
-                <span
-                  className={`h-2 w-2 rounded-full shrink-0 ${
+            <div className="rounded-lg bg-card border border-border p-3.5 flex items-center justify-between gap-3 text-xs shadow-xs">
+              <div className="flex items-center gap-3 min-w-0">
+                <div
+                  className={`h-2.5 w-2.5 rounded-full shrink-0 ${
                     localNotify.notify_status === 'sent'
-                      ? 'bg-teal-400'
+                      ? 'bg-emerald-500 ring-2 ring-emerald-500/20'
                       : localNotify.notify_status === 'failed'
-                      ? 'bg-rose-400'
-                      : 'bg-slate-500'
+                      ? 'bg-rose-500 ring-2 ring-rose-500/20'
+                      : 'bg-muted-foreground/40'
                   }`}
                   aria-hidden="true"
                 />
                 <div className="min-w-0">
-                  <p className="text-slate-200 font-medium truncate">
+                  <p className="text-foreground font-medium truncate">
                     {localNotify.notify_status === 'sent'
                       ? `Owner notified via ${formatProviderLabel(localNotify.notify_provider)} at ${formatNotifiedTime(localNotify.notified_at)}`
                       : localNotify.notify_status === 'failed'
-                      ? 'Notification failed'
-                      : 'Owner not notified'}
+                      ? 'Owner notification failed'
+                      : 'Owner notification pending'}
                   </p>
                   {localNotify.notify_status === 'failed' && localNotify.notify_error && !resendStatusMsg && (
-                    <p className="text-[11px] text-rose-300/80 truncate mt-0.5">
+                    <p className="text-[11px] text-destructive truncate mt-0.5">
                       {localNotify.notify_error}
                     </p>
                   )}
                   {resendStatusMsg && (
-                    <p className={`text-[11px] truncate mt-0.5 ${resendIsError ? 'text-rose-300' : 'text-teal-300'}`}>
+                    <p className={`text-[11px] truncate mt-0.5 font-medium ${resendIsError ? 'text-destructive' : 'text-primary'}`}>
                       {resendStatusMsg}
                     </p>
                   )}
                 </div>
               </div>
 
-              <button
-                type="button"
+              <Button
+                variant="outline"
+                size="sm"
                 onClick={handleResend}
                 disabled={resending}
-                className="shrink-0 px-2.5 py-1 text-xs font-medium rounded border border-slate-700/80 bg-slate-800/80 hover:bg-slate-700 text-slate-200 disabled:opacity-50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                className="shrink-0 h-7 text-xs gap-1.5"
               >
-                {resending ? 'Sending...' : 'Resend'}
-              </button>
+                {resending ? (
+                  <>
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    Sending...
+                  </>
+                ) : (
+                  <>
+                    <Send className="h-3 w-3" />
+                    Resend
+                  </>
+                )}
+              </Button>
             </div>
 
-            {/* Structured Summary Section */}
-            <section aria-labelledby="summary-section-heading">
-              <h3
-                id="summary-section-heading"
-                className="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-3"
-              >
-                Call Summary
-              </h3>
+            {/* Call Summary Section */}
+            <section aria-labelledby="summary-heading" className="space-y-3">
+              <div className="flex items-center gap-2">
+                <Sparkles className="h-3.5 w-3.5 text-primary" />
+                <h3 id="summary-heading" className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Structured AI Summary
+                </h3>
+              </div>
 
               {summary ? (
-                <div className="space-y-3.5">
+                <div className="space-y-3">
                   {summary.short_summary && (
-                    <div className="rounded-lg bg-teal-950/20 border border-teal-800/30 p-3 text-xs text-teal-100 leading-relaxed">
+                    <div className="rounded-lg bg-primary/5 border border-primary/20 p-3.5 text-xs text-foreground leading-relaxed">
+                      <p className="font-medium text-primary mb-1 text-[11px] uppercase tracking-wider">Overview</p>
                       {summary.short_summary}
                     </div>
                   )}
 
-                  <dl className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                    <div className="rounded-lg bg-slate-900/60 border border-slate-800/70 p-3">
-                      <dt className="text-slate-400 font-medium uppercase tracking-wider text-[10px]">
-                        Reason
-                      </dt>
-                      <dd className="mt-1 text-slate-200 text-xs leading-normal">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
+                    <div className="rounded-lg bg-muted/40 border border-border p-3">
+                      <div className="flex items-center gap-1.5 text-muted-foreground text-[10px] font-semibold uppercase tracking-wider mb-1">
+                        <MessageSquare className="h-3 w-3 text-primary/70" />
+                        <span>Reason</span>
+                      </div>
+                      <p className="text-foreground leading-normal font-normal">
                         {summary.reason || '—'}
-                      </dd>
+                      </p>
                     </div>
 
-                    <div className="rounded-lg bg-slate-900/60 border border-slate-800/70 p-3">
-                      <dt className="text-slate-400 font-medium uppercase tracking-wider text-[10px]">
-                        Preferred Time
-                      </dt>
-                      <dd className="mt-1 text-slate-200 text-xs leading-normal">
-                        {summary.preferred_time || '—'}
-                      </dd>
+                    <div className="rounded-lg bg-muted/40 border border-border p-3">
+                      <div className="flex items-center gap-1.5 text-muted-foreground text-[10px] font-semibold uppercase tracking-wider mb-1">
+                        <Calendar className="h-3 w-3 text-primary/70" />
+                        <span>Preferred / Callback Time</span>
+                      </div>
+                      <p className="text-foreground leading-normal font-normal">
+                        {summary.callback_time || summary.preferred_time || '—'}
+                      </p>
                     </div>
 
-                    <div className="rounded-lg bg-slate-900/60 border border-slate-800/70 p-3">
-                      <dt className="text-slate-400 font-medium uppercase tracking-wider text-[10px]">
-                        Contact Details
-                      </dt>
-                      <dd className="mt-1 text-slate-200 text-xs leading-normal">
+                    <div className="rounded-lg bg-muted/40 border border-border p-3">
+                      <div className="flex items-center gap-1.5 text-muted-foreground text-[10px] font-semibold uppercase tracking-wider mb-1">
+                        <User className="h-3 w-3 text-primary/70" />
+                        <span>Contact Details</span>
+                      </div>
+                      <p className="text-foreground leading-normal font-mono text-[11px]">
                         {summary.contact_details || '—'}
-                      </dd>
+                      </p>
                     </div>
 
-                    <div className="rounded-lg bg-slate-900/60 border border-slate-800/70 p-3">
-                      <dt className="text-slate-400 font-medium uppercase tracking-wider text-[10px]">
-                        Suggested Action
-                      </dt>
-                      <dd className="mt-1 text-slate-200 text-xs leading-normal">
+                    <div className="rounded-lg bg-muted/40 border border-border p-3">
+                      <div className="flex items-center gap-1.5 text-muted-foreground text-[10px] font-semibold uppercase tracking-wider mb-1">
+                        <Lightbulb className="h-3 w-3 text-primary/70" />
+                        <span>Suggested Action</span>
+                      </div>
+                      <p className="text-foreground leading-normal font-normal">
                         {summary.suggested_action || '—'}
-                      </dd>
+                      </p>
                     </div>
 
-                    <div className="rounded-lg bg-slate-900/60 border border-slate-800/70 p-3 sm:col-span-2">
-                      <dt className="text-slate-400 font-medium uppercase tracking-wider text-[10px]">
-                        Customer Sentiment
-                      </dt>
-                      <dd className="mt-1 text-slate-200 text-xs capitalize leading-normal">
-                        {summary.sentiment || '—'}
-                      </dd>
+                    <div className="rounded-lg bg-muted/40 border border-border p-3 sm:col-span-2">
+                      <div className="flex items-center gap-1.5 text-muted-foreground text-[10px] font-semibold uppercase tracking-wider mb-1">
+                        <HeartHandshake className="h-3 w-3 text-primary/70" />
+                        <span>Customer Sentiment</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Badge variant="outline" className="text-xs capitalize font-normal">
+                          {summary.sentiment || 'Neutral'}
+                        </Badge>
+                      </div>
                     </div>
-                  </dl>
+                  </div>
                 </div>
               ) : (
-                <div className="rounded-lg bg-slate-900/40 border border-slate-800/60 p-4 text-xs text-slate-400">
-                  {call.end_reason ? 'No summary generated for this call.' : 'Call is in progress. Summary will appear once completed.'}
+                <div className="rounded-lg bg-muted/30 border border-border p-4 text-xs text-muted-foreground text-center">
+                  {call.end_reason
+                    ? 'No summary recorded for this call.'
+                    : 'Call is in progress. Summary will appear as soon as the call finishes.'}
                 </div>
               )}
             </section>
 
-            {/* Transcript Section */}
-            <section aria-labelledby="transcript-section-heading">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2">
-                <h3
-                  id="transcript-section-heading"
-                  className="text-xs font-semibold uppercase tracking-wider text-slate-300"
-                >
-                  Transcript
-                </h3>
+            <Separator />
+
+            {/* Conversation Transcript Section */}
+            <section aria-labelledby="transcript-heading" className="space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <FileText className="h-3.5 w-3.5 text-primary" />
+                  <h3 id="transcript-heading" className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    Conversation Transcript {turns && turns.length > 0 && `(${turns.length} turns)`}
+                  </h3>
+                </div>
+
                 <div className="flex items-center gap-1.5 flex-wrap">
-                  <button
-                    type="button"
+                  <Button
+                    variant="outline"
+                    size="sm"
                     onClick={handleCopy}
                     disabled={!hasTurns}
-                    title={hasTurns ? 'Copy transcript to clipboard' : 'No turns recorded'}
-                    aria-label="Copy transcript"
-                    className={`px-2.5 py-1 text-xs font-medium rounded border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
-                      !hasTurns
-                        ? 'opacity-40 cursor-not-allowed bg-slate-900 border-slate-800 text-slate-500'
-                        : copied
-                        ? 'bg-teal-500/20 border-teal-500/50 text-teal-300'
-                        : copyError
-                        ? 'bg-rose-500/20 border-rose-500/50 text-rose-300'
-                        : 'bg-slate-800/80 hover:bg-slate-700/80 text-slate-200 border-slate-700/80 active:bg-slate-700'
-                    }`}
+                    className="h-7 text-xs gap-1"
                   >
-                    {copied ? 'Copied' : copyError ? copyError : 'Copy'}
-                  </button>
-                  <button
-                    type="button"
+                    {copied ? (
+                      <>
+                        <Check className="h-3 w-3 text-emerald-400" />
+                        Copied
+                      </>
+                    ) : copyError ? (
+                      <>
+                        <AlertCircle className="h-3 w-3 text-destructive" />
+                        {copyError}
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="h-3 w-3" />
+                        Copy
+                      </>
+                    )}
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
                     onClick={handleDownloadTxt}
                     disabled={!hasTurns}
-                    title={hasTurns ? 'Download plain text transcript' : 'No turns recorded'}
-                    aria-label="Download plain text transcript"
-                    className={`px-2.5 py-1 text-xs font-medium rounded border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
-                      !hasTurns
-                        ? 'opacity-40 cursor-not-allowed bg-slate-900 border-slate-800 text-slate-500'
-                        : 'bg-slate-800/80 hover:bg-slate-700/80 text-slate-200 border-slate-700/80 active:bg-slate-700'
-                    }`}
+                    className="h-7 text-xs gap-1"
                   >
-                    Download .txt
-                  </button>
-                  <button
-                    type="button"
+                    <Download className="h-3 w-3" />
+                    .txt
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
                     onClick={handleDownloadJson}
                     disabled={!hasTurns}
-                    title={hasTurns ? 'Download JSON transcript' : 'No turns recorded'}
-                    aria-label="Download JSON transcript"
-                    className={`px-2.5 py-1 text-xs font-medium rounded border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
-                      !hasTurns
-                        ? 'opacity-40 cursor-not-allowed bg-slate-900 border-slate-800 text-slate-500'
-                        : 'bg-slate-800/80 hover:bg-slate-700/80 text-slate-200 border-slate-700/80 active:bg-slate-700'
-                    }`}
+                    className="h-7 text-xs gap-1"
                   >
-                    Download .json
-                  </button>
+                    <Download className="h-3 w-3" />
+                    .json
+                  </Button>
                 </div>
               </div>
 
-              {/* Muted privacy note and live announcement */}
-              <div className="flex items-center justify-between text-[11px] text-slate-400 mb-3" aria-live="polite">
-                <span>Contains customer data. Share with care.</span>
-                {copied && <span className="text-teal-400 font-medium">Copied!</span>}
-                {copyError && <span className="text-rose-400 font-medium">{copyError}</span>}
-              </div>
+              <p className="text-[11px] text-muted-foreground">
+                Contains verified customer audio transcript. Share with care.
+              </p>
 
               {loadingTurns ? (
-                <div className="flex items-center justify-center py-8 text-xs text-slate-400 gap-2 rounded-xl border border-slate-800/70 bg-slate-950/40">
-                  <span className="h-4 w-4 rounded-full border-2 border-slate-600 border-t-teal-400 animate-spin" />
+                <div className="flex items-center justify-center py-10 text-xs text-muted-foreground gap-2 rounded-xl border border-border bg-muted/20">
+                  <Loader2 className="h-4 w-4 animate-spin text-primary" />
                   Loading conversation turns...
                 </div>
               ) : turns && turns.length > 0 ? (
-                <div className="rounded-xl border border-slate-800/70 bg-slate-950/40 p-4 max-h-96 overflow-y-auto">
-                  {turns.map(t => (
+                <div className="rounded-xl border border-border bg-muted/15 p-4 max-h-[380px] overflow-y-auto space-y-2">
+                  {turns.map((t) => (
                     <TranscriptBubble
                       key={t.id}
                       role={t.role}
@@ -565,14 +615,14 @@ export function Drawer({
                   ))}
                 </div>
               ) : (
-                <div className="rounded-xl border border-slate-800/70 bg-slate-950/40 p-6 text-center text-xs text-slate-400">
+                <div className="rounded-xl border border-border bg-muted/15 p-8 text-center text-xs text-muted-foreground">
                   No transcript turns recorded for this call.
                 </div>
               )}
             </section>
           </div>
-        </div>
-      </div>
-    </div>
+        </ScrollArea>
+      </SheetContent>
+    </Sheet>
   );
 }

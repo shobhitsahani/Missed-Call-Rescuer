@@ -1,119 +1,290 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import * as React from 'react';
+import Link from 'next/link';
+import {
+  ColumnDef,
+  flexRender,
+  getCoreRowModel,
+  getPaginationRowModel,
+  getSortedRowModel,
+  getFilteredRowModel,
+  SortingState,
+  VisibilityState,
+  useReactTable,
+} from '@tanstack/react-table';
+import {
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  ExternalLink,
+  Search,
+  SlidersHorizontal,
+  ChevronsLeft,
+  ChevronsRight,
+} from 'lucide-react';
 import { MissedCall } from '@/lib/useDashboardData';
 import { StatusBadge } from './StatusBadge';
 import { RelativeTime } from './RelativeTime';
 import { TableRowSkeleton } from './Skeleton';
 import { EmptyState } from './EmptyState';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
 
-interface MissedCallsViewProps {
+export interface MissedCallsViewProps {
   missed: MissedCall[];
   initialLoading: boolean;
   onSimulate: () => void;
   simulating: boolean;
+  externalSearch?: string;
 }
-
-const ITEMS_PER_PAGE = 15;
 
 export function MissedCallsView({
   missed,
   initialLoading,
   onSimulate,
   simulating,
+  externalSearch = '',
 }: MissedCallsViewProps) {
-  const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState('all');
-  const [page, setPage] = useState(1);
+  const [sorting, setSorting] = React.useState<SortingState>([
+    { id: 'time', desc: true },
+  ]);
+  const [columnVisibility, setColumnVisibility] = React.useState<VisibilityState>({});
+  const [globalFilter, setGlobalFilter] = React.useState(externalSearch);
+  const [statusFilter, setStatusFilter] = React.useState('all');
 
-  const filteredMissed = useMemo(() => {
-    return missed.filter(m => {
-      const status = (m.status || '').toLowerCase();
+  React.useEffect(() => {
+    if (externalSearch !== undefined) {
+      setGlobalFilter(externalSearch);
+    }
+  }, [externalSearch]);
 
-      // Search match
-      if (search.trim()) {
-        const query = search.toLowerCase().trim();
-        const phoneMatch = (m.customer_phone || '').toLowerCase().includes(query);
-        const idMatch = (m.id || '').toLowerCase().includes(query);
-        if (!phoneMatch && !idMatch) return false;
-      }
+  const columns = React.useMemo<ColumnDef<MissedCall>[]>(() => [
+    {
+      accessorKey: 'time',
+      header: ({ column }) => {
+        const isSorted = column.getIsSorted();
+        return (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => column.toggleSorting(column.getIsSorted() === 'asc')}
+            className="-ml-3 h-8 text-xs font-semibold hover:text-foreground"
+          >
+            <span>Time</span>
+            {isSorted === 'asc' ? (
+              <ArrowUp className="ml-1 h-3.5 w-3.5" />
+            ) : isSorted === 'desc' ? (
+              <ArrowDown className="ml-1 h-3.5 w-3.5" />
+            ) : (
+              <ArrowUpDown className="ml-1 h-3.5 w-3.5 text-muted-foreground/60" />
+            )}
+          </Button>
+        );
+      },
+      cell: ({ row }) => (
+        <span className="text-muted-foreground whitespace-nowrap text-xs">
+          <RelativeTime date={row.original.time} />
+        </span>
+      ),
+    },
+    {
+      accessorKey: 'customer_phone',
+      header: ({ column }) => {
+        const isSorted = column.getIsSorted();
+        return (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => column.toggleSorting(column.getIsSorted() === 'asc')}
+            className="-ml-3 h-8 text-xs font-semibold hover:text-foreground"
+          >
+            <span>Customer Phone</span>
+            {isSorted === 'asc' ? (
+              <ArrowUp className="ml-1 h-3.5 w-3.5" />
+            ) : isSorted === 'desc' ? (
+              <ArrowDown className="ml-1 h-3.5 w-3.5" />
+            ) : (
+              <ArrowUpDown className="ml-1 h-3.5 w-3.5 text-muted-foreground/60" />
+            )}
+          </Button>
+        );
+      },
+      cell: ({ row }) => (
+        <span className="font-medium text-foreground whitespace-nowrap">
+          {row.original.customer_phone}
+        </span>
+      ),
+    },
+    {
+      accessorKey: 'status',
+      header: 'Status',
+      cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      filterFn: (row, id, value) => {
+        if (!value || value === 'all') return true;
+        const status = (row.getValue(id) as string || '').toLowerCase();
+        return status.includes(value.toLowerCase());
+      },
+    },
+    {
+      id: 'actions',
+      header: () => <span className="text-right block">Action</span>,
+      cell: ({ row }) => {
+        const isJoinable = row.original.status === 'new' || row.original.status === 'queued';
+        return (
+          <div className="flex justify-end">
+            {isJoinable ? (
+              <Link
+                href={`/call/${row.original.id}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md bg-primary/10 hover:bg-primary/20 text-primary border border-primary/30 transition-colors"
+              >
+                <span>Open call page</span>
+                <ExternalLink className="h-3 w-3" />
+              </Link>
+            ) : (
+              <span className="text-muted-foreground text-xs">—</span>
+            )}
+          </div>
+        );
+      },
+    },
+  ], []);
 
-      // Status match
-      if (statusFilter !== 'all') {
-        if (!status.includes(statusFilter.toLowerCase())) return false;
-      }
+  const globalFilterFn = React.useCallback(
+    (row: any, _columnId: string, filterValue: string) => {
+      if (!filterValue) return true;
+      const search = filterValue.toLowerCase().trim();
+      const phone = (row.original.customer_phone || '').toLowerCase();
+      const id = (row.original.id || '').toLowerCase();
+      return phone.includes(search) || id.includes(search);
+    },
+    []
+  );
 
-      return true;
-    });
-  }, [missed, search, statusFilter]);
+  const table = useReactTable({
+    data: missed,
+    columns,
+    state: {
+      sorting,
+      columnVisibility,
+      globalFilter,
+    },
+    onSortingChange: setSorting,
+    onColumnVisibilityChange: setColumnVisibility,
+    onGlobalFilterChange: setGlobalFilter,
+    globalFilterFn,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+    getFilteredRowModel: getFilteredRowModel(),
+    getPaginationRowModel: getPaginationRowModel(),
+    initialState: {
+      pagination: {
+        pageSize: 15,
+      },
+    },
+  });
 
-  const totalPages = Math.max(1, Math.ceil(filteredMissed.length / ITEMS_PER_PAGE));
-  const currentPage = Math.min(page, totalPages);
+  React.useEffect(() => {
+    table.getColumn('status')?.setFilterValue(statusFilter);
+  }, [statusFilter, table]);
 
-  const paginatedMissed = useMemo(() => {
-    const start = (currentPage - 1) * ITEMS_PER_PAGE;
-    return filteredMissed.slice(start, start + ITEMS_PER_PAGE);
-  }, [filteredMissed, currentPage]);
-
-  const startIndex = filteredMissed.length === 0 ? 0 : (currentPage - 1) * ITEMS_PER_PAGE + 1;
-  const endIndex = Math.min(filteredMissed.length, currentPage * ITEMS_PER_PAGE);
+  const rowCount = table.getFilteredRowModel().rows.length;
 
   return (
     <div className="space-y-4">
-      {/* Filter and Search Bar */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-[#0e131f] border border-slate-800/80 p-3 rounded-xl">
-        <div className="flex-1 flex flex-wrap items-center gap-2.5">
-          {/* Search Input */}
+      {/* Table Toolbar */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 p-3 bg-card border border-border rounded-xl shadow-xs">
+        <div className="flex flex-1 flex-wrap items-center gap-2.5">
           <div className="relative min-w-[200px] flex-1 sm:max-w-xs">
-            <span className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none text-slate-500">
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-              </svg>
-            </span>
-            <input
-              type="text"
-              value={search}
-              onChange={e => {
-                setSearch(e.target.value);
-                setPage(1);
-              }}
+            <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground pointer-events-none" />
+            <Input
+              type="search"
+              value={globalFilter ?? ''}
+              onChange={(e) => setGlobalFilter(e.target.value)}
               placeholder="Search by phone, ID..."
-              className="w-full pl-8 pr-3 py-1.5 bg-[#090d16] border border-slate-800 rounded-lg text-xs text-white placeholder-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 focus-visible:border-transparent transition-colors"
+              className="pl-8 h-8 text-xs bg-background"
             />
           </div>
 
-          {/* Status Filter */}
-          <div className="flex items-center gap-1.5 text-xs text-slate-400">
-            <label htmlFor="missed-status-select" className="text-[11px] uppercase tracking-wider text-slate-500 font-medium">
-              Status:
-            </label>
-            <select
-              id="missed-status-select"
-              value={statusFilter}
-              onChange={e => {
-                setStatusFilter(e.target.value);
-                setPage(1);
-              }}
-              className="bg-[#090d16] border border-slate-800 rounded-lg text-xs text-slate-200 px-2 py-1.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-400"
-            >
-              <option value="all">All Statuses</option>
-              <option value="new">New</option>
-              <option value="queued">Queued</option>
-              <option value="calling">Calling</option>
-              <option value="done">Done</option>
-              <option value="opted_out">Opted Out</option>
-              <option value="failed">Failed</option>
-            </select>
+          <div className="w-36">
+            <Select value={statusFilter} onValueChange={setStatusFilter}>
+              <SelectTrigger className="h-8 text-xs bg-background">
+                <SelectValue placeholder="Status" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Statuses</SelectItem>
+                <SelectItem value="new">New</SelectItem>
+                <SelectItem value="queued">Queued</SelectItem>
+                <SelectItem value="calling">Calling</SelectItem>
+                <SelectItem value="done">Done</SelectItem>
+                <SelectItem value="opted_out">Opted Out</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
         </div>
 
-        <div className="text-xs text-slate-400 whitespace-nowrap self-end sm:self-auto">
-          {filteredMissed.length} {filteredMissed.length === 1 ? 'record' : 'records'}
+        <div className="flex items-center gap-2 self-end sm:self-auto">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs">
+                <SlidersHorizontal className="h-3.5 w-3.5" />
+                <span>Columns</span>
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-40">
+              <DropdownMenuLabel className="text-xs">Toggle columns</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              {table
+                .getAllColumns()
+                .filter((column) => column.getCanHide())
+                .map((column) => {
+                  return (
+                    <DropdownMenuCheckboxItem
+                      key={column.id}
+                      className="capitalize text-xs"
+                      checked={column.getIsVisible()}
+                      onCheckedChange={(value) => column.toggleVisibility(!!value)}
+                    >
+                      {column.id.replace('_', ' ')}
+                    </DropdownMenuCheckboxItem>
+                  );
+                })}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          <span className="text-xs text-muted-foreground whitespace-nowrap font-mono tabular-nums">
+            {rowCount} {rowCount === 1 ? 'record' : 'records'}
+          </span>
         </div>
       </div>
 
-      {/* Missed Calls Table */}
-      <div className="rounded-xl border border-slate-800/80 bg-[#0e131f] overflow-hidden">
+      {/* Main Table */}
+      <div className="rounded-xl border border-border bg-card overflow-hidden shadow-xs">
         {initialLoading ? (
           <div className="p-4">
             <table className="w-full">
@@ -121,107 +292,104 @@ export function MissedCallsView({
                 <TableRowSkeleton columns={4} />
                 <TableRowSkeleton columns={4} />
                 <TableRowSkeleton columns={4} />
-                <TableRowSkeleton columns={4} />
               </tbody>
             </table>
           </div>
-        ) : filteredMissed.length === 0 ? (
+        ) : rowCount === 0 ? (
           <EmptyState
             title="No missed calls found"
             description={
-              search || statusFilter !== 'all'
-                ? 'Try adjusting your search query or status filter.'
-                : 'No missed calls logged yet. Trigger a simulated call to create an inbound missed call record.'
+              globalFilter || statusFilter !== 'all'
+                ? 'Try adjusting your filters or search terms.'
+                : 'No missed calls recorded yet. Trigger a simulated call to start testing.'
             }
             actionText="Simulate missed call"
             onAction={onSimulate}
             loading={simulating}
           />
         ) : (
-          <div className="overflow-x-auto max-h-[650px] overflow-y-auto">
-            <table className="w-full text-left text-xs border-collapse">
-              <thead className="sticky top-0 bg-[#0c101a] text-slate-400 uppercase tracking-wider text-[11px] font-medium border-b border-slate-800/80 z-10 shadow-xs">
-                <tr>
-                  <th scope="col" className="py-2.5 px-4">Time</th>
-                  <th scope="col" className="py-2.5 px-4">Customer Phone</th>
-                  <th scope="col" className="py-2.5 px-4">Status</th>
-                  <th scope="col" className="py-2.5 px-4 text-right">Action</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60">
-                {paginatedMissed.map(m => {
-                  const isCallable = m.status === 'new' || m.status === 'queued';
-                  return (
-                    <tr
-                      key={m.id}
-                      className="hover:bg-slate-850/40 transition-colors"
-                    >
-                      <td className="py-2.5 px-4 text-slate-400 whitespace-nowrap">
-                        <RelativeTime date={m.time} />
-                      </td>
-                      <td className="py-2.5 px-4 whitespace-nowrap">
-                        <span className="font-medium text-slate-200 block">
-                          {m.customer_phone}
-                        </span>
-                        <span className="text-[10px] font-mono text-slate-400">
-                          {m.id}
-                        </span>
-                      </td>
-                      <td className="py-2.5 px-4 whitespace-nowrap">
-                        <StatusBadge status={m.status} />
-                      </td>
-                      <td className="py-2.5 px-4 text-right whitespace-nowrap">
-                        {isCallable ? (
-                          <a
-                            href={`/call/${m.id}`}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-teal-600/20 hover:bg-teal-600/30 text-teal-300 border border-teal-500/30 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-400"
-                          >
-                            <span>Open call page</span>
-                            <span aria-hidden="true">↗</span>
-                          </a>
-                        ) : (
-                          <span className="text-slate-400 text-xs">—</span>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+          <Table>
+            <TableHeader>
+              {table.getHeaderGroups().map((headerGroup) => (
+                <TableRow key={headerGroup.id}>
+                  {headerGroup.headers.map((header) => (
+                    <TableHead key={header.id} className="text-xs">
+                      {header.isPlaceholder
+                        ? null
+                        : flexRender(
+                            header.column.columnDef.header,
+                            header.getContext()
+                          )}
+                    </TableHead>
+                  ))}
+                </TableRow>
+              ))}
+            </TableHeader>
+            <TableBody>
+              {table.getRowModel().rows.map((row) => (
+                <TableRow key={row.id} className="h-11">
+                  {row.getVisibleCells().map((cell) => (
+                    <TableCell key={cell.id} className="py-2.5">
+                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                    </TableCell>
+                  ))}
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
         )}
 
-        {/* Pagination Bar */}
-        {filteredMissed.length > 0 && (
-          <div className="px-4 py-3 bg-[#0c101a] border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
-            <span>
-              Showing <strong className="text-slate-200">{startIndex}</strong> to{' '}
-              <strong className="text-slate-200">{endIndex}</strong> of{' '}
-              <strong className="text-slate-200">{filteredMissed.length}</strong> records
-            </span>
+        {/* Pagination */}
+        {rowCount > 0 && (
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-3 px-4 py-3 border-t border-border bg-card/50 text-xs text-muted-foreground">
+            <div className="flex items-center gap-1">
+              <span>Page</span>
+              <strong className="text-foreground font-mono">
+                {table.getState().pagination.pageIndex + 1}
+              </strong>
+              <span>of</span>
+              <strong className="text-foreground font-mono">
+                {table.getPageCount() || 1}
+              </strong>
+            </div>
 
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setPage(p => Math.max(1, p - 1))}
-                disabled={currentPage <= 1}
-                className="px-2.5 py-1 rounded bg-[#090d16] border border-slate-800 text-slate-300 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-400"
+            <div className="flex items-center gap-1.5">
+              <Button
+                variant="outline"
+                size="icon-sm"
+                onClick={() => table.setPageIndex(0)}
+                disabled={!table.getCanPreviousPage()}
+                title="First page"
+              >
+                <ChevronsLeft className="h-3.5 w-3.5" />
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => table.previousPage()}
+                disabled={!table.getCanPreviousPage()}
+                className="h-7 text-xs px-2.5"
               >
                 Previous
-              </button>
-              <span className="text-slate-400 tabular-nums">
-                Page {currentPage} of {totalPages}
-              </span>
-              <button
-                type="button"
-                onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-                disabled={currentPage >= totalPages}
-                className="px-2.5 py-1 rounded bg-[#090d16] border border-slate-800 text-slate-300 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-400"
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => table.nextPage()}
+                disabled={!table.getCanNextPage()}
+                className="h-7 text-xs px-2.5"
               >
                 Next
-              </button>
+              </Button>
+              <Button
+                variant="outline"
+                size="icon-sm"
+                onClick={() => table.setPageIndex(table.getPageCount() - 1)}
+                disabled={!table.getCanNextPage()}
+                title="Last page"
+              >
+                <ChevronsRight className="h-3.5 w-3.5" />
+              </Button>
             </div>
           </div>
         )}

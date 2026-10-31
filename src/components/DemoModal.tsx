@@ -1,7 +1,19 @@
 'use client';
 
+import * as React from 'react';
 import { useState } from 'react';
 import { API_BASE } from '@/lib/api';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Bell, Loader2, Send, CheckCircle2, AlertCircle, Wrench } from 'lucide-react';
 
 interface DemoModalProps {
   isOpen: boolean;
@@ -11,8 +23,6 @@ interface DemoModalProps {
 export function DemoModal({ isOpen, onClose }: DemoModalProps) {
   const [testingNotify, setTestingNotify] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
-
-  if (!isOpen) return null;
 
   const handleSendTestNotification = async () => {
     setTestingNotify(true);
@@ -29,7 +39,7 @@ export function DemoModal({ isOpen, onClose }: DemoModalProps) {
       } else {
         setTestResult({
           ok: true,
-          message: `Success! Test alert sent via ${data.provider}. Check your phone.`,
+          message: `Success! Test alert sent via ${data.provider}. Check your notification channel.`,
         });
       }
     } catch (err: any) {
@@ -43,97 +53,82 @@ export function DemoModal({ isOpen, onClose }: DemoModalProps) {
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="demo-dialog-title"
-    >
-      <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-[#0e1422] p-6 shadow-2xl space-y-4">
-        <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-          <h3 id="demo-dialog-title" className="text-sm font-semibold text-white">
-            Demo &amp; Testing Configuration
-          </h3>
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-slate-400 hover:text-white p-1 rounded-md"
-            aria-label="Close dialog"
-          >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
-
-        <div className="space-y-4 text-xs text-slate-300">
-          {/* Owner Notifications Section */}
-          <div className="rounded-lg bg-slate-900/60 border border-slate-800/80 p-3.5 space-y-3">
-            <div>
-              <p className="font-semibold text-white text-xs">Owner Notification Alert</p>
-              <p className="text-[11px] text-slate-400 mt-0.5">
-                Test the phone push notification flow to Telegram or Discord configured in <code className="bg-slate-850 px-1 py-0.5 rounded font-mono">.env</code>.
-              </p>
+    <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <div className="flex items-center gap-2">
+            <div className="h-8 w-8 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center shrink-0 text-primary">
+              <Wrench className="h-4 w-4" />
             </div>
+            <div>
+              <DialogTitle className="text-base font-semibold text-foreground">
+                Demo &amp; Testing Configuration
+              </DialogTitle>
+              <DialogDescription className="text-xs text-muted-foreground mt-0.5">
+                Diagnostics and real-time integration tools.
+              </DialogDescription>
+            </div>
+          </div>
+        </DialogHeader>
 
-            <button
-              type="button"
-              onClick={handleSendTestNotification}
-              disabled={testingNotify}
-              className="inline-flex items-center justify-center gap-2 px-3.5 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-500 text-white font-medium text-xs transition-colors disabled:opacity-50"
-            >
-              {testingNotify ? (
-                <>
-                  <span className="h-3 w-3 rounded-full border-2 border-white/30 border-t-white animate-spin" />
-                  <span>Sending alert...</span>
-                </>
-              ) : (
-                <span>Send test notification</span>
-              )}
-            </button>
+        <div className="space-y-4 py-2">
+          {/* Owner Notifications Section */}
+          <div className="rounded-lg bg-muted/40 border border-border p-4 space-y-3">
+            <div className="flex items-center gap-2">
+              <Bell className="h-4 w-4 text-primary" />
+              <p className="font-semibold text-foreground text-xs">Owner Notification Alert</p>
+            </div>
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              Test the phone push notification flow to Telegram or Discord configured in{' '}
+              <code className="bg-muted px-1 py-0.5 rounded text-[11px] font-mono text-foreground border border-border">.env</code>.
+            </p>
+
+            <div>
+              <Button
+                size="sm"
+                onClick={handleSendTestNotification}
+                disabled={testingNotify}
+                className="text-xs gap-1.5 h-8 font-medium shadow-xs"
+              >
+                {testingNotify ? (
+                  <>
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <span>Sending alert...</span>
+                  </>
+                ) : (
+                  <>
+                    <Send className="h-3 w-3" />
+                    <span>Send test notification</span>
+                  </>
+                )}
+              </Button>
+            </div>
 
             {testResult && (
               <div
-                className={`p-2.5 rounded-lg text-xs leading-normal border ${
+                className={`p-3 rounded-lg text-xs leading-normal flex items-start gap-2 border animate-in fade-in duration-150 ${
                   testResult.ok
-                    ? 'bg-teal-950/40 border-teal-800/50 text-teal-200'
-                    : 'bg-rose-950/40 border-rose-800/50 text-rose-200'
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600 dark:text-emerald-400'
+                    : 'bg-destructive/10 border-destructive/30 text-destructive'
                 }`}
               >
-                {testResult.message}
+                {testResult.ok ? (
+                  <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5 text-emerald-500" />
+                ) : (
+                  <AlertCircle className="h-4 w-4 shrink-0 mt-0.5 text-destructive" />
+                )}
+                <span>{testResult.message}</span>
               </div>
             )}
           </div>
-
-          <p>
-            You can generate incoming missed calls and live AI voice callback sessions using the primary{' '}
-            <strong className="text-teal-300">&ldquo;Simulate missed call&rdquo;</strong> action.
-          </p>
-
-          <div className="rounded-lg bg-amber-500/10 border border-amber-500/25 p-3 text-amber-200">
-            <p className="font-semibold text-amber-300 mb-1">Clear Test Data Notice</p>
-            <p className="text-[11px] leading-relaxed">
-              No reset route currently exists in <code className="bg-amber-950/40 px-1 py-0.5 rounded font-mono">server/index.ts</code>. To safely clear calls and jobs, add an endpoint such as:
-            </p>
-            <pre className="mt-2 text-[10px] bg-slate-950/80 p-2 rounded font-mono text-slate-200 overflow-x-auto">
-              {`app.post('/api/test-data/reset', (_req, res) => {
-  db.exec('DELETE FROM turns; DELETE FROM summaries; DELETE FROM calls; DELETE FROM callback_jobs; DELETE FROM missed_calls;');
-  res.json({ ok: true });
-});`}
-            </pre>
-          </div>
         </div>
 
-        <div className="flex justify-end pt-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition-colors"
-          >
+        <DialogFooter>
+          <Button variant="outline" size="sm" onClick={onClose} className="text-xs">
             Close
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

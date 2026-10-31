@@ -4,7 +4,7 @@
 
 Missed-Call Rescuer is an automated voice callback agent for small service businesses. When a call is missed, the system records the missed call and provides a callback URL (`/call/{id}`). The voice assistant greets the caller, confirms caller intent, handles barge-in interruptions, and records a structured summary for the business owner dashboard.
 
-For measured latency benchmarks (Time-to-First-Token, Time-to-First-Audio, and total time to first audio byte), see the [Latency section of README.md](file:///c:/projects/Missed-Call-Rescuer/README.md#latency).
+For measured latency benchmarks (Turn Detection, Time-to-First-Token, Time-to-First-Audio, and total time to first audio byte), see the [Latency section of README.md](file:///c:/projects/Missed-Call-Rescuer/README.md#latency).
 
 ---
 
@@ -15,9 +15,8 @@ flowchart TD
     subgraph Browser ["Client Tier (Browser)"]
         UI_Dash["Owner Dashboard (/page.tsx)"]
         UI_Call["Customer Call Page (/call/[token]/page.tsx)"]
-        WebSpeech["Web Speech API (STT)"]
+        Worklet["AudioWorklet (16 kHz PCM Downsampler)"]
         WebAudio["Web Audio API (24 kHz PCM Playback)"]
-        BargeDetect["Self-Speech Filter"]
     end
 
     subgraph Server ["Application Server (Node.js/Express: 4000)"]
@@ -25,25 +24,33 @@ flowchart TD
         WS_Server["WebSocket Server (/ws)"]
         SSE_Broker["SSE Event Broker (/events.ts)"]
         Session["Session State Machine (/session.ts)"]
+        STT_Client["AssemblyAI STT Client (/stt.ts)"]
+        TTS_Client["AssemblyAI TTS Client (/tts.ts)"]
         EarlyChunk["Early Clause & Word Chunking Buffer"]
     end
 
     subgraph External ["External AI Services"]
         LLM["Groq API (qwen/qwen3.8-27b)"]
-        AAI["AssemblyAI Streaming TTS (WebSocket)"]
+        AAI_STT["AssemblyAI Streaming STT (v3 WebSocket: universal-3-6-pro)"]
+        AAI_TTS["AssemblyAI Streaming TTS (v1 WebSocket: assemblyai-tts-1)"]
     end
 
     subgraph Storage ["Persistence Layer"]
         DB[(SQLite / better-sqlite3: data/app.db)]
     end
 
-    UI_Call <--> |WebSocket JSON & Binary PCM| WS_Server
+    UI_Call <--> |WebSocket JSON & 16kHz PCM (Mic)| WS_Server
+    WS_Server --> |Binary 16kHz PCM| STT_Client
+    STT_Client <--> |WebSocket| AAI_STT
+    STT_Client --> |Partials & Final Turns| Session
     UI_Dash <--> |SSE Stream (/api/events)| SSE_Broker
     HTTP --> DB
     WS_Server --> Session
     Session --> EarlyChunk
     EarlyChunk --> LLM
-    EarlyChunk --> AAI
+    EarlyChunk --> TTS_Client
+    TTS_Client <--> |WebSocket| AAI_TTS
+    TTS_Client --> |24kHz PCM Playback| WS_Server
     Session --> DB
     Session --> SSE_Broker
 ```
@@ -55,7 +62,7 @@ flowchart TD
 ### 3.1. Express Server & WebSocket Routing ([`server/index.ts`](file:///c:/projects/Missed-Call-Rescuer/server/index.ts))
 - Runs on port 4000 (configurable via `PORT` environment variable).
 - **REST Endpoints**:
-  - `GET /api/business`: Returns the configured business profile.
+  - `GET /api/business`: Returns the configured business profile plus active `sttProvider`.
   - `GET /api/missed-calls`: Returns missed calls ordered by time descending.
   - `POST /api/missed-calls/simulate`: Creates a missed call record (`mc_<timestamp>`), queues a row in `callback_jobs` (`job_<timestamp>`), updates missed call status to `queued`, and broadcasts a `missed_call` SSE event.
   - `GET /api/calls`: Returns calls ordered by start time with parsed `latency` and `usage` JSON.
@@ -69,17 +76,21 @@ flowchart TD
   - Attached to the HTTP server for `/ws` connections.
   - Incoming client messages:
     - `{ type: "join", missedCallId: string }`
-    - `{ type: "transcript", final: true, text: string }`
+    - `{ type: "transcript", final: true, text: string }` (browser fallback)
     - `{ type: "barge_in" }`
     - `{ type: "end", reason?: string }`
+    - Binary frames: raw 16 kHz linear PCM microphone chunks from the browser's `AudioWorklet`, forwarded directly to `session.stt.sendAudio()`.
   - Outgoing server messages:
+    - `{ type: "config", sttProvider: string }`
     - `{ type: "state", state: string }`
+    - `{ type: "partial", text: string }`: live partial transcripts from AssemblyAI STT.
+    - `{ type: "customer_transcript", text: string }`: final turn customer transcript.
     - `{ type: "agent_text", text: string }`
     - `{ type: "stop_audio" }`
-    - `{ type: "metrics", totalMs, llmFirstTokenMs, ttsFirstAudioMs, timeToFirstAudio }`
+    - `{ type: "metrics", totalMs, turnDetectionMs, llmFirstTokenMs, ttsFirstAudioMs, timeToFirstAudio }`
     - `{ type: "summary", summary: object }`
     - `{ type: "error", message: string }`
-    - Binary frames: raw 24 kHz linear PCM chunks (`Uint8Array`).
+    - Binary frames: raw 24 kHz linear PCM chunks (`Uint8Array`) for agent speech playback.
 
 ### 3.2. Session State Machine & Orchestrator ([`server/session.ts`](file:///c:/projects/Missed-Call-Rescuer/server/session.ts))
 - **State Machine**:
@@ -88,18 +99,27 @@ flowchart TD
   - Turn execution: `LISTENING` -> `THINKING` (LLM streaming) -> `SPEAKING` (first audio chunk arrives) -> `LISTENING` (turn finished).
   - Barge-in: `SPEAKING` or `THINKING` -> `LISTENING` (generation canceled, audio halted).
   - Termination: `ENDING` -> `SUMMARIZING` -> `DONE`.
-- **Timers**:
+- **Timers & Limits**:
   - Hard session timeout: 5 minutes (`session.maxTimer = setTimeout(() => endSession(session, 'timeout'), 5 * 60 * 1000)`).
+  - Closes AssemblyAI STT and TTS sessions cleanly on call end, socket close, or timeout.
   - TTS keep-alive: 30 seconds (`session.keepAliveTimer = setInterval(..., 30000)`).
 - **Concurrency & Pacing**:
   - Drops incoming utterances while `generating = true` to prevent overlapping responses.
 - **Persistence Deferral**:
   - Customer turn inserts into `turns` are deferred to the next event-loop turn using `setImmediate` (`deferDb = true`) to avoid blocking LLM initiation.
 
-### 3.3. AssemblyAI Streaming TTS Client ([`server/tts.ts`](file:///c:/projects/Missed-Call-Rescuer/server/tts.ts))
+### 3.3. AssemblyAI Streaming STT Client ([`server/stt.ts`](file:///c:/projects/Missed-Call-Rescuer/server/stt.ts))
+- Endpoint: `wss://streaming.assemblyai.com/v3/ws?speech_model=universal-3-6-pro&sample_rate=16000&encoding=pcm_s16le&format_turns=true&min_turn_silence=128&max_turn_silence=1000`.
+- **Authentication**: Sent in WebSocket connection headers using `Authorization: <ASSEMBLYAI_API_KEY>` (no `Bearer ` prefix).
+- **Audio Format**: 16 kHz mono 16-bit little-endian PCM (`pcm_s16le`), streamed in ~50 ms (1,600 byte) frames.
+- **Turn Detection**:
+  - Receives `Turn` messages with `end_of_turn: false` (interim partials) and `end_of_turn: true` (finalized turns).
+  - Word-level timestamps (`words` array) provide `lastWord.end`, allowing precise measurement of `turnDetectionMs` (`totalAudioMs - lastWord.end`).
+- **Clean Termination**: Emits `{ type: "Terminate" }` on session close to avoid idle billing.
+
+### 3.4. AssemblyAI Streaming TTS Client ([`server/tts.ts`](file:///c:/projects/Missed-Call-Rescuer/server/tts.ts))
 - Endpoint: `wss://tts.us.assemblyai.com/v1/ws`.
 - Voice: `aai-jane` (or `ASSEMBLYAI_VOICE_ID`), 24 kHz sample rate, 16-bit linear PCM (`pcm_s16le`), English.
-- **Authentication**: Sent in WebSocket connection headers using the `Authorization` header with the raw API key value (`Authorization: <api-key>`), without a `Bearer ` prefix.
 - **Protocol**:
   - Sends `{ type: "Generate", text }` followed by `{ type: "Flush" }`.
   - Receives base64-encoded `Audio` frames and converts them to binary buffers.
@@ -107,7 +127,7 @@ flowchart TD
   - Sends periodic `{ type: "KeepAlive" }` frames.
   - Includes single-attempt reconnection logic on connection loss.
 
-### 3.4. LLM Integration & Summarization ([`server/llm.ts`](file:///c:/projects/Missed-Call-Rescuer/server/llm.ts))
+### 3.5. LLM Integration & Summarization ([`server/llm.ts`](file:///c:/projects/Missed-Call-Rescuer/server/llm.ts))
 - Provider: OpenAI-compatible client targeted at Groq (`https://api.groq.com/openai/v1`).
 - Configured model: `qwen/qwen3.8-27b` (via `OPENAI_MODEL`).
 - System constraints:
@@ -129,7 +149,7 @@ flowchart TD
   }
   ```
 
-### 3.5. Persistence Layer ([`server/db.ts`](file:///c:/projects/Missed-Call-Rescuer/server/db.ts))
+### 3.6. Persistence Layer ([`server/db.ts`](file:///c:/projects/Missed-Call-Rescuer/server/db.ts))
 - SQLite using `better-sqlite3` located at `data/app.db`.
 - Configured with `WAL` journal mode and foreign keys enabled.
 - **Tables**:
@@ -151,22 +171,24 @@ flowchart TD
 
 ## 4. Latency Breakdown & Pipeline Timing
 
-The primary latency metric is strictly defined as the **time from end of recognized speech to first audio byte**.
+The primary latency metric is strictly defined as the **time from arrival of the end-of-turn event to the first playable audio byte**. Turn detection delay is tracked and presented separately.
 
-Browser speech recognition (`webkitSpeechRecognition` in Chrome or Edge) enforces an internal silence window of approximately 0.8 to 1.2 seconds before marking speech final, which precedes the measured timer.
-
-### Measured Turn Latency Stages (Average)
+### Measured Turn Latency Stages (Average from automated 5-turn run)
 
 ```
-0 ms ── Speech recognition turn end
+0 ms ── Customer stops speaking
   │
-  ├─ 0 to 305 ms (305 ms) : LLM streams first clause / 6 words
+  ├─ 0 to 389 ms (389 ms): AssemblyAI STT Turn Detection (endpointing silence threshold)
+  │                         [t_turn_end timestamp marked on end_of_turn: true]
   │
-  ├─ 305 to 331 ms (26 ms): Early chunk boundary extraction & TTS WebSocket dispatch
+  ├─ 389 to 709 ms (320 ms): LLM TTFT (Groq qwen/qwen3.8-27b streams first clause / 6 words)
   │
-  └─ 331 to 693 ms (362 ms): AssemblyAI TTS first audio chunk delivered
-                               │
-                             693 ms total (time from end of recognized speech to first audio byte)
+  ├─ 709 to 732 ms (23 ms): Early chunk boundary extraction & TTS WebSocket dispatch
+  │
+  └─ 732 to 1100 ms (368 ms): AssemblyAI TTS first audio chunk delivered to browser
+                              │
+                            711 ms Processing Pipeline (t_turn_end to first audio byte)
+                            1100 ms End-to-End Turnaround Time
 ```
 
 - **Early Chunking ([`extractNextChunk`](file:///c:/projects/Missed-Call-Rescuer/server/session.ts#L31-L74))**: First chunk is dispatched to TTS when punctuation (`,`, `;`, `:`, `—`, `--`, `.`, `!`, `?`) occurs OR at least 6 words (`FIRST_CHUNK_MIN_WORDS`) are collected. Subsequent chunks split on sentence punctuation (`.`, `!`, `?`).
@@ -176,12 +198,12 @@ Browser speech recognition (`webkitSpeechRecognition` in Chrome or Edge) enforce
 
 ## 5. Barge-In & Safety Handling
 
-### 5.1. Barge-In Guard: Self-Speech Filter
-The customer call interface ([`src/app/call/[token]/page.tsx`](file:///c:/projects/Missed-Call-Rescuer/src/app/call/%5Btoken%5D/page.tsx#L83-L94)) includes guards to prevent false barge-in triggers during `SPEAKING` and `THINKING` states:
-1. **Word Threshold**: At least 2 words in the interim transcript.
+### 5.1. Server-Side Barge-In with Self-Speech Filter
+The system moves barge-in detection to the server ([`server/session.ts`](file:///c:/projects/Missed-Call-Rescuer/server/session.ts)):
+1. **Word Threshold**: At least 2 words in the AssemblyAI partial transcript.
 2. **Time Guard**: At least 400 ms since agent speech began.
-3. **Self-Speech Filter**: Jaccard word-overlap similarity check between the interim transcript and the agent's current spoken text. If similarity exceeds 0.6, the utterance is treated as feedback and ignored. It is a text-overlap filter on recognized transcript words, not acoustic echo cancellation.
-4. **Cancellation**: If barge-in triggers, client sends `{ type: "barge_in" }`, stops local Web Audio playback, and the server aborts the LLM request, cancels TTS synthesis, and marks the turn as `interrupted = 1`.
+3. **Self-Speech Filter**: Jaccard word-overlap similarity check between the interim transcript and the agent's current spoken text. If similarity exceeds 0.6, the utterance is treated as speaker feedback/echo and ignored.
+4. **Immediate Cancellation**: When barge-in triggers, the server sends `{ type: "stop_audio" }` to the client, cancels TTS synthesis (`Cancel`), aborts the in-flight LLM stream (`AbortController`), and marks the current agent turn as `interrupted = 1`.
 
 ### 5.2. Safety Controls & Call Termination
 - **Automated Disclosure**: Assistant greeting states it is an automated assistant calling on behalf of the business.
@@ -197,9 +219,11 @@ The customer call interface ([`src/app/call/[token]/page.tsx`](file:///c:/projec
 - Connects to `/api/events` via Server-Sent Events to automatically reload on `missed_call`, `call_ended`, and `summary_ready`.
 - Button to trigger `POST /api/missed-calls/simulate`.
 - Displays missed calls and status badges (`new`, `queued`, `calling`, `done`, `opted_out`).
-- Displays call list with latency metrics in milliseconds (Total time, LLM TTFT, and TTS TTFA) and structured summary cards.
+- Displays call list with latency metrics in milliseconds (Total time, Turn detection, LLM TTFT, and TTS TTFA) and structured summary cards.
 
 ### 6.2. Customer Call Page ([`src/app/call/[token]/page.tsx`](file:///c:/projects/Missed-Call-Rescuer/src/app/call/%5Btoken%5D/page.tsx))
-- Web Speech API (`webkitSpeechRecognition`) for speech-to-text.
+- Microphone capture via `getUserMedia` routed through `AudioWorklet` ([`public/audio-processor.js`](file:///c:/projects/Missed-Call-Rescuer/public/audio-processor.js)).
+- Downsamples client audio to 16 kHz mono 16-bit signed PCM and streams chunks over the WebSocket.
+- Renders live partial transcripts as words are spoken.
 - Web Audio API `AudioContext` scheduled at 24 kHz for sequential linear PCM playback.
 - Displays live dialogue transcript, real-time latency indicators, and call summaries upon completion.

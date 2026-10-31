@@ -88,15 +88,29 @@ export class TtsClient {
       const ws = new WebSocket(url, { headers: { Authorization: this.apiKey } });
       this.ws = ws;
 
+      const connectTimeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          try { ws.terminate(); } catch {}
+          reject(new Error(`TTS connection timed out after 8000ms (voice_id=${this.voiceId})`));
+        }
+      }, 8000);
+
+      const cleanupTimeout = () => {
+        clearTimeout(connectTimeout);
+      };
+
       ws.on('message', (data: WebSocket.RawData) => {
         let msg: any;
         try { msg = JSON.parse(data.toString()); } catch { return; }
         if (!this.connected && msg.type === 'Begin') {
+          cleanupTimeout();
           this.connected = true;
           if (!settled) { settled = true; resolve(); }
           return;
         }
         if (!this.connected && msg.type === 'Error') {
+          cleanupTimeout();
           if (!settled) { settled = true; reject(new Error(`TTS ${msg.error_code}: ${msg.error} (voice_id=${this.voiceId})`)); }
           return;
         }
@@ -108,6 +122,7 @@ export class TtsClient {
       });
 
       ws.on('error', (err: Error) => {
+        cleanupTimeout();
         if (!settled) {
           settled = true;
           reject(err);
@@ -116,6 +131,7 @@ export class TtsClient {
       });
 
       ws.on('close', () => {
+        cleanupTimeout();
         this.connected = false;
         this.ws = null;
         // unblock any waiters
