@@ -56,8 +56,7 @@ app.get('/api/business/voices', (_req, res) => {
   res.json({ voices: ASSEMBLYAI_VOICES });
 });
 
-// In-memory cache for synthesized voice preview PCM audio (per voiceId)
-// 24kHz 16-bit mono PCM is ~48 kB/s; ~1.4s preview = ~67 kB per voice. 16 voices = ~1.1 MB RAM.
+// In-memory cache for synthesized voice preview WAV audio (per voiceId)
 const previewAudioCache = new Map<string, Buffer>();
 const MAX_PREVIEW_CACHE = 16;
 
@@ -65,18 +64,18 @@ const MAX_PREVIEW_CACHE = 16;
 // Never shared with live call pipeline.
 const previewHttpsAgent = new https.Agent({
   keepAlive: true,
-  maxSockets: 4,
+  maxSockets: 16,
   timeout: 10000,
 });
 
-// Rate limiting: per-voice cooldown (3s) and global IP cap (10/min)
+// Rate limiting: per-voice cooldown (3s) and global IP cap (20/min)
 const perVoiceCooldown = new Map<string, number>(); // key: `${ip}:${voiceId}` -> timestamp
 const globalIpRequests = new Map<string, number[]>(); // ip -> timestamps[]
 
 // Fixed business greeting (9 words, 47 chars, ~1.4s audio)
 const PREVIEW_TEXT = 'Thanks for calling. How can we help you today?';
 const PER_VOICE_COOLDOWN_MS = 3000;
-const GLOBAL_MAX_PER_MINUTE = 10;
+const GLOBAL_MAX_PER_MINUTE = 20;
 
 app.post('/api/business/voice-preview', async (req, res) => {
   const ip = req.ip || req.socket.remoteAddress || 'global';
@@ -84,21 +83,24 @@ app.post('/api/business/voice-preview', async (req, res) => {
   const startTime = Date.now();
 
   const { voiceId } = req.body || {};
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(`[Preview] Received request for voice "${voiceId}" from ${ip}`);
+  }
   if (!voiceId || typeof voiceId !== 'string' || !isValidVoiceId(voiceId)) {
     return res.status(400).json({ error: 'Invalid voice ID. Please select a valid voice from the list.' });
   }
 
   // 1. Check in-memory audio cache first (Cache HIT costs 0 TTS credits and 0 API calls)
-  const cachedPcm = previewAudioCache.get(voiceId);
-  if (cachedPcm) {
+  const cachedWav = previewAudioCache.get(voiceId);
+  if (cachedWav) {
     if (process.env.NODE_ENV !== 'production') {
-      console.log(`[Preview] Cache HIT for voice "${voiceId}": served ${cachedPcm.length} bytes in ${Date.now() - startTime}ms`);
+      console.log(`[Preview] Cache HIT for voice "${voiceId}": served ${cachedWav.length} bytes in ${Date.now() - startTime}ms`);
     }
-    res.setHeader('Content-Type', 'audio/pcm;rate=24000;channels=1');
-    res.setHeader('Content-Length', cachedPcm.length);
-    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Content-Length', cachedWav.length);
+    res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Audio-Cache', 'HIT');
-    return res.send(cachedPcm);
+    return res.send(cachedWav);
   }
 
   // 2. Rate limits for Cache MISS (synthesis generation):
@@ -112,11 +114,11 @@ app.post('/api/business/voice-preview', async (req, res) => {
     });
   }
 
-  // Check global rate limit (10 per minute per IP)
+  // Check global rate limit (20 per minute per IP)
   const ipTimestamps = (globalIpRequests.get(ip) || []).filter((t) => now - t < 60000);
   if (ipTimestamps.length >= GLOBAL_MAX_PER_MINUTE) {
     return res.status(429).json({
-      error: 'Preview rate limit reached (max 10 previews per minute). Please wait a moment.',
+      error: 'Preview rate limit reached. Please wait a moment.',
     });
   }
 
@@ -131,16 +133,33 @@ app.post('/api/business/voice-preview', async (req, res) => {
   }
 
   let clientAborted = false;
+  let timedOut = false;
   let upstreamReq: http.ClientRequest | null = null;
+  let upstreamStream: http.IncomingMessage | null = null;
 
-  req.on('close', () => {
+  const onClientClose = () => {
     if (!res.writableEnded) {
       clientAborted = true;
-      if (upstreamReq) {
+      if (upstreamStream && !upstreamStream.destroyed) {
+        upstreamStream.destroy();
+      }
+      if (upstreamReq && !upstreamReq.destroyed) {
         upstreamReq.destroy();
       }
     }
-  });
+  };
+
+  res.on('close', onClientClose);
+
+  const timeoutTimer = setTimeout(() => {
+    timedOut = true;
+    if (upstreamStream && !upstreamStream.destroyed) {
+      upstreamStream.destroy();
+    }
+    if (upstreamReq && !upstreamReq.destroyed) {
+      upstreamReq.destroy(new Error('UPSTREAM_TIMEOUT'));
+    }
+  }, 8000);
 
   try {
     const postData = JSON.stringify({
@@ -163,17 +182,14 @@ app.post('/api/business/voice-preview', async (req, res) => {
             'Content-Type': 'application/json',
             'Content-Length': Buffer.byteLength(postData),
           },
-          timeout: 10000,
         },
         (uRes) => {
+          upstreamStream = uRes;
           resolve({ statusCode: uRes.statusCode || 500, headers: uRes.headers, stream: uRes });
         }
       );
 
       uReq.on('error', (err) => reject(err));
-      uReq.on('timeout', () => {
-        uReq.destroy(new Error('AssemblyAI preview request timed out'));
-      });
 
       upstreamReq = uReq;
       uReq.write(postData);
@@ -191,50 +207,70 @@ app.post('/api/business/voice-preview', async (req, res) => {
       return res.status(502).json({ error: `Voice synthesis failed (HTTP ${statusCode}).` });
     }
 
-    // Set streaming headers for chunked audio response
-    res.setHeader('Content-Type', 'audio/pcm;rate=24000;channels=1');
-    res.setHeader('Transfer-Encoding', 'chunked');
-    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-    res.setHeader('X-Audio-Cache', 'MISS');
-
     const receivedChunks: Buffer[] = [];
-    let firstChunkTime: number | null = null;
-    let totalBytes = 0;
-
     for await (const chunk of stream) {
-      if (clientAborted) break;
+      if (clientAborted || timedOut) break;
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      if (!firstChunkTime) {
-        firstChunkTime = Date.now();
-        if (process.env.NODE_ENV !== 'production') {
-          console.log(`[Preview] First chunk for "${voiceId}": ${firstChunkTime - startTime}ms (${buf.length} bytes)`);
-        }
-      }
       receivedChunks.push(buf);
-      totalBytes += buf.length;
-      res.write(buf);
     }
 
-    if (!clientAborted) {
-      res.end();
+    if (clientAborted) {
+      return;
+    }
 
-      if (receivedChunks.length > 0) {
-        const fullPcm = Buffer.concat(receivedChunks);
-        if (previewAudioCache.size < MAX_PREVIEW_CACHE) {
-          previewAudioCache.set(voiceId, fullPcm);
-        }
-        if (process.env.NODE_ENV !== 'production') {
-          console.log(`[Preview] Complete for "${voiceId}": total ${Date.now() - startTime}ms, ${totalBytes} bytes cached`);
-        }
+    if (timedOut) {
+      if (!res.headersSent) {
+        return res.status(504).json({ error: 'Voice preview synthesis timed out. Please try again.' });
       }
+      return;
+    }
+
+    if (receivedChunks.length === 0) {
+      if (!res.headersSent) {
+        return res.status(502).json({ error: 'No audio returned from voice synthesis service.' });
+      }
+      return;
+    }
+
+    const pcmBuffer = Buffer.concat(receivedChunks);
+    const wavBuffer = pcmToWav(pcmBuffer, 24000, 1, 16);
+
+    if (previewAudioCache.size < MAX_PREVIEW_CACHE) {
+      previewAudioCache.set(voiceId, wavBuffer);
+    }
+
+    if (!res.headersSent) {
+      res.setHeader('Content-Type', 'audio/wav');
+      res.setHeader('Content-Length', wavBuffer.length);
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Audio-Cache', 'MISS');
+      return res.send(wavBuffer);
     }
   } catch (err: any) {
     if (clientAborted) return;
+    if (timedOut || err?.message === 'UPSTREAM_TIMEOUT') {
+      if (!res.headersSent) {
+        return res.status(504).json({ error: 'Voice preview synthesis timed out. Please try again.' });
+      }
+      return;
+    }
     console.error('Voice preview synthesis error:', err?.message);
     if (!res.headersSent) {
       return res.status(502).json({ error: 'Voice synthesis preview failed. Please try again.' });
-    } else {
-      res.end();
+    }
+  } finally {
+    clearTimeout(timeoutTimer);
+    res.off('close', onClientClose);
+    if (upstreamStream && !upstreamStream.destroyed) {
+      upstreamStream.destroy();
+    }
+    if (upstreamReq && !upstreamReq.destroyed) {
+      upstreamReq.destroy();
+    }
+    if (process.env.NODE_ENV !== 'production') {
+      const sockCount = Object.values(previewHttpsAgent.sockets).reduce((acc, arr) => acc + (arr?.length || 0), 0);
+      const freeCount = Object.values(previewHttpsAgent.freeSockets).reduce((acc, arr) => acc + (arr?.length || 0), 0);
+      console.log(`[Preview] Sockets: active=${sockCount}, free=${freeCount}`);
     }
   }
 });
