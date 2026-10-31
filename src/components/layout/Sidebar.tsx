@@ -8,7 +8,6 @@ import {
   Settings,
   ChevronLeft,
   ChevronRight,
-  Radio,
   SlidersHorizontal,
 } from 'lucide-react';
 import { Logomark } from './Logomark';

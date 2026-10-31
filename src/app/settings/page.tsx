@@ -99,8 +99,7 @@ export default function SettingsPage() {
   // Active in-page section for sticky nav
   const [activeSection, setActiveSection] = useState('section-general');
 
-  // Dismissible notice banner state
-  const [noticeDismissed, setNoticeDismissed] = useState(false);
+  // Dismissible notice banner state via useSyncExternalStore
 
   // Form fields
   const [name, setName] = useState('');
@@ -147,22 +146,26 @@ export default function SettingsPage() {
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
 
-  // Check notice dismissal from localStorage on client mount
-  useEffect(() => {
-    try {
-      const dismissed = localStorage.getItem(STORAGE_KEY_NOTICE);
-      if (dismissed === 'true') {
-        setNoticeDismissed(true);
+  // Check notice dismissal from localStorage safely without cascading renders
+  const noticeDismissed = React.useSyncExternalStore(
+    (cb) => {
+      window.addEventListener('storage', cb);
+      return () => window.removeEventListener('storage', cb);
+    },
+    () => {
+      try {
+        return localStorage.getItem(STORAGE_KEY_NOTICE) === 'true';
+      } catch {
+        return false;
       }
-    } catch {
-      // ignore localStorage exceptions
-    }
-  }, []);
+    },
+    () => false
+  );
 
   const handleDismissNotice = () => {
-    setNoticeDismissed(true);
     try {
       localStorage.setItem(STORAGE_KEY_NOTICE, 'true');
+      window.dispatchEvent(new Event('storage'));
     } catch {
       // ignore localStorage exceptions
     }
@@ -1213,9 +1216,10 @@ export default function SettingsPage() {
                   size="sm"
                   onClick={() => setShowResetConfirm(true)}
                   disabled={saving}
-                  className="h-8 text-xs font-medium"
+                  className="h-8 text-xs font-medium gap-1.5"
                 >
-                  Reset
+                  <RotateCcw className="h-3 w-3" />
+                  <span>Reset</span>
                 </Button>
                 <Button
                   type="button"
