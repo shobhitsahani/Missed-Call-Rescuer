@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS calls (
   end_reason TEXT,
   latency_json TEXT,
   usage_json TEXT,
+  notified_at TEXT,
+  notify_status TEXT,
+  notify_provider TEXT,
+  notify_error TEXT,
   FOREIGN KEY (business_id) REFERENCES businesses(id)
 );
 CREATE TABLE IF NOT EXISTS turns (
@@ -75,6 +79,20 @@ CREATE TABLE IF NOT EXISTS summaries (
   FOREIGN KEY (call_id) REFERENCES calls(id)
 );
 `);
+
+// Safe, idempotent column migration for existing databases
+export function ensureColumn(table: string, column: string, typeDef: string) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!cols.some(c => c.name === column)) {
+    db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeDef}`).run();
+  }
+}
+
+// Call owner notification tracking columns
+ensureColumn('calls', 'notified_at', 'TEXT');
+ensureColumn('calls', 'notify_status', 'TEXT');
+ensureColumn('calls', 'notify_provider', 'TEXT');
+ensureColumn('calls', 'notify_error', 'TEXT');
 
 const seedBiz = {
   id: 'biz_1',

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { StatusBadge } from './StatusBadge';
 import { TranscriptBubble } from './TranscriptBubble';
 import { RelativeTime } from './RelativeTime';
+import { API_BASE } from '@/lib/api';
 import {
   formatPlainTextTranscript,
   formatJsonTranscript,
@@ -22,6 +23,10 @@ export interface CallDetails {
   end_reason: string | null;
   latency: LatencyItem[];
   usage?: any;
+  notified_at?: string | null;
+  notify_status?: string | null;
+  notify_provider?: string | null;
+  notify_error?: string | null;
 }
 
 export interface SummaryDetails {
@@ -43,6 +48,24 @@ export interface TurnDetails {
   text: string;
   interrupted: number;
   ts: string;
+}
+
+function formatNotifiedTime(iso?: string | null): string {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  } catch {
+    return '';
+  }
+}
+
+function formatProviderLabel(provider?: string | null): string {
+  if (!provider) return 'Owner';
+  const p = provider.toLowerCase();
+  if (p === 'telegram') return 'Telegram';
+  if (p === 'discord') return 'Discord';
+  return provider;
 }
 
 interface DrawerProps {
@@ -68,6 +91,61 @@ export function Drawer({
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
   const copyTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [resending, setResending] = useState(false);
+  const [resendStatusMsg, setResendStatusMsg] = useState<string | null>(null);
+  const [resendIsError, setResendIsError] = useState(false);
+  const [localNotify, setLocalNotify] = useState<{
+    notified_at?: string | null;
+    notify_status?: string | null;
+    notify_provider?: string | null;
+    notify_error?: string | null;
+  }>({});
+
+  useEffect(() => {
+    setResending(false);
+    setResendStatusMsg(null);
+    setResendIsError(false);
+    if (call) {
+      setLocalNotify({
+        notified_at: call.notified_at,
+        notify_status: call.notify_status,
+        notify_provider: call.notify_provider,
+        notify_error: call.notify_error,
+      });
+    }
+  }, [call?.id, call?.notified_at, call?.notify_status, call?.notify_error, call?.notify_provider]);
+
+  const handleResend = async () => {
+    if (!call) return;
+    setResending(true);
+    setResendStatusMsg(null);
+    setResendIsError(false);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/calls/${call.id}/notify`, {
+        method: 'POST',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setResendIsError(true);
+        setResendStatusMsg(data?.error || `Resend failed (HTTP ${res.status})`);
+      } else {
+        setResendIsError(false);
+        setResendStatusMsg('Notification sent');
+        setLocalNotify({
+          notified_at: data.notified_at || new Date().toISOString(),
+          notify_status: 'sent',
+          notify_provider: data.provider,
+          notify_error: null,
+        });
+      }
+    } catch (err: any) {
+      setResendIsError(true);
+      setResendStatusMsg(err?.message || 'Network error');
+    } finally {
+      setResending(false);
+    }
+  };
 
   // Clear copy state on call change or close
   useEffect(() => {
@@ -288,6 +366,50 @@ export function Drawer({
 
           {/* Scrollable Content */}
           <div className="flex-1 overflow-y-auto p-5 space-y-6">
+            {/* Owner Notification Status Banner */}
+            <div className="rounded-lg bg-slate-900/60 border border-slate-800/80 p-3 flex items-center justify-between gap-3 text-xs">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span
+                  className={`h-2 w-2 rounded-full shrink-0 ${
+                    localNotify.notify_status === 'sent'
+                      ? 'bg-teal-400'
+                      : localNotify.notify_status === 'failed'
+                      ? 'bg-rose-400'
+                      : 'bg-slate-500'
+                  }`}
+                  aria-hidden="true"
+                />
+                <div className="min-w-0">
+                  <p className="text-slate-200 font-medium truncate">
+                    {localNotify.notify_status === 'sent'
+                      ? `Owner notified via ${formatProviderLabel(localNotify.notify_provider)} at ${formatNotifiedTime(localNotify.notified_at)}`
+                      : localNotify.notify_status === 'failed'
+                      ? 'Notification failed'
+                      : 'Owner not notified'}
+                  </p>
+                  {localNotify.notify_status === 'failed' && localNotify.notify_error && !resendStatusMsg && (
+                    <p className="text-[11px] text-rose-300/80 truncate mt-0.5">
+                      {localNotify.notify_error}
+                    </p>
+                  )}
+                  {resendStatusMsg && (
+                    <p className={`text-[11px] truncate mt-0.5 ${resendIsError ? 'text-rose-300' : 'text-teal-300'}`}>
+                      {resendStatusMsg}
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleResend}
+                disabled={resending}
+                className="shrink-0 px-2.5 py-1 text-xs font-medium rounded border border-slate-700/80 bg-slate-800/80 hover:bg-slate-700 text-slate-200 disabled:opacity-50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+              >
+                {resending ? 'Sending...' : 'Resend'}
+              </button>
+            </div>
+
             {/* Structured Summary Section */}
             <section aria-labelledby="summary-section-heading">
               <h3

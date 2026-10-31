@@ -3,6 +3,11 @@ dotenv.config({ override: true });
 import express from 'express';
 import http from 'http';
 import { WebSocketServer } from 'ws';
+import {
+  resendCallNotification,
+  sendTestNotification,
+  getActiveProvider,
+} from './notify';
 import cors from 'cors';
 import db from './db';
 import * as events from './events';
@@ -113,6 +118,75 @@ app.get('/api/events', (req, res) => {
   res.flushHeaders();
   events.addClient(res);
   res.write(`event: connected\ndata: ${JSON.stringify({ ok: true })}\n\n`);
+});
+
+const resendTimestamps = new Map<string, number>();
+
+app.post('/api/notify/test', async (_req, res) => {
+  const provider = getActiveProvider();
+  if (provider === 'none') {
+    return res.status(400).json({
+      ok: false,
+      error: 'No notification provider configured (NOTIFY_PROVIDER=none).',
+      provider: 'none',
+    });
+  }
+
+  const result = await sendTestNotification();
+  if (!result.ok) {
+    return res.status(400).json({
+      ok: false,
+      error: result.error || 'Failed to send test notification',
+      provider: result.provider,
+    });
+  }
+
+  res.json({
+    ok: true,
+    provider: result.provider,
+    message: 'Test notification sent successfully',
+  });
+});
+
+app.post('/api/calls/:id/notify', async (req, res) => {
+  const callId = req.params.id;
+  const call = db.prepare('SELECT id FROM calls WHERE id=?').get(callId);
+  if (!call) {
+    return res.status(404).json({ error: 'Call not found' });
+  }
+
+  const provider = getActiveProvider();
+  if (provider === 'none') {
+    return res.status(400).json({
+      error: 'No notification provider configured (NOTIFY_PROVIDER=none).',
+    });
+  }
+
+  const lastResend = resendTimestamps.get(callId);
+  const now = Date.now();
+  if (lastResend && now - lastResend < 30000) {
+    const remainingSec = Math.ceil((30000 - (now - lastResend)) / 1000);
+    return res.status(429).json({
+      error: `Rate limited. Please wait ${remainingSec}s before resending.`,
+    });
+  }
+
+  resendTimestamps.set(callId, now);
+
+  const result = await resendCallNotification(callId);
+  if (!result.ok) {
+    return res.status(500).json({
+      ok: false,
+      error: result.error || 'Notification failed',
+      provider: result.provider,
+    });
+  }
+
+  res.json({
+    ok: true,
+    provider: result.provider,
+    notified_at: result.notified_at,
+  });
 });
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));

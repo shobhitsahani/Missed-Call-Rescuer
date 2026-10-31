@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Sidebar, DashboardView } from '@/components/Sidebar';
 import { OverviewView } from '@/components/OverviewView';
 import { CallsView } from '@/components/CallsView';
@@ -37,6 +37,37 @@ export default function DashboardPage() {
     setSelectedCall(call);
     fetchTurns(call.id);
   };
+
+
+  // Open drawer if ?call=<id> query param is in URL
+  useEffect(() => {
+    if (calls.length === 0) return;
+    const params = new URLSearchParams(window.location.search);
+    const targetCallId = params.get('call');
+    if (targetCallId) {
+      const match = calls.find(c => c.id === targetCallId);
+      if (match) {
+        handleSelectCall(match);
+      }
+    }
+  }, [calls]);
+
+  // Keep selectedCall reference synced when call data updates
+  useEffect(() => {
+    if (selectedCall) {
+      const updated = calls.find(c => c.id === selectedCall.id);
+      if (
+        updated &&
+        (updated.notify_status !== selectedCall.notify_status ||
+          updated.notified_at !== selectedCall.notified_at ||
+          updated.notify_error !== selectedCall.notify_error)
+      ) {
+        setSelectedCall(updated);
+      }
+    }
+  }, [calls, selectedCall]);
+
+
 
   const pageTitle =
     currentView === 'overview'
