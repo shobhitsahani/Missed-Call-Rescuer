@@ -50,12 +50,14 @@ export default function CallPage() {
   const [latestMetric, setLatestMetric] = useState<TurnMetric | null>(null);
   const [_metricsHistory, setMetricsHistory] = useState<TurnMetric[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [progressMessage, setProgressMessage] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const recRef = useRef<any>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const micCtxRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const connectionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const endedRef = useRef(false);
   const stateRef = useRef(state);
@@ -169,7 +171,17 @@ export default function CallPage() {
     setStarted(true);
     setStatus('connecting');
     setError(null);
+    setProgressMessage('Connecting audio...');
     initAudio();
+
+    if (connectionTimeoutRef.current) {
+      clearTimeout(connectionTimeoutRef.current);
+    }
+    connectionTimeoutRef.current = setTimeout(() => {
+      if (stateRef.current === 'GREETING' && !endedRef.current) {
+        setError('Connection timed out waiting for the assistant to start. Please check your connection and try again.');
+      }
+    }, 10000);
 
     const provider = business?.sttProvider || sttProvider;
 
@@ -207,6 +219,7 @@ export default function CallPage() {
 
         micSource.connect(workletNode);
       } catch (err: any) {
+        if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
         setStarted(false);
         setStatus('idle');
         if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
@@ -245,10 +258,19 @@ export default function CallPage() {
             setSttProvider(msg.sttProvider);
           }
           break;
+        case 'progress':
+          if (msg.message) {
+            setProgressMessage(msg.message);
+          }
+          break;
         case 'state':
           setState(msg.state);
+          if (msg.state === 'SPEAKING' || msg.state === 'LISTENING') {
+            if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+          }
           break;
         case 'agent_text':
+          if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
           currentAgentTextRef.current = msg.text;
           setTranscript((t) => [...t, { role: 'agent', text: msg.text }]);
           break;
@@ -284,6 +306,7 @@ export default function CallPage() {
           setSummary(msg.summary);
           break;
         case 'error':
+          if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
           setError(msg.message || 'An unexpected error occurred during the call.');
           break;
       }
@@ -294,6 +317,7 @@ export default function CallPage() {
     };
 
     ws.onerror = () => {
+      if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
       setError('Connection lost. Could not communicate with the voice server.');
     };
 
@@ -405,22 +429,48 @@ export default function CallPage() {
     }
   }
 
+  function retryCall() {
+    endCall();
+    setError(null);
+    setProgressMessage(null);
+    setStarted(false);
+    setStatus('idle');
+    setState('GREETING');
+    setTranscript([]);
+    setLivePartial('');
+    setSummary(null);
+    endedRef.current = false;
+    setTimeout(() => {
+      connect();
+    }, 250);
+  }
+
   const isCallFinished = !!summary || state === 'DONE';
 
   return (
-    <main className="min-h-screen bg-background text-foreground flex flex-col justify-center px-4 py-8 sm:px-6 antialiased selection:bg-primary/20 selection:text-primary">
-      <div className="max-w-xl w-full mx-auto space-y-4">
+    <main className="min-h-screen bg-background text-foreground flex flex-col justify-center items-center px-4 py-8 sm:py-12 sm:px-6 antialiased selection:bg-primary/20 selection:text-primary">
+      <div className="w-full max-w-[520px] mx-auto space-y-4">
         {/* Error Notification Banner */}
         {error && (
           <div
             role="alert"
-            className="rounded-xl border border-destructive/40 bg-destructive/10 p-4 text-xs sm:text-sm text-foreground flex items-start gap-3 shadow-xs animate-in fade-in duration-200"
+            className="rounded-xl border border-destructive/40 bg-destructive/10 p-4 text-xs sm:text-sm text-foreground flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 shadow-xs animate-in fade-in duration-200"
           >
-            <ShieldAlert className="h-5 w-5 text-destructive shrink-0 mt-0.5" />
-            <div className="flex-1 min-w-0">
-              <p className="font-semibold text-destructive">Call Notice</p>
-              <p className="mt-0.5 text-muted-foreground">{error}</p>
+            <div className="flex items-start gap-3">
+              <ShieldAlert className="h-5 w-5 text-destructive shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <p className="font-semibold text-destructive">Could not connect voice assistant</p>
+                <p className="mt-0.5 text-muted-foreground">{error}</p>
+              </div>
             </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={retryCall}
+              className="border-destructive/30 hover:bg-destructive/15 text-destructive font-semibold h-8 text-xs shrink-0 self-end sm:self-center"
+            >
+              Try again
+            </Button>
           </div>
         )}
 
@@ -524,7 +574,7 @@ export default function CallPage() {
 
               {/* Central Voice Status Visualizer */}
               <div className="flex justify-center py-2">
-                <AgentStatusVisualizer state={state} />
+                <AgentStatusVisualizer state={state} progressText={progressMessage} />
               </div>
 
               {/* Scrollable Conversation Transcript Log */}
@@ -535,13 +585,38 @@ export default function CallPage() {
                 className="rounded-xl border border-border bg-muted/15 p-4 h-80 overflow-y-auto flex flex-col space-y-2 shadow-inner"
               >
                 {transcript.length === 0 && !livePartial ? (
-                  <div className="m-auto text-center py-8">
-                    <p className="text-xs font-medium text-muted-foreground">
-                      Connecting to voice assistant...
-                    </p>
-                    <p className="text-[11px] text-muted-foreground/70 mt-1">
-                      Speak naturally once connected.
-                    </p>
+                  <div className="m-auto text-center py-8 px-4">
+                    {error ? (
+                      <div className="space-y-3">
+                        <div className="h-10 w-10 rounded-full bg-destructive/10 border border-destructive/20 flex items-center justify-center mx-auto text-destructive">
+                          <AlertCircle className="h-5 w-5" />
+                        </div>
+                        <p className="text-xs font-semibold text-destructive">
+                          Could not connect the voice assistant
+                        </p>
+                        <p className="text-[11px] text-muted-foreground max-w-xs mx-auto">
+                          {error}
+                        </p>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={retryCall}
+                          className="mt-2 text-xs h-8 gap-1.5"
+                        >
+                          Try again
+                        </Button>
+                      </div>
+                    ) : (
+                      <>
+                        <Loader2 className="h-5 w-5 animate-spin mx-auto text-primary mb-2" />
+                        <p className="text-xs font-medium text-muted-foreground">
+                          {progressMessage || 'Connecting to voice assistant...'}
+                        </p>
+                        <p className="text-[11px] text-muted-foreground/70 mt-1">
+                          Speak naturally once connected.
+                        </p>
+                      </>
+                    )}
                   </div>
                 ) : (
                   <>
