@@ -8,6 +8,7 @@ import { CallsView } from '@/components/CallsView';
 import { MissedCallsView } from '@/components/MissedCallsView';
 import { Drawer, CallDetails } from '@/components/Drawer';
 import { DemoModal } from '@/components/DemoModal';
+import { PageContainer } from '@/components/layout/PageContainer';
 import { useDashboardData } from '@/lib/useDashboardData';
 
 export default function DashboardPage() {
@@ -121,44 +122,46 @@ export default function DashboardPage() {
         />
 
         {/* View Content */}
-        <main className="flex-1 p-4 sm:p-8 max-w-6xl w-full mx-auto">
-          {currentView === 'overview' && (
-            <OverviewView
-              missed={missed}
-              calls={calls}
-              summaries={summaries}
-              initialLoading={initialLoading}
-              completedCallsCount={completedCallsCount}
-              recoveryRate={recoveryRate}
-              overallLatency={overallLatency}
-              lastCallId={lastCallId}
-              onDismissBanner={() => setLastCallId(null)}
-              onViewAllCalls={() => setCurrentView('calls')}
-              onSelectCall={handleSelectCall}
-              onSimulate={simulate}
-              simulating={simulating}
-            />
-          )}
+        <main className="flex-1 w-full min-w-0">
+          <PageContainer size="wide">
+            {currentView === 'overview' && (
+              <OverviewView
+                missed={missed}
+                calls={calls}
+                summaries={summaries}
+                initialLoading={initialLoading}
+                completedCallsCount={completedCallsCount}
+                recoveryRate={recoveryRate}
+                overallLatency={overallLatency}
+                lastCallId={lastCallId}
+                onDismissBanner={() => setLastCallId(null)}
+                onViewAllCalls={() => setCurrentView('calls')}
+                onSelectCall={handleSelectCall}
+                onSimulate={simulate}
+                simulating={simulating}
+              />
+            )}
 
-          {currentView === 'calls' && (
-            <CallsView
-              calls={calls}
-              summaries={summaries}
-              initialLoading={initialLoading}
-              onSelectCall={handleSelectCall}
-              onSimulate={simulate}
-              simulating={simulating}
-            />
-          )}
+            {currentView === 'calls' && (
+              <CallsView
+                calls={calls}
+                summaries={summaries}
+                initialLoading={initialLoading}
+                onSelectCall={handleSelectCall}
+                onSimulate={simulate}
+                simulating={simulating}
+              />
+            )}
 
-          {currentView === 'missed' && (
-            <MissedCallsView
-              missed={missed}
-              initialLoading={initialLoading}
-              onSimulate={simulate}
-              simulating={simulating}
-            />
-          )}
+            {currentView === 'missed' && (
+              <MissedCallsView
+                missed={missed}
+                initialLoading={initialLoading}
+                onSimulate={simulate}
+                simulating={simulating}
+              />
+            )}
+          </PageContainer>
         </main>
       </div>
 
