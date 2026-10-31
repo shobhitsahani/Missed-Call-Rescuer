@@ -89,7 +89,25 @@ export default function SettingsPage() {
   // Voice preview state
   const [previewingVoiceId, setPreviewingVoiceId] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  const [cooldownVoiceId, setCooldownVoiceId] = useState<string | null>(null);
+  const [cooldownSeconds, setCooldownSeconds] = useState(0);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const cooldownTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const startVoiceCooldown = (voiceId: string, durationSec = 5) => {
+    setCooldownVoiceId(voiceId);
+    setCooldownSeconds(durationSec);
+    if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
+    let remaining = durationSec;
+    cooldownTimerRef.current = setInterval(() => {
+      remaining -= 1;
+      setCooldownSeconds(remaining);
+      if (remaining <= 0) {
+        if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
+        setCooldownVoiceId(null);
+      }
+    }, 1000);
+  };
 
   // SSE & counts for sidebar
   const [sseConnected, setSseConnected] = useState(false);
@@ -146,6 +164,7 @@ export default function SettingsPage() {
     es.onerror = () => setSseConnected(false);
     return () => {
       es.close();
+      if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
       if (activeAudioRef.current) {
         activeAudioRef.current.pause();
         activeAudioRef.current = null;
@@ -202,6 +221,11 @@ export default function SettingsPage() {
   };
 
   const handlePreviewVoice = async (targetVoiceId: string) => {
+    if (cooldownVoiceId === targetVoiceId && cooldownSeconds > 0) {
+      toast.error(`Please wait ${cooldownSeconds}s before previewing this voice again.`);
+      return;
+    }
+
     if (previewingVoiceId) {
       if (activeAudioRef.current) {
         activeAudioRef.current.pause();
@@ -209,6 +233,7 @@ export default function SettingsPage() {
       }
       if (previewingVoiceId === targetVoiceId) {
         setPreviewingVoiceId(null);
+        startVoiceCooldown(targetVoiceId, 5);
         return;
       }
     }
@@ -225,7 +250,8 @@ export default function SettingsPage() {
 
       if (!res.ok) {
         const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || `Voice preview failed (HTTP ${res.status})`);
+        const errMsg = errJson.error || `Voice preview failed (HTTP ${res.status})`;
+        throw new Error(errMsg);
       }
 
       const blob = await res.blob();
@@ -237,19 +263,26 @@ export default function SettingsPage() {
         setPreviewingVoiceId(null);
         activeAudioRef.current = null;
         URL.revokeObjectURL(audioUrl);
+        startVoiceCooldown(targetVoiceId, 5);
       };
 
       audio.onerror = () => {
-        setPreviewError('Failed to playback audio sample.');
+        const errMsg = 'Failed to playback audio sample.';
+        setPreviewError(errMsg);
+        toast.error(errMsg);
         setPreviewingVoiceId(null);
         activeAudioRef.current = null;
         URL.revokeObjectURL(audioUrl);
+        startVoiceCooldown(targetVoiceId, 5);
       };
 
       await audio.play();
     } catch (err: any) {
-      setPreviewError(err?.message || 'Voice synthesis preview unavailable.');
+      const errMsg = err?.message || 'Voice synthesis preview unavailable.';
+      setPreviewError(errMsg);
+      toast.error(errMsg);
       setPreviewingVoiceId(null);
+      startVoiceCooldown(targetVoiceId, 5);
     }
   };
 
@@ -645,6 +678,7 @@ export default function SettingsPage() {
                   {ASSEMBLYAI_VOICES.map((v: VoiceOption) => {
                     const isSelected = voice === v.id;
                     const isPlaying = previewingVoiceId === v.id;
+                    const isCoolingDown = cooldownVoiceId === v.id && cooldownSeconds > 0;
                     return (
                       <div
                         key={v.id}
@@ -672,17 +706,29 @@ export default function SettingsPage() {
                             type="button"
                             size="sm"
                             variant={isPlaying ? 'default' : 'outline'}
+                            disabled={isCoolingDown || (previewingVoiceId !== null && !isPlaying)}
                             onClick={(e) => {
                               e.stopPropagation();
                               handlePreviewVoice(v.id);
                             }}
-                            className="shrink-0 h-7 px-2 text-[11px] gap-1 font-medium"
-                            title="Preview voice audio sample"
+                            className="shrink-0 h-7 px-2 text-[11px] gap-1 font-medium disabled:opacity-50"
+                            title={
+                              isCoolingDown
+                                ? `Please wait ${cooldownSeconds}s before previewing again`
+                                : isPlaying
+                                ? 'Stop audio preview'
+                                : 'Preview voice audio sample'
+                            }
                           >
                             {isPlaying ? (
                               <>
                                 <Square className="h-2.5 w-2.5 fill-current animate-pulse" />
                                 <span>Playing</span>
+                              </>
+                            ) : isCoolingDown ? (
+                              <>
+                                <Clock className="h-2.5 w-2.5" />
+                                <span>Wait {cooldownSeconds}s</span>
                               </>
                             ) : (
                               <>

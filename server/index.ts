@@ -54,25 +54,64 @@ app.get('/api/business/voices', (_req, res) => {
   res.json({ voices: ASSEMBLYAI_VOICES });
 });
 
-const previewRateLimits = new Map<string, number>();
+// In-memory cache for synthesized voice preview WAV audio (per voiceId)
+const previewAudioCache = new Map<string, Buffer>();
+const MAX_PREVIEW_CACHE = 30;
+
+// Rate limiting: per-voice cooldown (5s) and global IP cap (10/min)
+const perVoiceCooldown = new Map<string, number>(); // key: `${ip}:${voiceId}` -> timestamp
+const globalIpRequests = new Map<string, number[]>(); // ip -> timestamps[]
+
+const PREVIEW_TEXT = 'Hi, this is a voice sample from Missed-Call Rescuer.';
+const PER_VOICE_COOLDOWN_MS = 5000;
+const GLOBAL_MAX_PER_MINUTE = 10;
 
 app.post('/api/business/voice-preview', async (req, res) => {
   const ip = req.ip || req.socket.remoteAddress || 'global';
   const now = Date.now();
-  const last = previewRateLimits.get(ip) || 0;
-  if (now - last < 1500) {
-    return res.status(429).json({ error: 'Too many preview requests. Please wait a moment.' });
-  }
-  previewRateLimits.set(ip, now);
 
   const { voiceId } = req.body || {};
-  if (!voiceId || !isValidVoiceId(voiceId)) {
-    return res.status(400).json({ error: 'Invalid voice ID.' });
+  if (!voiceId || typeof voiceId !== 'string' || !isValidVoiceId(voiceId)) {
+    return res.status(400).json({ error: 'Invalid voice ID. Please select a valid voice from the list.' });
   }
+
+  // 1. Check in-memory audio cache first (Cache HIT costs 0 TTS credits and 0 API calls)
+  const cachedWav = previewAudioCache.get(voiceId);
+  if (cachedWav) {
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Content-Length', cachedWav.length);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('X-Audio-Cache', 'HIT');
+    return res.send(cachedWav);
+  }
+
+  // 2. Rate limits for Cache MISS (synthesis generation):
+  // Check per-voice cooldown (5s)
+  const voiceKey = `${ip}:${voiceId}`;
+  const lastVoiceTime = perVoiceCooldown.get(voiceKey) || 0;
+  if (now - lastVoiceTime < PER_VOICE_COOLDOWN_MS) {
+    const waitSec = Math.ceil((PER_VOICE_COOLDOWN_MS - (now - lastVoiceTime)) / 1000);
+    return res.status(429).json({
+      error: `Too many preview requests for this voice. Please wait ${waitSec}s.`,
+    });
+  }
+
+  // Check global rate limit (10 per minute per IP)
+  const ipTimestamps = (globalIpRequests.get(ip) || []).filter((t) => now - t < 60000);
+  if (ipTimestamps.length >= GLOBAL_MAX_PER_MINUTE) {
+    return res.status(429).json({
+      error: 'Preview rate limit reached (max 10 previews per minute). Please wait a moment.',
+    });
+  }
+
+  // Record rate limit attempts
+  perVoiceCooldown.set(voiceKey, now);
+  ipTimestamps.push(now);
+  globalIpRequests.set(ip, ipTimestamps);
 
   const apiKey = process.env.ASSEMBLYAI_API_KEY || '';
   if (!apiKey) {
-    return res.status(503).json({ error: 'AssemblyAI API key not configured on server.' });
+    return res.status(503).json({ error: 'Voice synthesis service is not configured on the server.' });
   }
 
   try {
@@ -84,29 +123,34 @@ app.post('/api/business/voice-preview', async (req, res) => {
       language: 'english',
     });
 
-    const previewText = 'Hi, this is a voice sample from Missed-Call Rescuer.';
+    // Preview text is fixed on the server and capped in length (51 characters)
     const chunks: Buffer[] = [];
-
-    for await (const chunk of tts.speak(previewText)) {
+    for await (const chunk of tts.speak(PREVIEW_TEXT)) {
       chunks.push(Buffer.from(chunk));
     }
 
     await tts.close().catch(() => {});
 
     if (chunks.length === 0) {
-      return res.status(502).json({ error: 'No audio returned from voice synthesis.' });
+      return res.status(502).json({ error: 'No audio returned from voice synthesis service.' });
     }
 
     const pcmBuffer = Buffer.concat(chunks);
     const wavBuffer = pcmToWav(pcmBuffer, 24000, 1, 16);
 
+    // Store in in-memory cache
+    if (previewAudioCache.size < MAX_PREVIEW_CACHE) {
+      previewAudioCache.set(voiceId, wavBuffer);
+    }
+
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('Content-Length', wavBuffer.length);
-    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('X-Audio-Cache', 'MISS');
     return res.send(wavBuffer);
   } catch (err: any) {
-    console.error('Voice preview error:', err?.message);
-    return res.status(502).json({ error: err?.message || 'Voice synthesis preview failed.' });
+    console.error('Voice preview synthesis error:', err?.message);
+    return res.status(502).json({ error: 'Voice synthesis preview failed. Please try again.' });
   }
 });
 
