@@ -98,9 +98,10 @@ Set `NOTIFY_PROVIDER` in your `.env` to one of `telegram`, `discord`, or `none` 
 1. Open Telegram and search for `@BotFather`.
 2. Send `/newbot`, choose a name and username, and copy the HTTP API token provided (`TELEGRAM_BOT_TOKEN`).
 3. Start a chat with your new bot by clicking `Start` in Telegram.
-4. Get your Telegram numeric Chat ID:
-   - Message `@userinfobot` or `@RawDataBot` in Telegram, which immediately replies with your `id` (e.g. `123456789`).
-   - Alternatively, visit `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates` in your browser after sending `/start` to your bot.
+4. Get your Telegram numeric Chat ID (private method via official API):
+   - Send any message (e.g. `/start` or `hello`) to your new bot in Telegram.
+   - Open in your browser: `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
+   - Look for `"chat":{"id":123456789}` in the JSON response; that number is your `TELEGRAM_CHAT_ID` (avoids sharing your ID with third-party bots).
 5. Set the values in `.env`:
    ```bash
    NOTIFY_PROVIDER=telegram
@@ -108,6 +109,7 @@ Set `NOTIFY_PROVIDER` in your `.env` to one of `telegram`, `discord`, or `none` 
    TELEGRAM_CHAT_ID=123456789
    DASHBOARD_URL=http://localhost:3010
    ```
+   > **Note on DASHBOARD_URL**: `http://localhost:3010` works when browsing on the same computer. When testing notifications on a mobile phone, set `DASHBOARD_URL=http://<YOUR_LAN_IP>:3010` (e.g. `http://192.168.1.15:3010`) so links tapped on phone resolve to your local machine.
 
 #### 2. Discord Webhook Setup
 1. In Discord, go to Server Settings -> Integrations -> Webhooks -> New Webhook.

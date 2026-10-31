@@ -62,11 +62,20 @@ export function sanitizeError(msg: string): string {
   const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
   if (botToken) {
     sanitized = sanitized.split(botToken).join('<REDACTED_BOT_TOKEN>');
+    const parts = botToken.split(':');
+    if (parts.length === 2 && parts[1].length > 4) {
+      sanitized = sanitized.split(parts[1]).join('<REDACTED_TOKEN_SECRET>');
+    }
   }
 
   const discordUrl = process.env.DISCORD_WEBHOOK_URL?.trim();
   if (discordUrl) {
     sanitized = sanitized.split(discordUrl).join('<REDACTED_DISCORD_WEBHOOK>');
+    const parts = discordUrl.split('/');
+    const lastPart = parts[parts.length - 1];
+    if (lastPart && lastPart.length > 5) {
+      sanitized = sanitized.split(lastPart).join('<REDACTED_WEBHOOK_TOKEN>');
+    }
   }
 
   // Redact Telegram bot token patterns: bot<token>
