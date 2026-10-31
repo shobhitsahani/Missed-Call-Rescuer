@@ -1,20 +1,22 @@
 'use client';
 
 import * as React from 'react';
-import { Menu, Search, PhoneCall, Loader2, Sparkles } from 'lucide-react';
+import { Search, PhoneCall, Loader2, Menu } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
+import { Kbd } from '@/components/ui/kbd';
 import { Logomark } from './Logomark';
+import { usePlatform } from '@/lib/platform';
 
 interface TopBarProps {
   title: string;
   businessName?: string;
   searchQuery: string;
-  onSearchChange: (query: string) => void;
+  onSearchChange: (q: string) => void;
   onSimulate: () => void;
   simulating: boolean;
-  onOpenMobileMenu: () => void;
+  onOpenMobileMenu?: () => void;
 }
 
 export function TopBar({
@@ -27,18 +29,44 @@ export function TopBar({
   onOpenMobileMenu,
 }: TopBarProps) {
   const searchInputRef = React.useRef<HTMLInputElement>(null);
+  const { platform, mounted } = usePlatform();
 
-  // Keyboard shortcut Ctrl+K / Cmd+K to focus search
+  // Keyboard shortcut: Command+K on macOS, Ctrl+K on Windows/Linux (disabled on touch)
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-        e.preventDefault();
-        searchInputRef.current?.focus();
-      }
+      if (e.key.toLowerCase() !== 'k') return;
+
+      const isMac = platform === 'mac';
+      const isSearchModifier = isMac
+        ? e.metaKey && !e.ctrlKey && !e.altKey
+        : e.ctrlKey && !e.metaKey && !e.altKey;
+
+      if (!isSearchModifier) return;
+
+      // Prevent browser default URL focus / shortcut
+      e.preventDefault();
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
     };
+
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, [platform]);
+
+  const isMac = platform === 'mac';
+  const ariaKeyShortcuts = mounted
+    ? platform === 'touch'
+      ? undefined
+      : isMac
+      ? 'Meta+K'
+      : 'Control+K'
+    : undefined;
+
+  const accessibleSearchLabel = mounted
+    ? platform === 'touch'
+      ? 'Search calls, phones, reasons'
+      : `Search, shortcut ${isMac ? 'Command' : 'Control'} K`
+    : 'Search calls, phones, reasons';
 
   return (
     <header className="sticky top-0 z-20 flex h-14 items-center justify-between border-b border-border bg-card/80 px-4 md:px-6 backdrop-blur-md">
@@ -87,11 +115,13 @@ export function TopBar({
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
             placeholder="Search calls, phones, reasons..."
-            className="w-full pl-8 pr-12 h-8 text-xs bg-muted/40 border-border/80 placeholder:text-muted-foreground focus:bg-background"
+            aria-label={accessibleSearchLabel}
+            aria-keyshortcuts={ariaKeyShortcuts}
+            className="w-full pl-8 pr-14 h-8 text-xs bg-muted/40 border-border/80 placeholder:text-muted-foreground focus:bg-background"
           />
-          <kbd className="pointer-events-none absolute right-2 top-2 hidden h-4 select-none items-center gap-0.5 rounded border border-border bg-muted px-1.5 font-mono text-[9px] font-medium text-muted-foreground sm:flex">
-            <span>⌘</span>K
-          </kbd>
+          <div className="absolute right-2 top-2 hidden sm:flex items-center pointer-events-none">
+            <Kbd shortcutKey="K" actionName="Search" />
+          </div>
         </div>
       </div>
 
