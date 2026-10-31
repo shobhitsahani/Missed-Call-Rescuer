@@ -500,7 +500,68 @@ app.post('/api/calls/:id/notify', async (req, res) => {
   });
 });
 
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+function getComponentsHealth() {
+  const ttsKeySet = Boolean(process.env.ASSEMBLYAI_API_KEY);
+  const voiceId = process.env.ASSEMBLYAI_VOICE_ID || 'aai-jane';
+  const voiceValid = isValidVoiceId(voiceId);
+  const sttProvider = sessionModule.STT_PROVIDER;
+  const sttKeySet = sttProvider === 'assemblyai' ? ttsKeySet : true;
+  const llmKeySet = Boolean(process.env.OPENAI_API_KEY);
+  const llmModel = process.env.OPENAI_MODEL || 'qwen/qwen3.8-27b';
+  const llmBaseUrlSet = Boolean(process.env.OPENAI_BASE_URL);
+
+  let dbOk = false;
+  try {
+    db.prepare('SELECT 1').get();
+    dbOk = true;
+  } catch {}
+
+  const ok = dbOk && ttsKeySet && voiceValid && sttKeySet && llmKeySet;
+
+  return {
+    ok,
+    components: {
+      database: { status: dbOk ? 'ok' : 'error' },
+      tts: {
+        provider: 'assemblyai',
+        apiKey: ttsKeySet ? 'configured' : 'missing',
+        voiceId,
+        voiceValid,
+        status: ttsKeySet && voiceValid ? 'ok' : 'misconfigured',
+      },
+      stt: {
+        provider: sttProvider,
+        apiKey: sttKeySet ? 'configured' : 'missing',
+        model: process.env.ASSEMBLYAI_SPEECH_MODEL || 'universal-3-6-pro',
+        status: sttKeySet ? 'ok' : 'misconfigured',
+      },
+      llm: {
+        apiKey: llmKeySet ? 'configured' : 'missing',
+        model: llmModel,
+        baseUrlConfigured: llmBaseUrlSet,
+        status: llmKeySet ? 'ok' : 'misconfigured',
+      },
+    },
+  };
+}
+
+function runStartupChecks() {
+  const health = getComponentsHealth();
+  console.log('=== Missed-Call Rescuer Configuration Check ===');
+  console.log(`Database: ${health.components.database.status}`);
+  console.log(`TTS: AssemblyAI [voice=${health.components.tts.voiceId}, key=${health.components.tts.apiKey}, valid=${health.components.tts.voiceValid}]`);
+  console.log(`STT: ${health.components.stt.provider} [model=${health.components.stt.model}, key=${health.components.stt.apiKey}]`);
+  console.log(`LLM: OpenAI/Groq [model=${health.components.llm.model}, key=${health.components.llm.apiKey}]`);
+  if (!health.ok) {
+    console.warn('WARNING: Component misconfiguration detected (missing API keys or invalid voice ID). Calls may fail.');
+  }
+  console.log('==============================================');
+}
+
+app.get('/api/health', (_req, res) => {
+  const health = getComponentsHealth();
+  res.json(health);
+});
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
@@ -554,4 +615,5 @@ wss.on('connection', (ws) => {
 
 server.listen(PORT, () => {
   console.log(`API/WS server listening on http://localhost:${PORT}`);
+  runStartupChecks();
 });
