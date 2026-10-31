@@ -44,7 +44,12 @@ import {
 
 export type LatencyItem =
   | number
-  | { totalMs: number; llmFirstTokenMs?: number | null; ttsFirstAudioMs?: number | null };
+  | {
+      totalMs: number;
+      llmFirstTokenMs?: number | null;
+      ttsFirstAudioMs?: number | null;
+      turnDetectionMs?: number | null;
+    };
 
 export interface CallDetails {
   id: string;

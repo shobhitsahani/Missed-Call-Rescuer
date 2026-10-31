@@ -16,6 +16,7 @@ export function computeAverages(rawLatency: LatencyItem[] = []) {
   const totals: number[] = [];
   const llms: number[] = [];
   const ttss: number[] = [];
+  const turnDetections: number[] = [];
 
   for (const item of rawLatency) {
     if (typeof item === 'number') {
@@ -24,14 +25,16 @@ export function computeAverages(rawLatency: LatencyItem[] = []) {
       if (typeof item.totalMs === 'number') totals.push(item.totalMs);
       if (typeof item.llmFirstTokenMs === 'number') llms.push(item.llmFirstTokenMs);
       if (typeof item.ttsFirstAudioMs === 'number') ttss.push(item.ttsFirstAudioMs);
+      if (typeof item.turnDetectionMs === 'number') turnDetections.push(item.turnDetectionMs);
     }
   }
 
   const avgTotal = totals.length ? Math.round(totals.reduce((a, b) => a + b, 0) / totals.length) : null;
   const avgLlm = llms.length ? Math.round(llms.reduce((a, b) => a + b, 0) / llms.length) : null;
   const avgTts = ttss.length ? Math.round(ttss.reduce((a, b) => a + b, 0) / ttss.length) : null;
+  const avgTurn = turnDetections.length ? Math.round(turnDetections.reduce((a, b) => a + b, 0) / turnDetections.length) : null;
 
-  return { avgTotal, avgLlm, avgTts };
+  return { avgTotal, avgLlm, avgTts, avgTurn };
 }
 
 export function useDashboardData() {
