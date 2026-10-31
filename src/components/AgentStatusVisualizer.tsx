@@ -4,12 +4,13 @@ import * as React from 'react';
 
 interface AgentStatusVisualizerProps {
   state: string;
+  progressText?: string | null;
 }
 
-export function AgentStatusVisualizer({ state }: AgentStatusVisualizerProps) {
+export function AgentStatusVisualizer({ state, progressText }: AgentStatusVisualizerProps) {
   const norm = (state || '').toUpperCase();
 
-  let label = 'Connecting...';
+  let label = progressText || 'Connecting...';
   let indicator: React.ReactNode = null;
 
   if (norm === 'LISTENING') {
