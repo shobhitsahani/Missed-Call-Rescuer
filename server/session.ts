@@ -5,6 +5,7 @@ import * as events from './events';
 import { TtsClient } from './tts';
 import { SttClient } from './stt';
 import { notifyCallSummary } from './notify';
+import { isValidVoiceId } from '../src/lib/voices';
 
 const sessions = new Map<string, any>();
 
@@ -28,6 +29,26 @@ function detectOptOut(text: string) {
 function detectWrongNumber(text: string) {
   const t = (text || '').toLowerCase();
   return WRONG_NUMBER.some(p => t.includes(p));
+}
+
+function sanitizeErrorMsg(msg?: string): string {
+  if (!msg) return 'Unknown error';
+  return msg
+    .replace(/wss?:\/\/[^\s]+/g, '[server]')
+    .replace(/(?:key=|token=)[^\s&]+/gi, '[redacted]')
+    .slice(0, 200);
+}
+
+function withStageTimeout<T>(promise: Promise<T>, timeoutMs: number, stageName: string): Promise<T> {
+  let timer: NodeJS.Timeout | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${stageName} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 export function similar(a: string, b: string) {
@@ -188,7 +209,11 @@ export async function startSession(ws: any, missedCallId?: string) {
     db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run('calling', missed.id);
   }
 
-  const voiceId = process.env.ASSEMBLYAI_VOICE_ID || 'aai-jane';
+  const voiceId = (business?.voice && isValidVoiceId(business.voice))
+    ? business.voice
+    : (process.env.ASSEMBLYAI_VOICE_ID && isValidVoiceId(process.env.ASSEMBLYAI_VOICE_ID))
+      ? process.env.ASSEMBLYAI_VOICE_ID
+      : 'aai-jane';
   const apiKey = process.env.ASSEMBLYAI_API_KEY || '';
   const tts = new TtsClient({ apiKey, voiceId, sampleRate: 24000, encoding: 'pcm_s16le', language: 'english' });
 
@@ -224,17 +249,24 @@ export async function startSession(ws: any, missedCallId?: string) {
   send(session, { type: 'config', sttProvider: STT_PROVIDER });
 
   // connect TTS
+  send(session, { type: 'progress', stage: 'tts_connect', message: 'Connecting audio...' });
   try {
-    await tts.connectWithRetry();
+    await withStageTimeout(tts.connectWithRetry(), 10000, 'TTS connect');
   } catch (err: any) {
-    console.error('TTS connect failed:', err?.message);
-    try { ws.send(JSON.stringify({ type: 'error', message: 'Voice service unavailable.' })); } catch {}
+    const errorMsg = sanitizeErrorMsg(err?.message);
+    console.error(`[session ${session.id}] stage=tts_connect error=${errorMsg}`);
+    send(session, {
+      type: 'error',
+      code: 'tts_connect',
+      message: `Could not connect voice assistant audio: ${errorMsg}`,
+    });
     await endSession(session, 'error');
     return session;
   }
 
   // connect AssemblyAI STT if enabled
   if (STT_PROVIDER === 'assemblyai') {
+    send(session, { type: 'progress', stage: 'stt_connect', message: 'Connecting speech recognition...' });
     const stt = new SttClient({ apiKey });
     session.stt = stt;
 
@@ -284,16 +316,26 @@ export async function startSession(ws: any, missedCallId?: string) {
 
     stt.onError(async (err) => {
       if (session.ended) return;
-      console.error('STT error:', err?.message);
-      send(session, { type: 'error', message: 'Speech recognition service error. Ending call.' });
+      const errorMsg = sanitizeErrorMsg(err?.message);
+      console.error(`[session ${session.id}] stage=stt_runtime error=${errorMsg}`);
+      send(session, {
+        type: 'error',
+        code: 'stt_runtime',
+        message: 'Speech recognition service error. Ending call.',
+      });
       await endSession(session, 'error');
     });
 
     try {
-      await stt.connectWithRetry();
+      await withStageTimeout(stt.connectWithRetry(), 10000, 'STT connect');
     } catch (err: any) {
-      console.error('STT connect failed:', err?.message);
-      send(session, { type: 'error', message: 'Speech recognition service unavailable.' });
+      const errorMsg = sanitizeErrorMsg(err?.message);
+      console.error(`[session ${session.id}] stage=stt_connect error=${errorMsg}`);
+      send(session, {
+        type: 'error',
+        code: 'stt_connect',
+        message: `Could not connect speech recognition: ${errorMsg}`,
+      });
       await endSession(session, 'error');
       return session;
     }
@@ -306,14 +348,28 @@ export async function startSession(ws: any, missedCallId?: string) {
     }
   }, 30000);
 
+  send(session, { type: 'progress', stage: 'greeting', message: 'Starting assistant...' });
   setState(session, 'GREETING');
   const greeting = `Hi, this is an automated assistant calling on behalf of ${business.name}. We noticed we missed your call earlier. Is now a good time to chat?`;
   session.state = 'SPEAKING';
   session.currentAgentText = greeting;
   session.agentSpeakingStartTime = Date.now();
   send(session, { type: 'state', state: 'SPEAKING' });
-  const ok = await speakSentence(session, greeting, () => {});
-  if (!ok || session.ended) return session;
+  try {
+    const ok = await withStageTimeout(speakSentence(session, greeting, () => {}), 10000, 'Greeting audio playback');
+    if (!ok || session.ended) return session;
+  } catch (err: any) {
+    const errorMsg = sanitizeErrorMsg(err?.message);
+    console.error(`[session ${session.id}] stage=greeting error=${errorMsg}`);
+    send(session, {
+      type: 'error',
+      code: 'greeting',
+      message: `Could not start assistant greeting: ${errorMsg}`,
+    });
+    await endSession(session, 'error');
+    return session;
+  }
+
   addTurn(session, 'agent', greeting, false);
   if (!session.ended) {
     setState(session, 'LISTENING');
@@ -425,7 +481,9 @@ export async function handleCustomerUtterance(session: any, text: string, turnDe
         }
       }, controller.signal);
     } catch (e: any) {
-      if (!session.cancelGeneration) console.error('LLM error:', e?.message);
+      if (!session.cancelGeneration) {
+        console.error(`[session ${session.id}] stage=llm error=${sanitizeErrorMsg(e?.message)}`);
+      }
     } finally {
       const rest = buffer.trim();
       if (rest && !session.cancelGeneration) {
