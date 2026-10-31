@@ -59,6 +59,8 @@ export default function SettingsPage() {
   const [sseConnected, setSseConnected] = useState(false);
   const [callsCount, setCallsCount] = useState(0);
   const [missedCount, setMissedCount] = useState(0);
+  const [collapsed, setCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
 
   useEffect(() => {
     // Load business settings
@@ -294,6 +296,11 @@ export default function SettingsPage() {
         callsCount={callsCount}
         missedCount={missedCount}
         sseConnected={sseConnected}
+        businessName={name || 'Acme Plumbing'}
+        collapsed={collapsed}
+        onToggleCollapse={() => setCollapsed(!collapsed)}
+        mobileOpen={mobileOpen}
+        onMobileOpenChange={setMobileOpen}
         onOpenDemoSettings={() => {}}
       />
 
