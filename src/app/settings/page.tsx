@@ -11,6 +11,8 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
+import { ThemeToggle } from '@/components/layout/ThemeToggle';
+import { toast } from 'sonner';
 import {
   Dialog,
   DialogContent,
@@ -155,11 +157,15 @@ export default function SettingsPage() {
     const trimmed = newServiceInput.trim();
     if (!trimmed) return;
     if (services.length >= 20) {
-      setErrors((prev) => ({ ...prev, services: 'Maximum 20 services allowed.' }));
+      const msg = 'Maximum 20 services allowed.';
+      setErrors((prev) => ({ ...prev, services: msg }));
+      toast.error(msg);
       return;
     }
     if (trimmed.length > 80) {
-      setErrors((prev) => ({ ...prev, services: 'Each service must be 80 characters or fewer.' }));
+      const msg = 'Each service must be 80 characters or fewer.';
+      setErrors((prev) => ({ ...prev, services: msg }));
+      toast.error(msg);
       return;
     }
     setServices((prev) => [...prev, trimmed]);
@@ -177,7 +183,9 @@ export default function SettingsPage() {
 
   const handleAddFaq = () => {
     if (faqs.length >= 20) {
-      setErrors((prev) => ({ ...prev, faqs: 'Maximum 20 FAQs allowed.' }));
+      const msg = 'Maximum 20 FAQs allowed.';
+      setErrors((prev) => ({ ...prev, faqs: msg }));
+      toast.error(msg);
       return;
     }
     setFaqs((prev) => [...prev, { question: '', answer: '' }]);
@@ -245,22 +253,57 @@ export default function SettingsPage() {
     }
   };
 
-  const handleSave = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSave = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     setSaving(true);
     setSaveSuccessMsg(null);
     setGeneralError(null);
     setErrors({});
+
+    // Client-side validations
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      const msg = 'Business name is required.';
+      setErrors({ name: msg });
+      setGeneralError(msg);
+      toast.error(msg);
+      setSaving(false);
+      return;
+    }
+
+    const cleanServices = services.map((s) => s.trim()).filter(Boolean);
+    const cleanFaqs = faqs.map((f) => ({
+      question: f.question.trim(),
+      answer: f.answer.trim(),
+    }));
+
+    // Filter out completely blank FAQs or validate incomplete ones
+    for (let i = 0; i < cleanFaqs.length; i++) {
+      const f = cleanFaqs[i];
+      if (!f.question && !f.answer) {
+        continue; // skip empty rows
+      }
+      if (!f.question || !f.answer) {
+        const msg = `FAQ #${i + 1} must have both a question and an answer.`;
+        setErrors({ faqs: msg });
+        setGeneralError(msg);
+        toast.error(msg);
+        setSaving(false);
+        return;
+      }
+    }
+
+    const validFaqs = cleanFaqs.filter((f) => f.question && f.answer);
 
     try {
       const res = await fetch(`${API_BASE}/api/business`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          name: name.trim(),
+          name: trimmedName,
           hours: hours.trim(),
-          services,
-          faqs,
+          services: cleanServices,
+          faqs: validFaqs,
           tone: tone.trim(),
           voice,
           timezone,
@@ -272,15 +315,24 @@ export default function SettingsPage() {
       if (!res.ok) {
         if (data?.errors) {
           setErrors(data.errors);
+          const firstErr = Object.values(data.errors)[0] as string;
+          setGeneralError(firstErr);
+          toast.error(firstErr);
         } else {
-          setGeneralError(data?.error || `Save failed (HTTP ${res.status})`);
+          const msg = data?.error || `Save failed (HTTP ${res.status})`;
+          setGeneralError(msg);
+          toast.error(msg);
         }
       } else {
-        setSaveSuccessMsg('Business settings saved successfully.');
+        const msg = 'Business settings saved successfully.';
+        setSaveSuccessMsg(msg);
+        toast.success(msg);
         setTimeout(() => setSaveSuccessMsg(null), 4000);
       }
     } catch (err: any) {
-      setGeneralError(err?.message || 'Network error while saving settings.');
+      const msg = err?.message || 'Network error while saving settings.';
+      setGeneralError(msg);
+      toast.error(msg);
     } finally {
       setSaving(false);
     }
@@ -295,7 +347,9 @@ export default function SettingsPage() {
       const res = await fetch(`${API_BASE}/api/business/reset`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
-        setGeneralError(data?.error || 'Failed to reset settings.');
+        const msg = data?.error || 'Failed to reset settings.';
+        setGeneralError(msg);
+        toast.error(msg);
       } else {
         const b = data.business;
         setName(b.name || '');
@@ -306,11 +360,15 @@ export default function SettingsPage() {
         setVoice(b.voice || 'aai-jane');
         setTimezone(b.timezone || 'Asia/Kolkata');
         setShowResetConfirm(false);
-        setSaveSuccessMsg('Settings reset to Acme Plumbing defaults.');
+        const msg = 'Settings reset to Acme Plumbing defaults.';
+        setSaveSuccessMsg(msg);
+        toast.success(msg);
         setTimeout(() => setSaveSuccessMsg(null), 4000);
       }
     } catch (err: any) {
-      setGeneralError(err?.message || 'Network error while resetting.');
+      const msg = err?.message || 'Network error while resetting.';
+      setGeneralError(msg);
+      toast.error(msg);
     } finally {
       setResetting(false);
     }
@@ -349,6 +407,10 @@ export default function SettingsPage() {
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0">
+            <div className="w-9 h-9 flex items-center justify-center">
+              <ThemeToggle collapsed={true} />
+            </div>
+
             <Button
               variant="outline"
               size="sm"
@@ -357,11 +419,11 @@ export default function SettingsPage() {
               className="h-8 text-xs font-medium gap-1.5"
             >
               <RotateCcw className="h-3 w-3" />
-              <span>Reset to defaults</span>
+              <span>Reset</span>
             </Button>
             <Button
               size="sm"
-              onClick={handleSave}
+              onClick={() => handleSave()}
               disabled={loading || saving}
               className="h-8 text-xs font-semibold gap-1.5 shadow-xs"
             >
@@ -706,7 +768,7 @@ export default function SettingsPage() {
                       <button
                         type="button"
                         onClick={() => handleRemoveService(idx)}
-                        className="text-muted-foreground hover:text-destructive transition-colors ml-0.5"
+                        className="text-muted-foreground hover:text-destructive transition-colors ml-0.5 cursor-pointer"
                         title="Remove service"
                       >
                         <X className="h-3 w-3" />
@@ -806,25 +868,58 @@ export default function SettingsPage() {
               </CardContent>
             </Card>
 
-            {/* Bottom Actions */}
-            <div className="flex items-center justify-end gap-3 pt-2">
-              <Button
-                type="submit"
-                disabled={saving}
-                className="text-xs font-semibold gap-1.5 shadow-sm px-6"
-              >
-                {saving ? (
-                  <>
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    <span>Saving changes...</span>
-                  </>
-                ) : (
-                  <>
-                    <Save className="h-3.5 w-3.5" />
-                    <span>Save changes</span>
-                  </>
+            {/* Bottom Actions Sticky Floating Bar */}
+            <div className="sticky bottom-4 z-20 rounded-xl bg-card/95 backdrop-blur-md border border-border p-3.5 flex items-center justify-between gap-3 shadow-lg">
+              <div className="flex items-center gap-2 text-xs min-w-0">
+                {saveSuccessMsg && (
+                  <span className="inline-flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400 font-medium truncate animate-in fade-in">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-500 shrink-0" />
+                    <span className="truncate">{saveSuccessMsg}</span>
+                  </span>
                 )}
-              </Button>
+                {generalError && (
+                  <span className="inline-flex items-center gap-1.5 text-destructive font-medium truncate animate-in fade-in">
+                    <AlertCircle className="h-4 w-4 text-destructive shrink-0" />
+                    <span className="truncate">{generalError}</span>
+                  </span>
+                )}
+                {!saveSuccessMsg && !generalError && (
+                  <span className="text-xs text-muted-foreground hidden sm:inline">
+                    Changes take effect on new incoming calls.
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setShowResetConfirm(true)}
+                  disabled={loading || saving}
+                  className="h-8 text-xs font-medium gap-1.5"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  <span>Reset</span>
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={loading || saving}
+                  className="h-8 text-xs font-semibold gap-1.5 shadow-sm px-4"
+                >
+                  {saving ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      <span>Saving...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Save className="h-3.5 w-3.5" />
+                      <span>Save changes</span>
+                    </>
+                  )}
+                </Button>
+              </div>
             </div>
           </form>
         )}
