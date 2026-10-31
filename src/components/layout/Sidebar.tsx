@@ -8,8 +8,6 @@ import {
   Settings,
   ChevronLeft,
   ChevronRight,
-  Radio,
-  SlidersHorizontal,
 } from 'lucide-react';
 import { Logomark } from './Logomark';
 import { ThemeToggle } from './ThemeToggle';
@@ -82,8 +80,8 @@ export function Sidebar({
     const isIconOnly = collapsed && !isMobile;
 
     return (
-      <div className="flex flex-col h-full justify-between">
-        <div className="space-y-6">
+      <div className="flex flex-col min-h-full justify-between gap-4">
+        <div className="space-y-6 shrink-0">
           {/* Brand header */}
           <div className={`flex items-center gap-3 px-3 py-2 ${isIconOnly ? 'justify-center' : ''}`}>
             <div className="h-9 w-9 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center shrink-0">
@@ -175,7 +173,7 @@ export function Sidebar({
         </div>
 
         {/* Footer info & user badge */}
-        <div className="space-y-3 pt-4 px-1">
+        <div className="space-y-3 pt-4 px-1 shrink-0">
           <Separator />
 
           {/* SSE Status */}
@@ -204,24 +202,9 @@ export function Sidebar({
             )}
           </div>
 
-          {/* Theme Toggle & Demo Options */}
+          {/* Theme Toggle */}
           <div className="flex flex-col gap-1">
             <ThemeToggle collapsed={isIconOnly} />
-
-            {onOpenDemoSettings && (
-              <Button
-                variant="ghost"
-                size={isIconOnly ? 'icon-sm' : 'sm'}
-                onClick={onOpenDemoSettings}
-                className={`text-muted-foreground hover:text-foreground ${
-                  isIconOnly ? 'w-9 h-9 p-0 justify-center mx-auto' : 'w-full justify-start gap-2'
-                }`}
-                title="Simulation options & webhook tests"
-              >
-                <SlidersHorizontal className="h-4 w-4 shrink-0" />
-                {!isIconOnly && <span className="text-xs">Demo options</span>}
-              </Button>
-            )}
           </div>
 
           <Separator />
@@ -276,7 +259,7 @@ export function Sidebar({
     <>
       {/* Desktop Sticky Sidebar */}
       <aside
-        className={`hidden md:flex flex-col justify-between border-r border-border bg-card p-3 h-screen sticky top-0 transition-all duration-300 z-30 shrink-0 ${
+        className={`hidden md:flex flex-col justify-between border-r border-border bg-card p-3 h-dvh sticky top-0 overflow-y-auto overflow-x-hidden transition-all duration-300 z-30 shrink-0 ${
           collapsed ? 'w-16' : 'w-64'
         }`}
         aria-label="Main Navigation"

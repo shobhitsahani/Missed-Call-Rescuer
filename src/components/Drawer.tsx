@@ -16,7 +16,6 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { StatusBadge } from './StatusBadge';
 import { TranscriptBubble } from './TranscriptBubble';
 import { RelativeTime } from './RelativeTime';
-import { API_BASE } from '@/lib/api';
 import {
   formatPlainTextTranscript,
   formatJsonTranscript,
@@ -26,7 +25,6 @@ import {
   Copy,
   Check,
   Download,
-  Send,
   Phone,
   Clock,
   Activity,
@@ -88,24 +86,6 @@ export interface TurnDetails {
   ts: string;
 }
 
-function formatNotifiedTime(iso?: string | null): string {
-  if (!iso) return '';
-  try {
-    const d = new Date(iso);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
-  } catch {
-    return '';
-  }
-}
-
-function formatProviderLabel(provider?: string | null): string {
-  if (!provider) return 'Owner';
-  const p = provider.toLowerCase();
-  if (p === 'telegram') return 'Telegram';
-  if (p === 'discord') return 'Discord';
-  return provider;
-}
-
 interface DrawerProps {
   isOpen: boolean;
   onClose: () => void;
@@ -129,29 +109,6 @@ export function Drawer({
   const [copiedId, setCopiedId] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
   const copyTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const [resending, setResending] = useState(false);
-  const [resendStatusMsg, setResendStatusMsg] = useState<string | null>(null);
-  const [resendIsError, setResendIsError] = useState(false);
-  const [localNotify, setLocalNotify] = useState<{
-    notified_at?: string | null;
-    notify_status?: string | null;
-    notify_provider?: string | null;
-    notify_error?: string | null;
-  }>({});
-
-  useEffect(() => {
-    setResending(false);
-    setResendStatusMsg(null);
-    setResendIsError(false);
-    if (call) {
-      setLocalNotify({
-        notified_at: call.notified_at,
-        notify_status: call.notify_status,
-        notify_provider: call.notify_provider,
-        notify_error: call.notify_error,
-      });
-    }
-  }, [call?.id, call?.notified_at, call?.notify_status, call?.notify_error, call?.notify_provider]);
 
   useEffect(() => {
     setCopied(false);
@@ -161,38 +118,6 @@ export function Drawer({
       if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
     };
   }, [call?.id, isOpen]);
-
-  const handleResend = async () => {
-    if (!call) return;
-    setResending(true);
-    setResendStatusMsg(null);
-    setResendIsError(false);
-
-    try {
-      const res = await fetch(`${API_BASE}/api/calls/${call.id}/notify`, {
-        method: 'POST',
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setResendIsError(true);
-        setResendStatusMsg(data?.error || `Resend failed (HTTP ${res.status})`);
-      } else {
-        setResendIsError(false);
-        setResendStatusMsg('Notification sent');
-        setLocalNotify({
-          notified_at: data.notified_at || new Date().toISOString(),
-          notify_status: 'sent',
-          notify_provider: data.provider,
-          notify_error: null,
-        });
-      }
-    } catch (err: any) {
-      setResendIsError(true);
-      setResendStatusMsg(err?.message || 'Network error');
-    } finally {
-      setResending(false);
-    }
-  };
 
   const handleCopyId = async () => {
     if (!call) return;
@@ -392,64 +317,9 @@ export function Drawer({
           )}
         </div>
 
-        {/* Scrollable Body */}
+        {/* ScrollArea Body */}
         <ScrollArea className="flex-1 p-5 space-y-6">
           <div className="space-y-6 pb-6">
-            {/* Owner Notification Status Banner */}
-            <div className="rounded-lg bg-card border border-border p-3.5 flex items-center justify-between gap-3 text-xs shadow-xs">
-              <div className="flex items-center gap-3 min-w-0">
-                <div
-                  className={`h-2.5 w-2.5 rounded-full shrink-0 ${
-                    localNotify.notify_status === 'sent'
-                      ? 'bg-emerald-500 ring-2 ring-emerald-500/20'
-                      : localNotify.notify_status === 'failed'
-                      ? 'bg-rose-500 ring-2 ring-rose-500/20'
-                      : 'bg-muted-foreground/40'
-                  }`}
-                  aria-hidden="true"
-                />
-                <div className="min-w-0">
-                  <p className="text-foreground font-medium truncate">
-                    {localNotify.notify_status === 'sent'
-                      ? `Owner notified via ${formatProviderLabel(localNotify.notify_provider)} at ${formatNotifiedTime(localNotify.notified_at)}`
-                      : localNotify.notify_status === 'failed'
-                      ? 'Owner notification failed'
-                      : 'Owner notification pending'}
-                  </p>
-                  {localNotify.notify_status === 'failed' && localNotify.notify_error && !resendStatusMsg && (
-                    <p className="text-[11px] text-destructive truncate mt-0.5">
-                      {localNotify.notify_error}
-                    </p>
-                  )}
-                  {resendStatusMsg && (
-                    <p className={`text-[11px] truncate mt-0.5 font-medium ${resendIsError ? 'text-destructive' : 'text-primary'}`}>
-                      {resendStatusMsg}
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleResend}
-                disabled={resending}
-                className="shrink-0 h-7 text-xs gap-1.5"
-              >
-                {resending ? (
-                  <>
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                    Sending...
-                  </>
-                ) : (
-                  <>
-                    <Send className="h-3 w-3" />
-                    Resend
-                  </>
-                )}
-              </Button>
-            </div>
-
             {/* Call Summary Section */}
             <section aria-labelledby="summary-heading" className="space-y-3">
               <div className="flex items-center gap-2">

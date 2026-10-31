@@ -56,3 +56,5 @@ scripts/fixtures/
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+.vercel
