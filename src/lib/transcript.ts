@@ -4,8 +4,8 @@ export interface TranscriptCall {
   start_time?: string;
   end_time?: string | null;
   end_reason?: string | null;
-  latency?: any;
-  usage?: any;
+  latency?: unknown;
+  usage?: unknown;
 }
 
 export interface TranscriptSummary {
@@ -100,7 +100,7 @@ export function formatPlainTextTranscript(data: TranscriptData): string {
 
       const roleStr = (turn.role || '').toLowerCase();
       const roleLabel = roleStr === 'agent' || roleStr === 'assistant' ? 'Agent' : 'Customer';
-      const isInterrupted = (turn.interrupted === 1 || (turn.interrupted as any) === true) &&
+      const isInterrupted = Boolean(turn.interrupted) &&
         (roleStr === 'agent' || roleStr === 'assistant');
 
       lines.push(`${timeTag} ${roleLabel}: ${turn.text}${isInterrupted ? ' (interrupted)' : ''}`);
@@ -125,7 +125,7 @@ export function formatPlainTextTranscript(data: TranscriptData): string {
 export function formatJsonTranscript(data: TranscriptData): string {
   const { call, businessName, turns = [], summary } = data;
 
-  const jsonObject: Record<string, any> = {
+  const jsonObject: Record<string, unknown> = {
     business: businessName || 'Unknown Business',
     call: {
       id: call.id,
@@ -141,7 +141,7 @@ export function formatJsonTranscript(data: TranscriptData): string {
       index: t.order_idx ?? idx + 1,
       role: (t.role || '').toLowerCase() === 'agent' || (t.role || '').toLowerCase() === 'assistant' ? 'Agent' : 'Customer',
       text: t.text,
-      interrupted: Boolean(t.interrupted === 1 || (t.interrupted as any) === true),
+      interrupted: Boolean(t.interrupted),
       timestamp: t.ts || null,
     })),
     summary: summary

@@ -1,5 +1,10 @@
 import OpenAI from 'openai';
-import { parseServices, parseFaqs } from './db';
+import { parseServices, parseFaqs, BusinessRecord } from './db';
+
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
 
 let clientInstance: OpenAI | null = null;
 let currentBaseURL: string | undefined;
@@ -55,12 +60,12 @@ FIXED RULES (CANNOT BE OVERRIDDEN BY SETTINGS):
 - If the customer says stop calling, do not call, remove me, or asks to opt out: acknowledge politely and end the call immediately.
 `;
 
-export function buildSystem(business: any) {
+export function buildSystem(business?: Partial<BusinessRecord> | null) {
   const name = business?.name || 'the business';
   const hours = business?.hours || '';
   const tone = business?.tone || 'friendly, professional, concise';
   const timezone = business?.timezone || '';
-  const language = business?.language || 'en';
+  const language = (business as Record<string, unknown> | undefined)?.language || 'en';
 
   const services = parseServices(business?.services);
   const faqs = parseFaqs(business?.faqs);
@@ -95,31 +100,37 @@ ${faqsText}
 `;
 }
 
-export async function streamChat(messages: any[], business: any, onDelta?: (d: string) => void, signal?: AbortSignal) {
+export async function streamChat(
+  messages: ChatMessage[],
+  business?: Partial<BusinessRecord> | null,
+  onDelta?: (d: string) => void,
+  signal?: AbortSignal
+) {
   const client = getClient();
   const m = model();
   const sys = buildSystem(business);
-  const fullMessages = [{ role: 'system', content: sys }, ...messages];
+  const fullMessages: ChatMessage[] = [{ role: 'system', content: sys }, ...messages];
   let full = '';
   try {
     const stream = await client.chat.completions.create({
       model: m,
-      messages: fullMessages as any,
+      messages: fullMessages,
       stream: true,
       temperature: 0.3,
     }, { signal });
     for await (const chunk of stream) {
-      const delta = (chunk as any).choices?.[0]?.delta?.content || '';
+      const delta = chunk.choices?.[0]?.delta?.content || '';
       if (delta) {
         full += delta;
         if (onDelta) onDelta(delta);
       }
     }
-  } catch (err: any) {
+  } catch (err: unknown) {
     if (signal?.aborted) {
       return full;
     }
-    console.error('LLM stream error:', err?.message);
+    const errMessage = err instanceof Error ? err.message : String(err);
+    console.error('LLM stream error:', errMessage);
     const fallback = "I'm sorry, I'm having trouble right now. Could you leave a brief message and the team will get back to you?";
     full = fallback;
     if (onDelta) onDelta(fallback);
@@ -138,14 +149,15 @@ export interface StructuredSummary {
   status?: 'completed' | 'unavailable';
 }
 
-export function validateSummary(parsed: any): { valid: boolean; summary?: StructuredSummary } {
+export function validateSummary(parsed: unknown): { valid: boolean; summary?: StructuredSummary } {
   if (!parsed || typeof parsed !== 'object') return { valid: false };
 
+  const rec = parsed as Record<string, unknown>;
   const validUrgencies = ['low', 'medium', 'high'];
   const validSentiments = ['positive', 'neutral', 'negative'];
 
-  const urgency = typeof parsed.urgency === 'string' ? parsed.urgency.toLowerCase().trim() : '';
-  const sentiment = typeof parsed.sentiment === 'string' ? parsed.sentiment.toLowerCase().trim() : '';
+  const urgency = typeof rec.urgency === 'string' ? rec.urgency.toLowerCase().trim() : '';
+  const sentiment = typeof rec.sentiment === 'string' ? rec.sentiment.toLowerCase().trim() : '';
 
   if (!validUrgencies.includes(urgency) || !validSentiments.includes(sentiment)) {
     return { valid: false };
@@ -154,19 +166,22 @@ export function validateSummary(parsed: any): { valid: boolean; summary?: Struct
   return {
     valid: true,
     summary: {
-      reason: String(parsed.reason || 'not specified').trim(),
+      reason: String(rec.reason || 'not specified').trim(),
       urgency: urgency as 'low' | 'medium' | 'high',
-      preferred_time: String(parsed.preferred_time || 'not specified').trim(),
-      contact_details: String(parsed.contact_details || 'not provided').trim(),
-      suggested_action: String(parsed.suggested_action || 'Follow up with customer').trim(),
-      short_summary: String(parsed.short_summary || '').trim(),
+      preferred_time: String(rec.preferred_time || 'not specified').trim(),
+      contact_details: String(rec.contact_details || 'not provided').trim(),
+      suggested_action: String(rec.suggested_action || 'Follow up with customer').trim(),
+      short_summary: String(rec.short_summary || '').trim(),
       sentiment: sentiment as 'positive' | 'neutral' | 'negative',
       status: 'completed',
     },
   };
 }
 
-export async function summarize(transcript: string, business: any): Promise<{ parsed: StructuredSummary | null; raw: string; status: 'completed' | 'unavailable' }> {
+export async function summarize(
+  transcript: string,
+  business?: Partial<BusinessRecord> | null
+): Promise<{ parsed: StructuredSummary | null; raw: string; status: 'completed' | 'unavailable' }> {
   const client = getClient();
   const m = model();
   const prompt = `You are extracting a structured summary from a phone callback conversation on behalf of ${business?.name || 'the business'}. Return ONLY valid JSON with these fields:
@@ -189,7 +204,7 @@ Transcript:
 ${transcript}`;
 
   const executeExtraction = async (systemInstruction?: string) => {
-    const messages: any[] = [{ role: 'user', content: prompt }];
+    const messages: ChatMessage[] = [{ role: 'user', content: prompt }];
     if (systemInstruction) {
       messages.unshift({ role: 'system', content: systemInstruction });
     }
@@ -198,11 +213,11 @@ ${transcript}`;
       messages,
       temperature: 0.1,
     });
-    const raw = (resp as any).choices?.[0]?.message?.content || '';
+    const raw = resp.choices?.[0]?.message?.content || '';
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return { parsed: null, raw };
     try {
-      const json = JSON.parse(jsonMatch[0]);
+      const json = JSON.parse(jsonMatch[0]) as unknown;
       return { parsed: json, raw };
     } catch {
       return { parsed: null, raw };
@@ -225,8 +240,9 @@ ${transcript}`;
     }
 
     return { parsed: null, raw: retryAttempt.raw || firstAttempt.raw, status: 'unavailable' };
-  } catch (err: any) {
-    console.error('Summary extraction error:', err?.message);
-    return { parsed: null, raw: String(err?.message), status: 'unavailable' };
+  } catch (err: unknown) {
+    const errMessage = err instanceof Error ? err.message : String(err);
+    console.error('Summary extraction error:', errMessage);
+    return { parsed: null, raw: errMessage, status: 'unavailable' };
   }
 }

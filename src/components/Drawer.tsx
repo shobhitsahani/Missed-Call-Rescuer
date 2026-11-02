@@ -29,7 +29,6 @@ import {
   Clock,
   Activity,
   AlertCircle,
-  CheckCircle2,
   Calendar,
   User,
   HeartHandshake,
@@ -55,13 +54,15 @@ export interface CallDetails {
   start_time: string;
   end_time: string | null;
   end_reason: string | null;
+  is_completed?: boolean;
   outcome?: string | null;
   latency: LatencyItem[];
-  usage?: any;
+  usage?: Record<string, unknown>;
   notified_at?: string | null;
   notify_status?: string | null;
   notify_provider?: string | null;
   notify_error?: string | null;
+  summary?: (SummaryDetails & { status?: string }) | null;
 }
 
 export interface SummaryDetails {
@@ -74,6 +75,7 @@ export interface SummaryDetails {
   suggested_action: string;
   short_summary: string;
   sentiment: string;
+  status?: string;
 }
 
 export interface TurnDetails {
@@ -110,14 +112,20 @@ export function Drawer({
   const [copyError, setCopyError] = useState<string | null>(null);
   const copyTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  useEffect(() => {
+  const [prevKey, setPrevKey] = useState<string | null>(null);
+  const currentKey = `${call?.id}-${isOpen}`;
+  if (prevKey !== currentKey) {
+    setPrevKey(currentKey);
     setCopied(false);
     setCopiedId(false);
     setCopyError(null);
+  }
+
+  useEffect(() => {
     return () => {
       if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
     };
-  }, [call?.id, isOpen]);
+  }, []);
 
   const handleCopyId = async () => {
     if (!call) return;
@@ -273,7 +281,7 @@ export function Drawer({
 
               <div className="flex flex-wrap items-center gap-1.5 pt-1">
                 <StatusBadge status={call.end_reason || 'in progress'} />
-                {summary?.urgency && (summary as any).status !== 'unavailable' && (
+                {summary?.urgency && summary.status !== 'unavailable' && (
                   <StatusBadge status={summary.urgency} label={`Urgency: ${summary.urgency}`} />
                 )}
                 {call.outcome && (
@@ -329,7 +337,7 @@ export function Drawer({
                 </h3>
               </div>
 
-              {summary && (summary as any).status === 'unavailable' ? (
+              {summary && summary.status === 'unavailable' ? (
                 <div className="rounded-lg bg-amber-500/10 border border-amber-500/30 p-4 text-xs text-amber-300 space-y-1">
                   <p className="font-semibold text-amber-400">Summary Unavailable</p>
                   <p className="text-muted-foreground">

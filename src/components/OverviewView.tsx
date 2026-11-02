@@ -29,7 +29,6 @@ import {
   ExternalLink,
   X,
   ChevronRight,
-  Sparkles,
   BarChart3,
   Calendar,
 } from 'lucide-react';
@@ -276,7 +275,7 @@ export function OverviewView({
                       color: 'var(--foreground)',
                       boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
                     }}
-                    formatter={(value: any) => [`${value} ms`, 'Avg Latency']}
+                    formatter={(value) => [`${value} ms`, 'Avg Latency']}
                     labelFormatter={(label) => `Time: ${label}`}
                   />
                   <Area

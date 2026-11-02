@@ -9,6 +9,22 @@ services:
     envVars:
       - key: PORT
         value: 4000
+      - key: NODE_ENV
+        value: production
+      - key: ALLOWED_ORIGINS
+        value: https://missed-call-rescuer.vercel.app,http://localhost:3010
+      - key: MAX_CONCURRENT_CALLS
+        value: 2
+      - key: MAX_CALLS_PER_DAY
+        value: 100
+      - key: MAX_CALL_SECONDS
+        value: 300
+      - key: ADMIN_ENABLED
+        value: true
+      - key: STT_PROVIDER
+        value: assemblyai
+      - key: FIRST_CHUNK_MIN_WORDS
+        value: 6
       - key: OPENAI_BASE_URL
         value: https://api.groq.com/openai/v1
       - key: OPENAI_MODEL
@@ -17,3 +33,19 @@ services:
         sync: false
       - key: ASSEMBLYAI_API_KEY
         sync: false
+      - key: ASSEMBLYAI_VOICE_ID
+        value: aai-jane
+      - key: ACCESS_CODE
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: NOTIFY_PROVIDER
+        value: none
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: DASHBOARD_URL
+        value: https://missed-call-rescuer.vercel.app

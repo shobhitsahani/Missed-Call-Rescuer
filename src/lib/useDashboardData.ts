@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { API_BASE, api, getStoredToken, ApiError } from '@/lib/api';
+import { API_BASE, api, ApiError } from '@/lib/api';
 import { CallDetails, SummaryDetails, TurnDetails, LatencyItem } from '@/components/Drawer';
 
 export type MissedCall = {
@@ -42,7 +42,7 @@ export function computeAverages(rawLatency: LatencyItem[] = []) {
 
 export function useDashboardData() {
   const [isAuthorized, setIsAuthorized] = useState<boolean>(true);
-  const [business, setBusiness] = useState<any>(null);
+  const [business, setBusiness] = useState<Record<string, unknown> | null>(null);
   const [missed, setMissed] = useState<MissedCall[]>([]);
   const [calls, setCalls] = useState<CallDetails[]>([]);
   const [summaries, setSummaries] = useState<Record<string, SummaryDetails>>({});
@@ -98,7 +98,7 @@ export function useDashboardData() {
         );
         setSummaries((prev) => ({ ...prev, ...map }));
       }
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (e instanceof ApiError && e.status === 401) {
         setIsAuthorized(false);
       } else {
@@ -110,7 +110,16 @@ export function useDashboardData() {
   }, []);
 
   useEffect(() => {
-    load();
+    let ignore = false;
+    const timer = setTimeout(() => {
+      if (!ignore) {
+        void load();
+      }
+    }, 0);
+    return () => {
+      ignore = true;
+      clearTimeout(timer);
+    };
   }, [load]);
 
   // Authenticated SSE event subscription
@@ -163,17 +172,18 @@ export function useDashboardData() {
           load();
         });
 
-        es.addEventListener('summary_ready', (e: any) => {
+        es.addEventListener('summary_ready', (e: Event) => {
           setSseConnected(true);
           try {
-            const d = JSON.parse(e.data);
+            const me = e as MessageEvent;
+            const d = JSON.parse(me.data);
             if (d.summary) {
               setSummaries((prev) => ({ ...prev, [d.callId]: d.summary }));
             }
           } catch {}
           load();
         });
-      } catch (err: any) {
+      } catch (err: unknown) {
         if (err instanceof ApiError && err.status === 401) {
           setIsAuthorized(false);
         }
@@ -207,7 +217,7 @@ export function useDashboardData() {
       }
       await load();
       return r;
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (e instanceof ApiError && e.status === 401) {
         setIsAuthorized(false);
       }
@@ -226,7 +236,7 @@ export function useDashboardData() {
         body: JSON.stringify({ scope }),
       });
       await load();
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (e instanceof ApiError && e.status === 401) {
         setIsAuthorized(false);
       }
@@ -263,7 +273,7 @@ export function useDashboardData() {
 
   // Strict honest completed call definition: customer spoke at least once AND valid summary generated (not failed reason)
   const completedCallsCount = useMemo(() => {
-    return calls.filter((c) => (c as any).is_completed === true).length;
+    return calls.filter((c) => c.is_completed === true).length;
   }, [calls]);
 
   // Completion rate (completed calls / missed calls logged); hidden when fewer than 5 missed calls exist

@@ -131,32 +131,51 @@ export const DEFAULT_BIZ = {
 
 export { BUSINESS_PRESETS };
 
-export function parseServices(raw: any): string[] {
+export function parseServices(raw: unknown): string[] {
   if (!raw) return [];
   if (Array.isArray(raw)) return raw;
   try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed.map(s => String(s).trim()).filter(Boolean);
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (Array.isArray(parsed)) return parsed.map((s) => String(s).trim()).filter(Boolean);
   } catch {}
-  return String(raw).split(',').map(s => s.trim()).filter(Boolean);
+  return String(raw).split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-export function parseFaqs(raw: any): Array<{ question: string; answer: string }> {
+export function parseFaqs(raw: unknown): Array<{ question: string; answer: string }> {
   if (!raw) return [];
-  if (Array.isArray(raw)) return raw;
+  if (Array.isArray(raw)) return raw as Array<{ question: string; answer: string }>;
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
     if (Array.isArray(parsed)) {
-      return parsed.filter(item => item && typeof item === 'object').map(item => ({
-        question: String(item.question || '').trim(),
-        answer: String(item.answer || '').trim(),
-      }));
+      return parsed.filter((item) => item && typeof item === 'object').map((item) => {
+        const entry = item as Record<string, unknown>;
+        return {
+          question: String(entry.question || '').trim(),
+          answer: String(entry.answer || '').trim(),
+        };
+      });
     }
   } catch {}
   return [{ question: 'General inquiry', answer: String(raw).trim() }];
 }
 
-const existingBiz = db.prepare('SELECT * FROM businesses WHERE id=?').get(DEFAULT_BIZ.id) as any;
+export interface BusinessRecord {
+  id: string;
+  name: string;
+  hours: string;
+  services: string;
+  faqs: string;
+  tone: string;
+  voice: string;
+  language?: string;
+  timezone: string;
+  owner_email?: string;
+  [key: string]: unknown;
+}
+
+const existingBiz = db.prepare('SELECT * FROM businesses WHERE id=?').get(DEFAULT_BIZ.id) as
+  | { id: string; voice?: string; timezone?: string }
+  | undefined;
 if (!existingBiz) {
   db.prepare(`INSERT INTO businesses (id,name,hours,services,faqs,tone,voice,language,timezone,owner_email) VALUES (?,?,?,?,?,?,?,?,?,?)`)
     .run(

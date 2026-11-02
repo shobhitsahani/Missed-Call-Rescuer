@@ -38,13 +38,17 @@ export function createRateLimiter(action: string, maxPerMinute: number) {
 
 export function getAllowedOrigins(): string[] {
   const envVal = process.env.ALLOWED_ORIGINS?.trim();
-  if (envVal) {
-    return envVal.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-  }
-  if (process.env.NODE_ENV !== 'production') {
-    return ['http://localhost:3010', 'http://127.0.0.1:3010'];
-  }
-  return [];
+  const configured = envVal
+    ? envVal.split(',').map((s) => s.trim().toLowerCase().replace(/\/+$/, '')).filter(Boolean)
+    : [];
+
+  const defaults = [
+    'https://missed-call-rescuer.vercel.app',
+    'http://localhost:3010',
+    'http://127.0.0.1:3010',
+  ];
+
+  return Array.from(new Set([...defaults, ...configured]));
 }
 
 export function isOriginAllowed(origin?: string | null): boolean {
@@ -52,8 +56,17 @@ export function isOriginAllowed(origin?: string | null): boolean {
     // In production, reject requests without an Origin header where origin is required (WebSocket / SSE)
     return process.env.NODE_ENV !== 'production';
   }
-  const cleanOrigin = origin.trim().toLowerCase();
+  const cleanOrigin = origin.trim().toLowerCase().replace(/\/+$/, '');
   const allowed = getAllowedOrigins();
+
+  if (allowed.includes(cleanOrigin)) {
+    return true;
+  }
+
+  // Allow Vercel preview deployment URLs for this project
+  if (/^https:\/\/missed-call-rescuer(-[a-z0-9-]+)?\.vercel\.app$/.test(cleanOrigin)) {
+    return true;
+  }
 
   if (process.env.NODE_ENV !== 'production') {
     if (cleanOrigin.startsWith('http://localhost:') || cleanOrigin.startsWith('http://127.0.0.1:')) {
@@ -61,7 +74,7 @@ export function isOriginAllowed(origin?: string | null): boolean {
     }
   }
 
-  return allowed.includes(cleanOrigin);
+  return false;
 }
 
 export function checkCallBudget(): { allowed: boolean; reason?: string } {
@@ -76,7 +89,7 @@ export function checkCallBudget(): { allowed: boolean; reason?: string } {
 
   // Check 24-hour call cap
   try {
-    const row: any = db.prepare(`SELECT COUNT(*) as cnt FROM calls WHERE start_time >= datetime('now', '-24 hours')`).get();
+    const row = db.prepare(`SELECT COUNT(*) as cnt FROM calls WHERE start_time >= datetime('now', '-24 hours')`).get() as { cnt: number } | undefined;
     if (row && row.cnt >= MAX_CALLS_PER_DAY) {
       return { allowed: false, reason: 'Daily demo limit reached. Please try again tomorrow.' };
     }
@@ -85,9 +98,9 @@ export function checkCallBudget(): { allowed: boolean; reason?: string } {
   return { allowed: true };
 }
 
-export function sanitizeClientError(err: any): string {
+export function sanitizeClientError(err: unknown): string {
   if (!err) return 'Internal Server Error';
-  const msg = typeof err === 'string' ? err : err.message || '';
+  const msg = typeof err === 'string' ? err : (err instanceof Error ? err.message : '');
   if (process.env.NODE_ENV === 'production') {
     return 'An unexpected error occurred. Please try again later.';
   }

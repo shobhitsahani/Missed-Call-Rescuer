@@ -1,4 +1,3 @@
-import { isValidVoiceId } from '../src/lib/voices';
 
 async function runTests() {
   const base = process.env.API_BASE || 'http://localhost:4000';

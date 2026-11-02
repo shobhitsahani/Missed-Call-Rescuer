@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useSyncExternalStore } from 'react';
 
 export type Platform = 'mac' | 'windows' | 'linux' | 'touch' | 'other';
 
@@ -70,13 +70,12 @@ export function detectPlatform(nav?: NavigatorLike | null): Platform {
  * Renders neutral fallback before mount to avoid hydration mismatches.
  */
 export function usePlatform(): { platform: Platform; mounted: boolean } {
-  const [platform, setPlatform] = useState<Platform>('other');
-  const [mounted, setMounted] = useState(false);
-
-  useEffect(() => {
-    setPlatform(detectPlatform());
-    setMounted(true);
-  }, []);
+  const mounted = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false
+  );
+  const platform = mounted ? detectPlatform() : 'other';
 
   return { platform, mounted };
 }

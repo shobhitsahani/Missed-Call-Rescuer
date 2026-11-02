@@ -53,8 +53,8 @@ export function AccessScreen({ onSuccess, apiBase = process.env.NEXT_PUBLIC_API_
       } else {
         setError('Unexpected server response. Please try again.');
       }
-    } catch (err: any) {
-      setError(err?.message || 'Network error connecting to the API server.');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Network error connecting to the API server.');
     } finally {
       setLoading(false);
     }

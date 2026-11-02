@@ -27,8 +27,8 @@ export function clearStoredToken(): void {
 
 export class ApiError extends Error {
   status: number;
-  data?: any;
-  constructor(status: number, message: string, data?: any) {
+  data?: unknown;
+  constructor(status: number, message: string, data?: unknown) {
     super(message);
     this.status = status;
     this.data = data;
@@ -59,11 +59,11 @@ export async function api(path: string, init: RequestInit = {}) {
   }
 
   if (!res.ok) {
-    let errorBody: any = null;
+    let errorBody: Record<string, unknown> | null = null;
     try {
       errorBody = await res.json();
     } catch {}
-    const msg = errorBody?.error || `API error (${res.status})`;
+    const msg = (typeof errorBody?.error === 'string' ? errorBody.error : null) || `API error (${res.status})`;
     throw new ApiError(res.status, msg, errorBody);
   }
 

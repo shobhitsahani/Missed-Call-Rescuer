@@ -2,40 +2,29 @@ import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
 
 const ACCESS_CODE = process.env.ACCESS_CODE?.trim();
-const SESSION_SECRET = process.env.SESSION_SECRET?.trim() || (process.env.NODE_ENV !== 'production' ? 'dev-session-secret-missed-call-rescuer' : '');
+const SESSION_SECRET = process.env.SESSION_SECRET?.trim() || 'hackathon-open-secret';
 
 export function validateStartupAuth(): void {
-  if (process.env.NODE_ENV === 'production') {
-    const missing: string[] = [];
-    if (!ACCESS_CODE) missing.push('ACCESS_CODE');
-    if (!SESSION_SECRET) missing.push('SESSION_SECRET');
-
-    if (missing.length > 0) {
-      console.error(`[FATAL] Missing required production environment variable(s): ${missing.join(', ')}`);
-      console.error('The application refuses to start in production without authentication configured.');
-      process.exit(1);
-    }
+  if (ACCESS_CODE) {
+    console.log('[AUTH] ACCESS_CODE configured. Protected dashboard access active.');
   } else {
-    if (!ACCESS_CODE) {
-      console.warn('[AUTH] ACCESS_CODE is unset. Running in open access mode (development only).');
-    }
+    console.log('[AUTH] Open access mode enabled (hackathon demo). No ACCESS_CODE or SESSION_SECRET required.');
   }
 }
 
 export function isOpenAccess(): boolean {
-  return !ACCESS_CODE && process.env.NODE_ENV !== 'production';
+  return !ACCESS_CODE;
 }
 
 /**
- * Constant-time comparison for access code
+ * Constant-time comparison for access code (optional fallback if ACCESS_CODE is provided)
  */
 export function verifyAccessCode(inputCode: string): boolean {
   if (!ACCESS_CODE) {
-    return isOpenAccess();
+    return true;
   }
   if (!inputCode || typeof inputCode !== 'string') return false;
 
-  // Use SHA-256 digests so both buffers have identical 32-byte lengths
   const expectedHash = crypto.createHash('sha256').update(ACCESS_CODE).digest();
   const actualHash = crypto.createHash('sha256').update(inputCode.trim()).digest();
 
@@ -49,17 +38,16 @@ interface TokenPayload {
 }
 
 /**
- * Sign HMAC token with 12-hour expiration
+ * Sign HMAC token (retained for backward compatibility)
  */
 export function signAuthToken(role: 'judge' | 'owner' = 'judge', ttlMs: number = 12 * 60 * 60 * 1000): string {
-  const secret = SESSION_SECRET || 'dev-session-secret';
   const payload: TokenPayload = {
     role,
     exp: Date.now() + ttlMs,
     nonce: crypto.randomBytes(8).toString('hex'),
   };
   const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
-  const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
   return `${body}.${sig}`;
 }
 
@@ -68,15 +56,14 @@ export function signAuthToken(role: 'judge' | 'owner' = 'judge', ttlMs: number =
  */
 export function verifyAuthToken(token: string): TokenPayload | null {
   if (isOpenAccess()) {
-    return { role: 'judge', exp: Date.now() + 60000 };
+    return { role: 'judge', exp: Date.now() + 86400000 };
   }
   if (!token || typeof token !== 'string') return null;
   const parts = token.split('.');
   if (parts.length !== 2) return null;
 
   const [body, sig] = parts;
-  const secret = SESSION_SECRET || 'dev-session-secret';
-  const expectedSig = crypto.createHmac('sha256', secret).update(body).digest('base64url');
+  const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(body).digest('base64url');
 
   const sigBuf = Buffer.from(sig);
   const expBuf = Buffer.from(expectedSig);
@@ -96,17 +83,18 @@ export function verifyAuthToken(token: string): TokenPayload | null {
 }
 
 /**
- * Generate 60-second single-purpose stream token for SSE
+ * Generate stream token for SSE (retained for backward compatibility)
  */
 export function signStreamToken(): string {
   return signAuthToken('judge', 60 * 1000);
 }
 
 /**
- * Express middleware requiring Bearer token
+ * Express middleware requiring Bearer token (no-op in open access mode)
  */
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   if (isOpenAccess()) {
+    (req as Request & { user?: TokenPayload }).user = { role: 'judge', exp: Date.now() + 86400000 };
     return next();
   }
 
@@ -125,6 +113,6 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
     return;
   }
 
-  (req as any).user = payload;
+  (req as Request & { user?: TokenPayload }).user = payload;
   next();
 }

@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { API_BASE, api } from '@/lib/api';
+import { API_BASE } from '@/lib/api';
 import { SummaryCard } from '@/components/SummaryCard';
 import { TranscriptBubble } from '@/components/TranscriptBubble';
 import { AgentStatusVisualizer } from '@/components/AgentStatusVisualizer';
@@ -18,7 +18,6 @@ import {
   AlertCircle,
   Activity,
   CheckCircle2,
-  Sparkles,
   Loader2,
   ShieldAlert,
 } from 'lucide-react';
@@ -39,23 +38,22 @@ type TranscriptItem = {
 export default function CallPage() {
   const params = useParams();
   const token = params?.token as string;
-  const [business, setBusiness] = useState<any>(null);
+  const [business, setBusiness] = useState<{ name: string; voice: string } | null>(null);
   const [sttProvider, setSttProvider] = useState<string>('assemblyai');
   const [status, setStatus] = useState('idle');
   const [started, setStarted] = useState(false);
   const [state, setState] = useState('GREETING');
   const [transcript, setTranscript] = useState<TranscriptItem[]>([]);
   const [livePartial, setLivePartial] = useState<string>('');
-  const [summary, setSummary] = useState<any>(null);
+  const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
   const [latestMetric, setLatestMetric] = useState<TurnMetric | null>(null);
-  const [_metricsHistory, setMetricsHistory] = useState<TurnMetric[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [tokenError, setTokenError] = useState<string | null>(null);
   const [validatingToken, setValidatingToken] = useState(true);
   const [progressMessage, setProgressMessage] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const recRef = useRef<any>(null);
+  const recRef = useRef<{ stop?: () => void } | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const micCtxRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
@@ -94,7 +92,7 @@ export default function CallPage() {
         if (data?.valid) {
           setBusiness({ name: data.businessName, voice: data.voice });
         }
-      } catch (err: any) {
+      } catch {
         if (!isCancelled) {
           setTokenError('Unable to connect to the callback server.');
         }
@@ -130,14 +128,14 @@ export default function CallPage() {
 
   function initAudio() {
     if (!audioCtxRef.current) {
-      const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext;
+      const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       audioCtxRef.current = new Ctx({ sampleRate: 24000 });
     }
-    const ctx = audioCtxRef.current!;
+    const ctx = audioCtxRef.current;
     if (ctx.state === 'suspended') {
       ctx.resume();
     }
-    return audioCtxRef.current!;
+    return audioCtxRef.current;
   }
 
   function playPcmChunk(arrayBuffer: ArrayBuffer) {
@@ -213,7 +211,7 @@ export default function CallPage() {
       }
     }, 10000);
 
-    const provider = business?.sttProvider || sttProvider;
+    const provider = sttProvider;
 
     // In AssemblyAI mode, acquire mic before connecting WS
     if (provider === 'assemblyai') {
@@ -227,7 +225,7 @@ export default function CallPage() {
         });
         mediaStreamRef.current = stream;
 
-        const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+        const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
         const micCtx = new AudioCtx();
         micCtxRef.current = micCtx;
         if (micCtx.state === 'suspended') {
@@ -248,14 +246,15 @@ export default function CallPage() {
         };
 
         micSource.connect(workletNode);
-      } catch (err: any) {
+      } catch (err: unknown) {
         if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
         setStarted(false);
         setStatus('idle');
-        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        const errObj = err as Error;
+        if (errObj.name === 'NotAllowedError' || errObj.name === 'PermissionDeniedError') {
           setError('Microphone access blocked. Please enable microphone permissions in your browser to start the call.');
         } else {
-          setError(`Microphone error: ${err.message || 'Unable to access audio device.'}`);
+          setError(`Microphone error: ${errObj.message || 'Unable to access audio device.'}`);
         }
         return;
       }
@@ -276,7 +275,19 @@ export default function CallPage() {
         playPcmChunk(ev.data);
         return;
       }
-      let msg: any;
+      let msg: {
+        type?: string;
+        sttProvider?: string;
+        message?: string;
+        state?: string;
+        text?: string;
+        totalMs?: number;
+        timeToFirstAudio?: number;
+        llmFirstTokenMs?: number | null;
+        ttsFirstAudioMs?: number | null;
+        turnDetectionMs?: number | null;
+        summary?: Record<string, unknown>;
+      };
       try {
         msg = JSON.parse(ev.data);
       } catch {
@@ -294,22 +305,24 @@ export default function CallPage() {
           }
           break;
         case 'state':
-          setState(msg.state);
-          if (msg.state === 'SPEAKING' || msg.state === 'LISTENING') {
-            if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+          if (msg.state) {
+            setState(msg.state);
+            if (msg.state === 'SPEAKING' || msg.state === 'LISTENING') {
+              if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+            }
           }
           break;
         case 'agent_text':
           if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
-          currentAgentTextRef.current = msg.text;
-          setTranscript((t) => [...t, { role: 'agent', text: msg.text }]);
+          currentAgentTextRef.current = msg.text || '';
+          setTranscript((t) => [...t, { role: 'agent', text: msg.text || '' }]);
           break;
         case 'partial':
           setLivePartial(msg.text || '');
           break;
         case 'customer_transcript':
           setLivePartial('');
-          setTranscript((t) => [...t, { role: 'customer', text: msg.text }]);
+          setTranscript((t) => [...t, { role: 'customer', text: msg.text || '' }]);
           break;
         case 'stop_audio':
           stopAllAudio();
@@ -328,12 +341,11 @@ export default function CallPage() {
               turnDetectionMs: turnDetection,
             };
             setLatestMetric(m);
-            setMetricsHistory((prev) => [...prev, m]);
           }
           break;
         }
         case 'summary':
-          setSummary(msg.summary);
+          setSummary(msg.summary || null);
           break;
         case 'error':
           if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
@@ -353,7 +365,24 @@ export default function CallPage() {
 
     // If STT provider is browser fallback, setup SpeechRecognition
     if (provider === 'browser') {
-      const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      type SpeechRecognitionCtor = new () => {
+        continuous: boolean;
+        interimResults: boolean;
+        lang: string;
+        start: () => void;
+        stop: () => void;
+        onresult: (e: {
+          resultIndex: number;
+          results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }>;
+        }) => void;
+        onerror: (e: { error: string }) => void;
+        onend: () => void;
+      };
+      const win = window as unknown as {
+        SpeechRecognition?: SpeechRecognitionCtor;
+        webkitSpeechRecognition?: SpeechRecognitionCtor;
+      };
+      const SR = win.SpeechRecognition || win.webkitSpeechRecognition;
       if (!SR) {
         setError('Browser speech recognition is not supported in this browser. Please use Chrome or Edge.');
         return;
@@ -364,7 +393,10 @@ export default function CallPage() {
       rec.interimResults = true;
       rec.lang = 'en-US';
 
-      rec.onresult = (e: any) => {
+      rec.onresult = (e: {
+        resultIndex: number;
+        results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }>;
+      }) => {
         let interim = '';
         let final = '';
         for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -399,7 +431,7 @@ export default function CallPage() {
         }
       };
 
-      rec.onerror = (e: any) => {
+      rec.onerror = (e: { error: string }) => {
         if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
           setError('Microphone access blocked. Please enable microphone permissions in your browser.');
         } else if (e.error === 'network') {
@@ -448,7 +480,7 @@ export default function CallPage() {
 
     // Cleanup browser recognition if active
     try {
-      recRef.current?.stop();
+      recRef.current?.stop?.();
     } catch {}
 
     stopAllAudio();

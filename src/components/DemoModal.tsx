@@ -38,10 +38,10 @@ export function DemoModal({ isOpen, onClose, onDataCleared }: DemoModalProps) {
         ok: true,
         message: `Success! Test alert sent via ${data.provider}. Check your notification channel.`,
       });
-    } catch (err: any) {
+    } catch (err: unknown) {
       setTestResult({
         ok: false,
-        message: err?.message || 'Failed to send test notification',
+        message: err instanceof Error ? err.message : 'Failed to send test notification',
       });
     } finally {
       setTestingNotify(false);
@@ -63,10 +63,10 @@ export function DemoModal({ isOpen, onClose, onDataCleared }: DemoModalProps) {
       });
       setConfirmClear(false);
       if (onDataCleared) onDataCleared();
-    } catch (err: any) {
+    } catch (err: unknown) {
       setClearResult({
         ok: false,
-        message: err?.message || 'Failed to clear test data. Ensure ADMIN_ENABLED=true if in production.',
+        message: err instanceof Error ? err.message : 'Failed to clear test data. Ensure ADMIN_ENABLED=true if in production.',
       });
     } finally {
       setClearing(false);

@@ -176,7 +176,7 @@ export function MissedCallsView({
   ], []);
 
   const globalFilterFn = React.useCallback(
-    (row: any, _columnId: string, filterValue: string) => {
+    (row: { original: MissedCall }, _columnId: string, filterValue: string) => {
       if (!filterValue) return true;
       const search = filterValue.toLowerCase().trim();
       const phone = (row.original.customer_phone || '').toLowerCase();

@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
+import WebSocket from 'ws';
 import db from './db';
 import * as llm from './llm';
 import * as events from './events';
@@ -8,7 +9,60 @@ import { notifyCallSummary } from './notify';
 import { isValidVoiceId } from '../src/lib/voices';
 import { checkCallBudget, MAX_CALL_SECONDS } from './security';
 
-export const sessions = new Map<string, any>();
+export interface SessionTurn {
+  role: string;
+  text: string;
+  interrupted: boolean;
+}
+
+export interface SessionUsage {
+  ttsChars: number;
+  sttSeconds: number;
+  llmTokens: number;
+}
+
+export interface SessionBusiness {
+  id: string;
+  name: string;
+  hours: string;
+  services: string;
+  faqs: string;
+  tone: string;
+  voice: string;
+  language?: string;
+  timezone: string;
+  owner_email?: string;
+}
+
+export interface Session {
+  id: string;
+  ws: WebSocket | null;
+  business: SessionBusiness;
+  missedCallId: string | null;
+  customerPhone: string;
+  state: string;
+  turns: SessionTurn[];
+  turnOrder: number;
+  generating: boolean;
+  cancelGeneration: boolean;
+  abortController: AbortController | null;
+  ended: boolean;
+  startedAt: number;
+  latencies: number[];
+  usage: SessionUsage;
+  silenceTimer: NodeJS.Timeout | null;
+  maxTimer: NodeJS.Timeout | null;
+  tts: TtsClient;
+  stt: SttClient | null;
+  keepAliveTimer: NodeJS.Timeout | null;
+  ttsFailed: boolean;
+  currentAgentText: string;
+  agentSpeakingStartTime: number;
+  sttProvider: string;
+  notificationDispatched?: boolean;
+}
+
+export const sessions = new Map<string, Session>();
 
 export const STT_PROVIDER = process.env.STT_PROVIDER || 'assemblyai';
 
@@ -16,11 +70,34 @@ const OPT_OUT_PHRASES = ['stop calling', 'do not call', "don't call", 'remove me
 const WRONG_NUMBER = ['wrong number', 'not the right person', 'you have the wrong'];
 
 function getBusinessRow() {
-  return db.prepare('SELECT * FROM businesses LIMIT 1').get();
+  return db.prepare('SELECT * FROM businesses LIMIT 1').get() as Record<string, unknown> | undefined;
 }
 
-function rowToBiz(r: any) {
-  return { id: r.id, name: r.name, hours: r.hours, services: r.services, faqs: r.faqs, tone: r.tone, voice: r.voice, language: r.language, timezone: r.timezone, owner_email: r.owner_email };
+function rowToBiz(r?: Record<string, unknown>): SessionBusiness {
+  if (!r) {
+    return {
+      id: 'default',
+      name: 'Business',
+      hours: '',
+      services: '',
+      faqs: '',
+      tone: 'friendly, professional, concise',
+      voice: 'aai-jane',
+      timezone: 'UTC',
+    };
+  }
+  return {
+    id: String(r.id || 'default'),
+    name: String(r.name || 'Business'),
+    hours: String(r.hours || ''),
+    services: String(r.services || ''),
+    faqs: String(r.faqs || ''),
+    tone: String(r.tone || 'friendly, professional, concise'),
+    voice: String(r.voice || 'aai-jane'),
+    language: r.language ? String(r.language) : undefined,
+    timezone: String(r.timezone || 'UTC'),
+    owner_email: r.owner_email ? String(r.owner_email) : undefined,
+  };
 }
 
 function detectOptOut(text: string) {
@@ -112,24 +189,24 @@ function extractNextChunk(buf: string, isFirst: boolean): { chunk: string; remai
   }
 }
 
-function send(session: any, msg: any) {
+function send(session: Session, msg: Record<string, unknown>) {
   if (session.ws && session.ws.readyState === 1) {
-    try { session.ws.send(JSON.stringify(msg)); } catch (e) {}
+    try { session.ws.send(JSON.stringify(msg)); } catch {}
   }
 }
 
-function sendBinary(session: any, data: Uint8Array) {
+function sendBinary(session: Session, data: Uint8Array) {
   if (session.ws && session.ws.readyState === 1) {
-    try { session.ws.send(data, { binary: true }); } catch (e) {}
+    try { session.ws.send(data, { binary: true }); } catch {}
   }
 }
 
-function setState(session: any, state: string) {
+function setState(session: Session, state: string) {
   session.state = state;
   send(session, { type: 'state', state });
 }
 
-function addTurn(session: any, role: string, text: string, interrupted = false, deferDb = false) {
+function addTurn(session: Session, role: string, text: string, interrupted = false, deferDb = false) {
   session.turnOrder += 1;
   const orderIdx = session.turnOrder;
   const turnId = uuidv4();
@@ -140,8 +217,9 @@ function addTurn(session: any, role: string, text: string, interrupted = false, 
     try {
       db.prepare('INSERT INTO turns (id, call_id, order_idx, role, text, interrupted, ts) VALUES (?,?,?,?,?,?,?)')
         .run(turnId, session.id, orderIdx, role, text, interrupted ? 1 : 0, ts);
-    } catch (e: any) {
-      console.error('Failed to insert turn:', e?.message);
+    } catch (e: unknown) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      console.error('Failed to insert turn:', errMsg);
     }
   };
 
@@ -153,7 +231,7 @@ function addTurn(session: any, role: string, text: string, interrupted = false, 
 }
 
 async function speakSentence(
-  session: any,
+  session: Session,
   sentence: string,
   onFirstAudio?: () => void,
   onGenerateSent?: () => void
@@ -182,15 +260,17 @@ async function speakSentence(
 
   try {
     return await trySpeak();
-  } catch (err: any) {
+  } catch (err: unknown) {
     if (session.cancelGeneration || session.ended) return true;
-    console.error('TTS error:', err?.message);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error('TTS error:', errMsg);
     // retry once
     try {
       await session.tts.connectWithRetry();
       return await trySpeak();
-    } catch (err2: any) {
-      console.error('TTS retry failed:', err2?.message);
+    } catch (err2: unknown) {
+      const err2Msg = err2 instanceof Error ? err2.message : String(err2);
+      console.error('TTS retry failed:', err2Msg);
       send(session, { type: 'error', message: 'Voice synthesis failed. Ending call.' });
       await endSession(session, 'error');
       return false;
@@ -198,15 +278,23 @@ async function speakSentence(
   }
 }
 
-export async function startSession(ws: any, missedCallTokenOrId?: string) {
+export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) {
   const budget = checkCallBudget();
   if (!budget.allowed) {
     throw new Error(budget.reason || 'Demo is busy, try again in a minute');
   }
 
-  let missed: any = null;
+  interface MissedRow {
+    id: string;
+    business_id: string;
+    customer_phone: string;
+    token_expires_at?: string;
+    call_started_at?: string;
+  }
+
+  let missed: MissedRow | undefined = undefined;
   if (missedCallTokenOrId) {
-    missed = db.prepare('SELECT * FROM missed_calls WHERE token = ? OR id = ?').get(missedCallTokenOrId, missedCallTokenOrId);
+    missed = db.prepare('SELECT * FROM missed_calls WHERE token = ? OR id = ?').get(missedCallTokenOrId, missedCallTokenOrId) as MissedRow | undefined;
   }
   if (!missed) {
     throw new Error('Callback session not found');
@@ -254,7 +342,7 @@ export async function startSession(ws: any, missedCallTokenOrId?: string) {
   const apiKey = process.env.ASSEMBLYAI_API_KEY || '';
   const tts = new TtsClient({ apiKey, voiceId, sampleRate: 24000, encoding: 'pcm_s16le', language: 'english' });
 
-  const session: any = {
+  const session: Session = {
     id: callId,
     ws,
     business,
@@ -289,8 +377,8 @@ export async function startSession(ws: any, missedCallTokenOrId?: string) {
   send(session, { type: 'progress', stage: 'tts_connect', message: 'Connecting audio...' });
   try {
     await withStageTimeout(tts.connectWithRetry(), 10000, 'TTS connect');
-  } catch (err: any) {
-    const errorMsg = sanitizeErrorMsg(err?.message);
+  } catch (err: unknown) {
+    const errorMsg = sanitizeErrorMsg(err instanceof Error ? err.message : String(err));
     console.error(`[session ${session.id}] stage=tts_connect error=${errorMsg}`);
     send(session, {
       type: 'error',
@@ -307,7 +395,7 @@ export async function startSession(ws: any, missedCallTokenOrId?: string) {
     const stt = new SttClient({ apiKey });
     session.stt = stt;
 
-    stt.onSpeechStart((_audioStartMs) => {
+    stt.onSpeechStart(() => {
       // Speech started signal available if needed
     });
 
@@ -365,8 +453,8 @@ export async function startSession(ws: any, missedCallTokenOrId?: string) {
 
     try {
       await withStageTimeout(stt.connectWithRetry(), 10000, 'STT connect');
-    } catch (err: any) {
-      const errorMsg = sanitizeErrorMsg(err?.message);
+    } catch (err: unknown) {
+      const errorMsg = sanitizeErrorMsg(err instanceof Error ? err.message : String(err));
       console.error(`[session ${session.id}] stage=stt_connect error=${errorMsg}`);
       send(session, {
         type: 'error',
@@ -395,8 +483,8 @@ export async function startSession(ws: any, missedCallTokenOrId?: string) {
   try {
     const ok = await withStageTimeout(speakSentence(session, greeting, () => {}), 10000, 'Greeting audio playback');
     if (!ok || session.ended) return session;
-  } catch (err: any) {
-    const errorMsg = sanitizeErrorMsg(err?.message);
+  } catch (err: unknown) {
+    const errorMsg = sanitizeErrorMsg(err instanceof Error ? err.message : String(err));
     console.error(`[session ${session.id}] stage=greeting error=${errorMsg}`);
     send(session, {
       type: 'error',
@@ -414,7 +502,7 @@ export async function startSession(ws: any, missedCallTokenOrId?: string) {
   return session;
 }
 
-export async function handleCustomerUtterance(session: any, text: string, turnDetectionMs?: number | null) {
+export async function handleCustomerUtterance(session: Session, text: string, turnDetectionMs?: number | null) {
   if (session.ended) return;
   text = (text || '').trim();
   if (!text) return;
@@ -489,9 +577,9 @@ export async function handleCustomerUtterance(session: any, text: string, turnDe
     console.log(`[turn] turn_detection=${turnDetectionMs ?? '-'}ms llm_first_token=${llmFirstTokenMs ?? '-'}ms tts_first_audio=${ttsFirstAudioMs ?? '-'}ms total=${totalMs}ms`);
   };
 
-  const messages = session.turns
-    .filter((t: any) => t.role === 'customer' || t.role === 'agent')
-    .map((t: any) => ({ role: t.role === 'agent' ? 'assistant' : 'user', content: t.text }));
+  const messages: llm.ChatMessage[] = session.turns
+    .filter((t: SessionTurn) => t.role === 'customer' || t.role === 'agent')
+    .map((t: SessionTurn) => ({ role: (t.role === 'agent' ? 'assistant' : 'user') as 'assistant' | 'user', content: t.text }));
 
   // chunk queue consumer
   const chunkQueue: string[] = [];
@@ -517,9 +605,10 @@ export async function handleCustomerUtterance(session: any, text: string, turnDe
           }
         }
       }, controller.signal);
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (!session.cancelGeneration) {
-        console.error(`[session ${session.id}] stage=llm error=${sanitizeErrorMsg(e?.message)}`);
+        const errMsg = e instanceof Error ? e.message : String(e);
+        console.error(`[session ${session.id}] stage=llm error=${sanitizeErrorMsg(errMsg)}`);
       }
     } finally {
       const rest = buffer.trim();
@@ -574,7 +663,7 @@ export async function handleCustomerUtterance(session: any, text: string, turnDe
   }
 }
 
-export function bargeIn(session: any) {
+export function bargeIn(session: Session) {
   if (session.ended) return;
   session.cancelGeneration = true;
   session.generating = false;
@@ -582,15 +671,15 @@ export function bargeIn(session: any) {
     try { session.abortController.abort(); } catch {}
   }
   try { session.tts.cancel(); } catch {}
-  const row = db.prepare('SELECT id FROM turns WHERE call_id=? AND role=? ORDER BY order_idx DESC LIMIT 1').get(session.id, 'agent');
-  if (row) db.prepare('UPDATE turns SET interrupted=1 WHERE id=?').run((row as any).id);
-  const last = session.turns.slice().reverse().find((t: any) => t.role === 'agent');
+  const row = db.prepare('SELECT id FROM turns WHERE call_id=? AND role=? ORDER BY order_idx DESC LIMIT 1').get(session.id, 'agent') as { id: string } | undefined;
+  if (row) db.prepare('UPDATE turns SET interrupted=1 WHERE id=?').run(row.id);
+  const last = session.turns.slice().reverse().find((t: SessionTurn) => t.role === 'agent');
   if (last) last.interrupted = true;
   send(session, { type: 'stop_audio' });
   setState(session, 'LISTENING');
 }
 
-export async function endSession(session: any, reason: string) {
+export async function endSession(session: Session, reason: string) {
   if (session.ended) return;
   session.ended = true;
   if (session.silenceTimer) clearTimeout(session.silenceTimer);
@@ -611,7 +700,7 @@ export async function endSession(session: any, reason: string) {
   }
 
   setState(session, 'SUMMARIZING');
-  const transcript = session.turns.map((t: any) => `${t.role === 'agent' ? 'Agent' : 'Customer'}: ${t.text}`).join('\n');
+  const transcript = session.turns.map((t: SessionTurn) => `${t.role === 'agent' ? 'Agent' : 'Customer'}: ${t.text}`).join('\n');
   const { parsed, raw, status: summaryStatus } = await llm.summarize(transcript, session.business);
   const summaryId = uuidv4();
   const isUnavailable = summaryStatus === 'unavailable' || !parsed;
@@ -652,7 +741,7 @@ export async function endSession(session: any, reason: string) {
   setState(session, 'DONE');
   send(session, { type: 'summary', summary });
   setTimeout(() => {
-    try { session.ws.close(); } catch (e) {}
+    try { session.ws?.close(); } catch {}
   }, 500);
 
   sessions.delete(session.id);
@@ -660,7 +749,7 @@ export async function endSession(session: any, reason: string) {
   events.broadcast('summary_ready', { callId: session.id, summary });
 
   // Fire-and-forget owner notification: send nothing if 0 customer turns, unless opted_out
-  const customerTurns = (session.turns || []).filter((t: any) => t.role === 'customer');
+  const customerTurns = (session.turns || []).filter((t: SessionTurn) => t.role === 'customer');
   const shouldNotify = customerTurns.length > 0 || reason === 'opted_out';
 
   if (shouldNotify && !session.notificationDispatched) {
@@ -671,8 +760,9 @@ export async function endSession(session: any, reason: string) {
       customerPhone: session.customerPhone,
       endReason: reason,
       summary,
-    }).catch((err: any) => {
-      console.error('[session] Owner notification dispatch error:', err?.message);
+    }).catch((err: unknown) => {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error('[session] Owner notification dispatch error:', errMsg);
     });
   }
 }

@@ -2,6 +2,7 @@
 
 import * as React from 'react';
 import { useState, useEffect, useRef, useMemo } from 'react';
+import { useRouter } from 'next/navigation';
 import { Sidebar, DashboardView } from '@/components/Sidebar';
 import { ASSEMBLYAI_VOICES, VoiceOption } from '@/lib/voices';
 import { API_BASE } from '@/lib/api';
@@ -101,6 +102,8 @@ export default function SettingsPage() {
 
   // Dismissible notice banner state via useSyncExternalStore
 
+  const router = useRouter();
+
   // Form fields
   const [name, setName] = useState('');
   const [hours, setHours] = useState('');
@@ -128,6 +131,7 @@ export default function SettingsPage() {
   const cooldownTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
+    const cache = blobUrlCacheRef.current;
     return () => {
       if (previewAbortRef.current) {
         previewAbortRef.current.abort();
@@ -137,12 +141,12 @@ export default function SettingsPage() {
         activeAudioRef.current.pause();
         activeAudioRef.current = null;
       }
-      blobUrlCacheRef.current.forEach((url) => {
+      cache.forEach((url) => {
         try {
           URL.revokeObjectURL(url);
         } catch {}
       });
-      blobUrlCacheRef.current.clear();
+      cache.clear();
       if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
     };
   }, []);
@@ -263,7 +267,7 @@ export default function SettingsPage() {
           voice: loadedVoice,
           timezone: loadedTimezone,
         });
-      } catch (err: any) {
+      } catch {
         setGeneralError('Failed to load business settings. Check server connection.');
       } finally {
         setLoading(false);
@@ -509,7 +513,7 @@ export default function SettingsPage() {
 
       setLoadingVoiceId(null);
       setPreviewingVoiceId(targetVoiceId);
-    } catch (err: any) {
+    } catch (err: unknown) {
       if (controller.signal.aborted) {
         const isTimeout = controller.signal.reason?.message === 'TIMEOUT' || controller.signal.reason === 'TIMEOUT';
         if (isTimeout) {
@@ -520,7 +524,7 @@ export default function SettingsPage() {
         }
         return;
       }
-      const errMsg = err?.message || 'Voice synthesis preview unavailable.';
+      const errMsg = err instanceof Error ? err.message : 'Voice synthesis preview unavailable.';
       setPreviewError(errMsg);
       toast.error(errMsg);
       startVoiceCooldown(targetVoiceId, 3);
@@ -614,8 +618,8 @@ export default function SettingsPage() {
         });
         setTimeout(() => setSaveSuccessMsg(null), 4000);
       }
-    } catch (err: any) {
-      const msg = err?.message || 'Network error while saving settings.';
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Network error while saving settings.';
       setGeneralError(msg);
       toast.error(msg);
     } finally {
@@ -669,8 +673,8 @@ export default function SettingsPage() {
         toast.success(msg);
         setTimeout(() => setSaveSuccessMsg(null), 4000);
       }
-    } catch (err: any) {
-      const msg = err?.message || 'Network error while resetting.';
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Network error while resetting.';
       setGeneralError(msg);
       toast.error(msg);
     } finally {
@@ -680,8 +684,8 @@ export default function SettingsPage() {
 
   const handleSidebarNav = (view: DashboardView) => {
     if (view === 'settings') return;
-    if (view === 'overview') window.location.href = '/';
-    else window.location.href = `/?tab=${view}`;
+    if (view === 'overview') router.push('/');
+    else router.push(`/?tab=${view}`);
   };
 
   return (

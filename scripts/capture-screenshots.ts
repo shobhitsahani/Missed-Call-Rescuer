@@ -16,7 +16,7 @@ function sendCommand(ws: WebSocket, id: number, method: string, params: any = {}
           if (msg.error) reject(new Error(msg.error.message));
           else resolve(msg.result);
         }
-      } catch (e) {
+      } catch {
         // ignore other messages
       }
     };

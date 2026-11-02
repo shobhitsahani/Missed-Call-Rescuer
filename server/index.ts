@@ -15,8 +15,7 @@ import db, { parseServices, parseFaqs, DEFAULT_BIZ } from './db';
 import { BUSINESS_PRESETS, DEFAULT_PRESET } from '../src/lib/presets';
 import * as events from './events';
 import * as sessionModule from './session';
-import { ASSEMBLYAI_VOICES, VALID_VOICE_IDS, isValidVoiceId } from '../src/lib/voices';
-import { TtsClient } from './tts';
+import { ASSEMBLYAI_VOICES, isValidVoiceId } from '../src/lib/voices';
 import { pcmToWav } from './wav';
 import {
   formatPlainTextTranscript,
@@ -29,11 +28,9 @@ import {
   signAuthToken,
   signStreamToken,
   requireAuth,
-  isOpenAccess,
 } from './auth';
 import {
   securityHeadersMiddleware,
-  createRateLimiter,
   checkRateLimit,
   isOriginAllowed,
   checkCallBudget,
@@ -113,7 +110,16 @@ app.get('/api/call-token/:token', (req, res) => {
     return res.status(429).json({ error: budget.reason || 'Demo is busy, try again in a minute.' });
   }
 
-  const missed: any = db.prepare('SELECT * FROM missed_calls WHERE token = ?').get(token);
+  interface MissedCallTokenRow {
+    id: string;
+    token: string;
+    customer_phone?: string;
+    token_expires_at?: string;
+    call_started_at?: string;
+    status?: string;
+  }
+
+  const missed = db.prepare('SELECT * FROM missed_calls WHERE token = ?').get(token) as MissedCallTokenRow | undefined;
   if (!missed) {
     return res.status(404).json({ error: 'Callback session not found or link is invalid.' });
   }
@@ -138,7 +144,7 @@ app.get('/api/call-token/:token', (req, res) => {
     }
   }
 
-  const biz: any = db.prepare('SELECT name, voice FROM businesses LIMIT 1').get();
+  const biz = db.prepare('SELECT name, voice FROM businesses LIMIT 1').get() as { name?: string; voice?: string } | undefined;
   res.json({
     valid: true,
     missedCallId: missed.id,
@@ -151,7 +157,7 @@ app.get('/api/call-token/:token', (req, res) => {
 });
 
 app.get('/api/business', requireAuth, (_req, res) => {
-  const b = db.prepare('SELECT * FROM businesses LIMIT 1').get() as any;
+  const b = db.prepare('SELECT * FROM businesses LIMIT 1').get() as BusinessRecord | undefined;
   if (!b) return res.status(404).json({ error: 'Business config not found' });
   res.json({
     ...b,
@@ -357,15 +363,16 @@ app.post('/api/business/voice-preview', requireAuth, async (req, res) => {
       res.setHeader('X-Audio-Cache', 'MISS');
       return res.send(wavBuffer);
     }
-  } catch (err: any) {
+  } catch (err: unknown) {
     if (clientAborted) return;
-    if (timedOut || err?.message === 'UPSTREAM_TIMEOUT') {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (timedOut || errMsg === 'UPSTREAM_TIMEOUT') {
       if (!res.headersSent) {
         return res.status(504).json({ error: 'Voice preview synthesis timed out. Please try again.' });
       }
       return;
     }
-    console.error('Voice preview synthesis error:', err?.message);
+    console.error('Voice preview synthesis error:', errMsg);
     if (!res.headersSent) {
       return res.status(502).json({ error: 'Voice synthesis preview failed. Please try again.' });
     }
@@ -492,7 +499,7 @@ app.put('/api/business', requireAuth, (req, res) => {
     answer: f.answer.trim(),
   }));
 
-  const existingBiz = db.prepare('SELECT id FROM businesses LIMIT 1').get() as any;
+  const existingBiz = db.prepare('SELECT id FROM businesses LIMIT 1').get() as { id?: string } | undefined;
   const bizId = existingBiz?.id || DEFAULT_BIZ.id;
 
   db.prepare(`UPDATE businesses SET name=?, hours=?, services=?, faqs=?, tone=?, voice=?, timezone=? WHERE id=?`)
@@ -507,12 +514,12 @@ app.put('/api/business', requireAuth, (req, res) => {
       bizId
     );
 
-  const updated = db.prepare('SELECT * FROM businesses WHERE id=?').get(bizId) as any;
+  const updated = db.prepare('SELECT * FROM businesses WHERE id=?').get(bizId) as BusinessRecord | undefined;
   return res.json({
     ...updated,
     services: cleanedServices,
     faqs: cleanedFaqs,
-    timezone: updated.timezone || timezone,
+    timezone: updated?.timezone || timezone,
   });
 });
 
@@ -521,7 +528,7 @@ app.get('/api/business/presets', requireAuth, (_req, res) => {
 });
 
 app.post('/api/business/reset', requireAuth, (req, res) => {
-  const existingBiz = db.prepare('SELECT id FROM businesses LIMIT 1').get() as any;
+  const existingBiz = db.prepare('SELECT id FROM businesses LIMIT 1').get() as { id?: string } | undefined;
   const bizId = existingBiz?.id || DEFAULT_BIZ.id;
 
   const presetKey = req.body?.preset || req.query?.preset;
@@ -568,13 +575,13 @@ app.post('/api/missed-calls/simulate', requireAuth, (req, res) => {
   const tokenExpiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
   const rowSource = source === 'test' ? 'test' : 'demo';
 
-  const business: any = db.prepare('SELECT id FROM businesses LIMIT 1').get();
+  const business = db.prepare('SELECT id FROM businesses LIMIT 1').get() as { id: string } | undefined;
   const phoneNumber = phone || '+1 (555) 010-' + Math.floor(1000 + Math.random() * 9000);
 
   db.prepare(`
     INSERT INTO missed_calls (id, business_id, customer_phone, time, status, token, token_expires_at, source)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, business.id, phoneNumber, new Date().toISOString(), 'new', token, tokenExpiresAt, rowSource);
+  `).run(id, business?.id || 'default', phoneNumber, new Date().toISOString(), 'new', token, tokenExpiresAt, rowSource);
 
   const jobId = 'job_' + Date.now();
   db.prepare('INSERT INTO callback_jobs (id, missed_call_id, attempts, schedule, state) VALUES (?,?,?,?,?)')
@@ -598,15 +605,15 @@ app.post('/api/missed-calls/simulate', requireAuth, (req, res) => {
 
 app.post('/api/test/force-stt-disconnect', requireAuth, (req, res) => {
   const { callId, missedCallId } = req.body || {};
-  let targetSession: any = null;
+  let targetSession: sessionModule.Session | undefined = undefined;
   if (callId) {
     targetSession = sessionModule.getSession(callId);
   } else if (missedCallId) {
     const all = sessionModule.getAllSessions();
-    targetSession = all.find((s: any) => s.missedCallId === missedCallId && !s.ended && s.stt);
+    targetSession = all.find((s: sessionModule.Session) => s.missedCallId === missedCallId && !s.ended && s.stt);
   } else {
     const all = sessionModule.getAllSessions();
-    targetSession = all.find((s: any) => !s.ended && s.stt);
+    targetSession = all.find((s: sessionModule.Session) => !s.ended && s.stt);
   }
 
   if (targetSession && targetSession.stt) {
@@ -627,31 +634,38 @@ app.get('/api/calls', requireAuth, (_req, res) => {
     FROM calls c
     LEFT JOIN summaries s ON s.call_id = c.id
     ORDER BY c.start_time DESC
-  `).all() as any[];
+  `).all() as Array<Record<string, unknown>>;
 
-  const callsWithDetails = rows.map((r: any) => {
-    const customerSpoke = (r.customer_turns_count || 0) > 0;
-    const validSummary = r.summary_status === 'completed' || (!r.summary_status && r.summary_urgency && r.summary_sentiment && r.summary_status !== 'unavailable');
-    const notFailedReason = !['error', 'no_answer', 'opt_out'].includes(r.end_reason);
+  const callsWithDetails = rows.map((r: Record<string, unknown>) => {
+    const customerSpoke = typeof r.customer_turns_count === 'number' && r.customer_turns_count > 0;
+    const validSummary = r.summary_status === 'completed' || (!r.summary_status && Boolean(r.summary_urgency) && Boolean(r.summary_sentiment) && r.summary_status !== 'unavailable');
+    const notFailedReason = !['error', 'no_answer', 'opt_out'].includes(String(r.end_reason || ''));
     const is_completed = Boolean(customerSpoke && validSummary && notFailedReason);
 
-    const { customer_turns_count, summary_status, summary_urgency, summary_sentiment, ...rest } = r;
     return {
-      ...rest,
+      ...r,
       is_completed,
-      latency: r.latency_json ? JSON.parse(r.latency_json) : [],
-      usage: r.usage_json ? JSON.parse(r.usage_json) : {},
+      latency: typeof r.latency_json === 'string' ? JSON.parse(r.latency_json) : [],
+      usage: typeof r.usage_json === 'string' ? JSON.parse(r.usage_json) : {},
     };
   });
   res.json(callsWithDetails);
 });
 
 app.get('/api/calls/:id', requireAuth, (req, res) => {
-  const call = db.prepare('SELECT * FROM calls WHERE id=?').get(req.params.id);
+  const call = db.prepare('SELECT * FROM calls WHERE id=?').get(req.params.id) as Record<string, unknown> | undefined;
   if (!call) return res.status(404).json({ error: 'not found' });
   const turns = db.prepare('SELECT * FROM turns WHERE call_id=? ORDER BY order_idx').all(req.params.id);
   const summary = db.prepare('SELECT * FROM summaries WHERE call_id=?').get(req.params.id);
-  res.json({ call: { ...call, latency: (call as any).latency_json ? JSON.parse((call as any).latency_json) : [], usage: (call as any).usage_json ? JSON.parse((call as any).usage_json) : {} }, turns, summary });
+  res.json({
+    call: {
+      ...call,
+      latency: typeof call.latency_json === 'string' ? JSON.parse(call.latency_json) : [],
+      usage: typeof call.usage_json === 'string' ? JSON.parse(call.usage_json) : {},
+    },
+    turns,
+    summary,
+  });
 });
 
 app.get('/api/calls/:id/transcript', requireAuth, (req, res) => {
@@ -660,17 +674,17 @@ app.get('/api/calls/:id/transcript', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'Invalid format. Use "txt" or "json".' });
   }
 
-  const call: any = db.prepare('SELECT * FROM calls WHERE id=?').get(req.params.id);
+  const call = db.prepare('SELECT * FROM calls WHERE id=?').get(req.params.id) as Record<string, unknown> | undefined;
   if (!call) return res.status(404).json({ error: 'not found' });
 
-  const turns: any = db.prepare('SELECT * FROM turns WHERE call_id=? ORDER BY order_idx').all(req.params.id);
-  const summary: any = db.prepare('SELECT * FROM summaries WHERE call_id=?').get(req.params.id);
-  const business: any = db.prepare('SELECT name FROM businesses LIMIT 1').get();
+  const turns = db.prepare('SELECT * FROM turns WHERE call_id=? ORDER BY order_idx').all(req.params.id) as Array<{ role: string; text: string; [key: string]: unknown }>;
+  const summary = db.prepare('SELECT * FROM summaries WHERE call_id=?').get(req.params.id) as Record<string, unknown> | undefined;
+  const business = db.prepare('SELECT name FROM businesses LIMIT 1').get() as { name?: string } | undefined;
 
   const parsedCall = {
     ...call,
-    latency: call.latency_json ? JSON.parse(call.latency_json) : [],
-    usage: call.usage_json ? JSON.parse(call.usage_json) : {},
+    latency: typeof call.latency_json === 'string' ? JSON.parse(call.latency_json) : [],
+    usage: typeof call.usage_json === 'string' ? JSON.parse(call.usage_json) : {},
   };
 
   const filename = getTranscriptFilename(parsedCall, format as 'txt' | 'json');
@@ -829,13 +843,16 @@ app.post('/api/calls/:id/notify', requireAuth, async (req, res) => {
 });
 
 // Sanitized production error handler (no stack traces or secrets leaked)
-app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   const isProd = process.env.NODE_ENV === 'production';
-  const status = typeof err.status === 'number' ? err.status : typeof err.statusCode === 'number' ? err.statusCode : 500;
-  const message = isProd ? (status === 500 ? 'Internal Server Error' : err.message) : err.message;
+  const errObj = (typeof err === 'object' && err !== null) ? (err as Record<string, unknown>) : {};
+  const status = typeof errObj.status === 'number' ? errObj.status : typeof errObj.statusCode === 'number' ? errObj.statusCode : 500;
+  const rawMsg = typeof errObj.message === 'string' ? errObj.message : String(err || '');
+  const message = isProd ? (status === 500 ? 'Internal Server Error' : rawMsg) : rawMsg;
   res.status(status).json({
     error: message,
-    ...(isProd ? {} : { stack: err.stack }),
+    ...(isProd ? {} : { stack: typeof errObj.stack === 'string' ? errObj.stack : undefined }),
   });
 });
 
@@ -923,7 +940,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', (ws, req: http.IncomingMessage) => {
-  let session: any = null;
+  let session: sessionModule.Session | null = null;
   const ip = req.headers['x-forwarded-for']
     ? String(req.headers['x-forwarded-for']).split(',')[0].trim()
     : req.socket.remoteAddress || 'global';
@@ -937,8 +954,8 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
       }
       return;
     }
-    let msg: any;
-    try { msg = JSON.parse(data.toString()); } catch (e) { return; }
+    let msg: { type?: string; token?: string; missedCallId?: string; final?: boolean; text?: string };
+    try { msg = JSON.parse(data.toString()); } catch { return; }
     if (msg.type === 'join') {
       const joinLimit = checkRateLimit(`wsjoin:${ip}`, 10, 60000);
       if (!joinLimit.allowed) {
@@ -949,8 +966,9 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
 
       try {
         session = await sessionModule.startSession(ws, msg.token || msg.missedCallId);
-      } catch (e: any) {
-        ws.send(JSON.stringify({ type: 'error', message: e?.message }));
+      } catch (e: unknown) {
+        const errMsg = e instanceof Error ? e.message : String(e);
+        ws.send(JSON.stringify({ type: 'error', message: errMsg }));
       }
       return;
     }

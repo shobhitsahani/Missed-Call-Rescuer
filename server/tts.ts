@@ -10,6 +10,14 @@ export interface TtsOptions {
   language?: string;
 }
 
+export interface TtsFrame {
+  type: string;
+  audio?: string;
+  error?: string;
+  error_code?: string | number;
+  [key: string]: unknown;
+}
+
 export class TtsClient {
   private ws: WebSocket | null = null;
   private apiKey: string;
@@ -22,8 +30,8 @@ export class TtsClient {
   private reconnectAttempted = false;
   private cancelled = false;
   private generation = 0;
-  private frameWaiters: Array<(f: any) => void> = [];
-  private frameQueue: any[] = [];
+  private frameWaiters: Array<(f: TtsFrame) => void> = [];
+  private frameQueue: TtsFrame[] = [];
   private closed = false;
 
   constructor(opts: TtsOptions) {
@@ -43,7 +51,7 @@ export class TtsClient {
     return `${TTS_URL}?${params.toString()}`;
   }
 
-  private pushFrame(f: any) {
+  private pushFrame(f: TtsFrame) {
     if (this.frameWaiters.length > 0) {
       const w = this.frameWaiters.shift()!;
       w(f);
@@ -52,9 +60,9 @@ export class TtsClient {
     }
   }
 
-  private nextFrame(timeoutMs = 30000): Promise<any> {
+  private nextFrame(timeoutMs = 30000): Promise<TtsFrame> {
     if (this.frameQueue.length > 0) {
-      return Promise.resolve(this.frameQueue.shift());
+      return Promise.resolve(this.frameQueue.shift()!);
     }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -62,7 +70,7 @@ export class TtsClient {
         if (idx >= 0) this.frameWaiters.splice(idx, 1);
         reject(new Error('TTS frame timeout'));
       }, timeoutMs);
-      const wrapped = (f: any) => {
+      const wrapped = (f: TtsFrame) => {
         clearTimeout(timer);
         resolve(f);
       };
@@ -101,7 +109,7 @@ export class TtsClient {
       };
 
       ws.on('message', (data: WebSocket.RawData) => {
-        let msg: any;
+        let msg: TtsFrame;
         try { msg = JSON.parse(data.toString()); } catch { return; }
         if (!this.connected && msg.type === 'Begin') {
           cleanupTimeout();
@@ -178,7 +186,7 @@ export class TtsClient {
         // cancelled; stop yielding
         break;
       }
-      let frame: any;
+      let frame: TtsFrame;
       try {
         frame = await this.nextFrame();
       } catch (e) {

@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { Sidebar, DashboardView } from '@/components/Sidebar';
 import { TopBar } from '@/components/layout/TopBar';
 import { OverviewView } from '@/components/OverviewView';
@@ -44,10 +45,12 @@ export default function DashboardPage() {
     load,
   } = useDashboardData();
 
-  const handleSelectCall = (call: CallDetails) => {
+  const router = useRouter();
+
+  const handleSelectCall = useCallback((call: CallDetails) => {
     setSelectedCall(call);
     fetchTurns(call.id);
-  };
+  }, [fetchTurns]);
 
 
   // Open drawer if ?call=<id> query param is in URL
@@ -58,10 +61,11 @@ export default function DashboardPage() {
     if (targetCallId) {
       const match = calls.find(c => c.id === targetCallId);
       if (match) {
-        handleSelectCall(match);
+        const timer = setTimeout(() => handleSelectCall(match), 0);
+        return () => clearTimeout(timer);
       }
     }
-  }, [calls]);
+  }, [calls, handleSelectCall]);
 
   // Keep selectedCall reference synced when call data updates
   useEffect(() => {
@@ -73,7 +77,8 @@ export default function DashboardPage() {
           updated.notified_at !== selectedCall.notified_at ||
           updated.notify_error !== selectedCall.notify_error)
       ) {
-        setSelectedCall(updated);
+        const timer = setTimeout(() => setSelectedCall(updated), 0);
+        return () => clearTimeout(timer);
       }
     }
   }, [calls, selectedCall]);
@@ -82,7 +87,7 @@ export default function DashboardPage() {
 
   const handleChangeView = (view: DashboardView) => {
     if (view === 'settings') {
-      window.location.href = '/settings';
+      router.push('/settings');
       return;
     }
     setCurrentView(view);
@@ -110,7 +115,7 @@ export default function DashboardPage() {
         callsCount={calls.length}
         missedCount={missed.length}
         sseConnected={sseConnected}
-        businessName={business?.name || 'Business'}
+        businessName={typeof business?.name === 'string' ? business.name : 'Business'}
         collapsed={collapsed}
         onToggleCollapse={() => setCollapsed(!collapsed)}
         mobileOpen={mobileOpen}
@@ -123,7 +128,7 @@ export default function DashboardPage() {
         {/* Top Bar with Search & Quick Actions */}
         <TopBar
           title={pageTitle}
-          businessName={business?.name}
+          businessName={typeof business?.name === 'string' ? business.name : undefined}
           searchQuery={searchQuery}
           onSearchChange={setSearchQuery}
           onSimulate={simulate}
@@ -185,7 +190,7 @@ export default function DashboardPage() {
         isOpen={!!selectedCall}
         onClose={() => setSelectedCall(null)}
         call={selectedCall}
-        businessName={business?.name}
+        businessName={typeof business?.name === 'string' ? business.name : undefined}
         summary={selectedCall ? summaries[selectedCall.id] || null : null}
         turns={selectedCall ? turnsMap[selectedCall.id] || null : null}
         loadingTurns={selectedCall ? !!loadingTurns[selectedCall.id] : false}
