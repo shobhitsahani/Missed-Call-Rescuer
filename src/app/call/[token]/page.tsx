@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { API_BASE } from '@/lib/api';
+import { getApiBase } from '@/lib/api';
 import { SummaryCard } from '@/components/SummaryCard';
 import { TranscriptBubble } from '@/components/TranscriptBubble';
 import { AgentStatusVisualizer } from '@/components/AgentStatusVisualizer';
@@ -72,7 +72,7 @@ export default function CallPage() {
     let isCancelled = false;
     async function validateToken() {
       try {
-        const res = await fetch(`${API_BASE}/api/call-token/${encodeURIComponent(token)}`);
+        const res = await fetch(`${getApiBase()}/api/call-token/${encodeURIComponent(token)}`);
         const data = await res.json().catch(() => null);
         if (isCancelled) return;
 
@@ -260,7 +260,7 @@ export default function CallPage() {
       }
     }
 
-    const wsUrl = API_BASE.replace(/^http/, 'ws') + '/ws';
+    const wsUrl = getApiBase().replace(/^http/, 'ws') + '/ws';
     const ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;

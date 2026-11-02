@@ -5,7 +5,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import { Sidebar, DashboardView } from '@/components/Sidebar';
 import { ASSEMBLYAI_VOICES, VoiceOption } from '@/lib/voices';
-import { API_BASE } from '@/lib/api';
+import { getApiBase } from '@/lib/api';
 import { BUSINESS_PRESETS, BusinessPreset, checkExampleMismatch } from '@/lib/presets';
 import { PageContainer } from '@/components/layout/PageContainer';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
@@ -126,20 +126,44 @@ export default function SettingsPage() {
   const [cooldownVoiceId, setCooldownVoiceId] = useState<string | null>(null);
   const [cooldownSeconds, setCooldownSeconds] = useState(0);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const audioBufferCacheRef = useRef<Map<string, AudioBuffer>>(new Map());
   const previewAbortRef = useRef<AbortController | null>(null);
   const blobUrlCacheRef = useRef<Map<string, string>>(new Map());
   const cooldownTimerRef = useRef<NodeJS.Timeout | null>(null);
 
+  const stopAllAudio = () => {
+    if (audioSourceRef.current) {
+      try {
+        audioSourceRef.current.stop();
+        audioSourceRef.current.disconnect();
+      } catch {}
+      audioSourceRef.current = null;
+    }
+    if (activeAudioRef.current) {
+      try {
+        activeAudioRef.current.pause();
+        activeAudioRef.current.currentTime = 0;
+      } catch {}
+      activeAudioRef.current = null;
+    }
+  };
+
   useEffect(() => {
     const cache = blobUrlCacheRef.current;
+    const bufCache = audioBufferCacheRef.current;
     return () => {
       if (previewAbortRef.current) {
         previewAbortRef.current.abort();
         previewAbortRef.current = null;
       }
-      if (activeAudioRef.current) {
-        activeAudioRef.current.pause();
-        activeAudioRef.current = null;
+      stopAllAudio();
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+        try {
+          audioContextRef.current.close().catch(() => {});
+        } catch {}
+        audioContextRef.current = null;
       }
       cache.forEach((url) => {
         try {
@@ -147,6 +171,7 @@ export default function SettingsPage() {
         } catch {}
       });
       cache.clear();
+      bufCache.clear();
       if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
     };
   }, []);
@@ -239,9 +264,15 @@ export default function SettingsPage() {
     async function fetchBusiness() {
       try {
         setLoading(true);
-        const res = await fetch(`${API_BASE}/api/business`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
+        const base = getApiBase();
+        const [resBiz, resCalls, resMissed] = await Promise.all([
+          fetch(`${base}/api/business`),
+          fetch(`${base}/api/calls`).catch(() => null),
+          fetch(`${base}/api/missed-calls`).catch(() => null),
+        ]);
+
+        if (!resBiz.ok) throw new Error(`HTTP ${resBiz.status}`);
+        const data = await resBiz.json();
         const loadedName = data.name || '';
         const loadedHours = data.hours || '';
         const loadedServices = Array.isArray(data.services) ? data.services : [];
@@ -267,6 +298,15 @@ export default function SettingsPage() {
           voice: loadedVoice,
           timezone: loadedTimezone,
         });
+
+        if (resCalls && resCalls.ok) {
+          const callsData = await resCalls.json().catch(() => null);
+          if (Array.isArray(callsData)) setCallsCount(callsData.length);
+        }
+        if (resMissed && resMissed.ok) {
+          const missedData = await resMissed.json().catch(() => null);
+          if (Array.isArray(missedData)) setMissedCount(missedData.length);
+        }
       } catch {
         setGeneralError('Failed to load business settings. Check server connection.');
       } finally {
@@ -279,26 +319,36 @@ export default function SettingsPage() {
 
   // Subscribe to SSE for sidebar sync
   useEffect(() => {
-    const es = new EventSource(`${API_BASE}/api/events`);
-    es.onopen = () => setSseConnected(true);
-    es.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'init' && msg.data) {
-          if (Array.isArray(msg.data.calls)) setCallsCount(msg.data.calls.length);
-          if (Array.isArray(msg.data.missed)) setMissedCount(msg.data.missed.length);
-        } else if (msg.type === 'call_created') {
-          setCallsCount((c) => c + 1);
-        } else if (msg.type === 'missed_created') {
-          setMissedCount((c) => c + 1);
-        }
-      } catch {
-        // ignore parse error
-      }
-    };
-    es.onerror = () => setSseConnected(false);
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource(`${getApiBase()}/api/events`);
+      es.onopen = () => setSseConnected(true);
+      es.addEventListener('connected', () => setSseConnected(true));
+      es.addEventListener('call_updated', () => {
+        setSseConnected(true);
+        setCallsCount((c) => c + 1);
+      });
+      es.addEventListener('call_ended', () => {
+        setSseConnected(true);
+        setCallsCount((c) => c + 1);
+      });
+      es.addEventListener('missed_call', () => {
+        setSseConnected(true);
+        setMissedCount((c) => c + 1);
+      });
+      es.addEventListener('data_cleared', () => {
+        setSseConnected(true);
+        setCallsCount(0);
+        setMissedCount(0);
+      });
+      es.onerror = () => {
+        setSseConnected(false);
+      };
+    } catch {
+      // EventSource instantiation failed or unsupported; sseConnected is false by default
+    }
     return () => {
-      es.close();
+      if (es) es.close();
       if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
       if (activeAudioRef.current) {
         activeAudioRef.current.pause();
@@ -421,10 +471,7 @@ export default function SettingsPage() {
         previewAbortRef.current.abort();
         previewAbortRef.current = null;
       }
-      if (activeAudioRef.current) {
-        activeAudioRef.current.pause();
-        activeAudioRef.current = null;
-      }
+      stopAllAudio();
       setLoadingVoiceId(null);
       setPreviewingVoiceId(null);
       startVoiceCooldown(targetVoiceId, 3);
@@ -441,12 +488,19 @@ export default function SettingsPage() {
       previewAbortRef.current.abort();
       previewAbortRef.current = null;
     }
-    if (activeAudioRef.current) {
-      activeAudioRef.current.pause();
-      activeAudioRef.current = null;
-    }
+    stopAllAudio();
     setLoadingVoiceId(null);
     setPreviewingVoiceId(null);
+
+    // Synchronously unlock / resume AudioContext on user click
+    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!audioContextRef.current && AudioCtx) {
+      audioContextRef.current = new AudioCtx({ sampleRate: 24000 });
+    }
+    const ctx = audioContextRef.current;
+    if (ctx && ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
 
     const controller = new AbortController();
     previewAbortRef.current = controller;
@@ -460,29 +514,85 @@ export default function SettingsPage() {
     setPreviewError(null);
 
     try {
-      let audioUrl = blobUrlCacheRef.current.get(targetVoiceId);
+      // 1. Check in-memory decoded buffer cache first (instant playback, 0 network latency)
+      const cachedBuf = audioBufferCacheRef.current.get(targetVoiceId);
+      if (cachedBuf && ctx && ctx.state !== 'closed') {
+        const source = ctx.createBufferSource();
+        source.buffer = cachedBuf;
+        source.connect(ctx.destination);
+        audioSourceRef.current = source;
+        source.onended = () => {
+          if (audioSourceRef.current === source) {
+            audioSourceRef.current = null;
+            setPreviewingVoiceId(null);
+            setLoadingVoiceId(null);
+            startVoiceCooldown(targetVoiceId, 3);
+          }
+        };
+        source.start(0);
+        setLoadingVoiceId(null);
+        setPreviewingVoiceId(targetVoiceId);
+        return;
+      }
 
-      if (!audioUrl) {
-        const res = await fetch(`${API_BASE}/api/business/voice-preview`, {
+      // 2. Fetch fresh WAV from voice-preview API
+      const base = getApiBase();
+      let res: Response;
+      try {
+        res = await fetch(`${base}/api/business/voice-preview`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ voiceId: targetVoiceId }),
           signal: controller.signal,
         });
-
-        if (!res.ok) {
-          const errJson = await res.json().catch(() => ({}));
-          const errMsg = errJson.error || `Voice preview failed (HTTP ${res.status})`;
-          throw new Error(errMsg);
-        }
-
-        const blob = await res.blob();
-        if (controller.signal.aborted) return;
-        audioUrl = URL.createObjectURL(blob);
-        blobUrlCacheRef.current.set(targetVoiceId, audioUrl);
+      } catch (fetchErr: unknown) {
+        if (controller.signal.aborted) throw fetchErr;
+        throw new Error('Unable to connect to the voice preview server. Please ensure the backend is running.');
       }
 
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        const errMsg = errJson.error || `Voice preview failed (HTTP ${res.status})`;
+        throw new Error(errMsg);
+      }
+
+      const arrayBuffer = await res.arrayBuffer();
       if (controller.signal.aborted) return;
+
+      // 3. Play via Web Audio API (immune to autoplay restrictions after async network call)
+      if (ctx && ctx.state !== 'closed') {
+        try {
+          const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
+          if (controller.signal.aborted) return;
+          audioBufferCacheRef.current.set(targetVoiceId, decoded);
+
+          const source = ctx.createBufferSource();
+          source.buffer = decoded;
+          source.connect(ctx.destination);
+          audioSourceRef.current = source;
+
+          source.onended = () => {
+            if (audioSourceRef.current === source) {
+              audioSourceRef.current = null;
+              setPreviewingVoiceId(null);
+              setLoadingVoiceId(null);
+              startVoiceCooldown(targetVoiceId, 3);
+            }
+          };
+
+          source.start(0);
+          setLoadingVoiceId(null);
+          setPreviewingVoiceId(targetVoiceId);
+          return;
+        } catch {
+          // If AudioContext decode fails, fall through to HTMLAudioElement fallback
+        }
+      }
+
+      // 4. Fallback to HTMLAudioElement with ObjectURL
+      const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
+      const audioUrl = URL.createObjectURL(blob);
+      blobUrlCacheRef.current.set(targetVoiceId, audioUrl);
 
       const audio = new Audio(audioUrl);
       activeAudioRef.current = audio;
@@ -495,7 +605,7 @@ export default function SettingsPage() {
       };
 
       audio.onerror = () => {
-        const errMsg = 'Failed to playback audio sample.';
+        const errMsg = 'Failed to playback audio sample in browser.';
         setPreviewError(errMsg);
         toast.error(errMsg);
         setPreviewingVoiceId(null);
@@ -504,7 +614,13 @@ export default function SettingsPage() {
         startVoiceCooldown(targetVoiceId, 3);
       };
 
-      await audio.play();
+      try {
+        await audio.play();
+      } catch (playErr: unknown) {
+        if (controller.signal.aborted) return;
+        const playMsg = playErr instanceof Error ? playErr.message : 'Audio playback was blocked or failed.';
+        throw new Error(playMsg);
+      }
 
       if (controller.signal.aborted) {
         audio.pause();
@@ -576,7 +692,7 @@ export default function SettingsPage() {
     const validFaqs = cleanFaqs.filter((f) => f.question && f.answer);
 
     try {
-      const res = await fetch(`${API_BASE}/api/business`, {
+      const res = await fetch(`${getApiBase()}/api/business`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -633,7 +749,7 @@ export default function SettingsPage() {
     setErrors({});
 
     try {
-      const res = await fetch(`${API_BASE}/api/business/reset`, { method: 'POST' });
+      const res = await fetch(`${getApiBase()}/api/business/reset`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
         const msg = data?.error || 'Failed to reset settings.';

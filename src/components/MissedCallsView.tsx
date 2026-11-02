@@ -158,7 +158,7 @@ export function MissedCallsView({
           <div className="flex justify-end">
             {isJoinable ? (
               <Link
-                href={`/call/${row.original.id}`}
+                href={`/call/${row.original.token || row.original.id}`}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md bg-primary/10 hover:bg-primary/20 text-primary border border-primary/30 transition-colors"

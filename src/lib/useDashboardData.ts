@@ -1,7 +1,8 @@
 'use client';
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { API_BASE, api } from '@/lib/api';
+import { toast } from 'sonner';
+import { api, getApiBase } from '@/lib/api';
 import { CallDetails, SummaryDetails, TurnDetails, LatencyItem } from '@/components/Drawer';
 
 export type MissedCall = {
@@ -104,7 +105,7 @@ export function useDashboardData() {
     let es: EventSource | null = null;
 
     try {
-      es = new EventSource(`${API_BASE}/api/events`);
+      es = new EventSource(`${getApiBase()}/api/events`);
 
       es.onopen = () => setSseConnected(true);
       es.onerror = () => {
@@ -167,16 +168,29 @@ export function useDashboardData() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ source: 'demo' }),
       });
+      const token = r?.token;
       if (r?.missedCallId) {
         setLastCallId(r.missedCallId);
       }
-      if (r?.token) {
-        setLastCallToken(r.token);
+      if (token) {
+        setLastCallToken(token);
       }
       await load();
+      if (token) {
+        toast.success('Simulated missed call queued. Callback link ready.', {
+          action: {
+            label: 'Open call',
+            onClick: () => window.open(`/call/${token}`, '_blank'),
+          },
+        });
+      } else {
+        toast.success('Simulated missed call queued.');
+      }
       return r;
     } catch (e: unknown) {
       console.error('Simulate missed call failed:', e);
+      const errMsg = e instanceof Error ? e.message : 'Failed to simulate missed call.';
+      toast.error(errMsg);
       throw e;
     } finally {
       setSimulating(false);

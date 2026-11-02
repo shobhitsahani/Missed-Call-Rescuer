@@ -1,7 +1,16 @@
+import dns from 'dns';
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {}
 import https from 'https';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
-dotenv.config();
+const parsedEnv = dotenv.config().parsed || {};
+for (const key of ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL', 'OPENAI_API_BASE', 'ASSEMBLYAI_API_KEY', 'ASSEMBLYAI_VOICE_ID', 'ALLOWED_ORIGINS']) {
+  if (parsedEnv[key]) {
+    process.env[key] = parsedEnv[key];
+  }
+}
 import express from 'express';
 import http from 'http';
 import { WebSocketServer } from 'ws';
@@ -554,8 +563,7 @@ app.post('/api/missed-calls/simulate', (req, res) => {
 
   events.broadcast('missed_call', {
     id,
-    customer_phone: phoneNumber,
-    token,
+    customer_phone: phoneNumber.replace(/\d(?=\d{4})/g, '*'),
     source: rowSource,
   });
 

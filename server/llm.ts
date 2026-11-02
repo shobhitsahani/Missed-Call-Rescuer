@@ -1,3 +1,14 @@
+import dns from 'dns';
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {}
+import dotenv from 'dotenv';
+const parsedEnv = dotenv.config().parsed || {};
+for (const key of ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL', 'OPENAI_API_BASE']) {
+  if (parsedEnv[key]) {
+    process.env[key] = parsedEnv[key];
+  }
+}
 import OpenAI from 'openai';
 import { parseServices, parseFaqs, BusinessRecord } from './db';
 
