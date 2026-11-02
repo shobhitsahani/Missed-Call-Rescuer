@@ -828,7 +828,6 @@ export default function SettingsPage() {
         onToggleCollapse={() => setCollapsed(!collapsed)}
         mobileOpen={mobileOpen}
         onMobileOpenChange={setMobileOpen}
-        onOpenDemoSettings={() => {}}
       />
 
       <div className="flex-1 flex flex-col min-w-0">

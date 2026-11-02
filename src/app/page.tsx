@@ -8,7 +8,6 @@ import { OverviewView } from '@/components/OverviewView';
 import { CallsView } from '@/components/CallsView';
 import { MissedCallsView } from '@/components/MissedCallsView';
 import { Drawer, CallDetails } from '@/components/Drawer';
-import { DemoModal } from '@/components/DemoModal';
 import { PageContainer } from '@/components/layout/PageContainer';
 import { useDashboardData } from '@/lib/useDashboardData';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
@@ -17,7 +16,6 @@ import { Button } from '@/components/ui/button';
 export default function DashboardPage() {
   const [currentView, setCurrentView] = useState<DashboardView>('overview');
   const [selectedCall, setSelectedCall] = useState<CallDetails | null>(null);
-  const [demoModalOpen, setDemoModalOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -128,7 +126,6 @@ export default function DashboardPage() {
         onToggleCollapse={() => setCollapsed(!collapsed)}
         mobileOpen={mobileOpen}
         onMobileOpenChange={setMobileOpen}
-        onOpenDemoSettings={() => setDemoModalOpen(true)}
       />
 
       {/* Main Content Area */}
@@ -221,13 +218,6 @@ export default function DashboardPage() {
         summary={selectedCall ? summaries[selectedCall.id] || null : null}
         turns={selectedCall ? turnsMap[selectedCall.id] || null : null}
         loadingTurns={selectedCall ? !!loadingTurns[selectedCall.id] : false}
-      />
-
-      {/* Demo / Clear Test Data Modal */}
-      <DemoModal
-        isOpen={demoModalOpen}
-        onClose={() => setDemoModalOpen(false)}
-        onDataCleared={load}
       />
     </div>
   );

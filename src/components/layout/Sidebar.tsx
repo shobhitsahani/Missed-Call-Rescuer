@@ -8,7 +8,6 @@ import {
   Settings,
   ChevronLeft,
   ChevronRight,
-  Wrench,
 } from 'lucide-react';
 import { Logomark } from './Logomark';
 import { ThemeToggle } from './ThemeToggle';
@@ -37,7 +36,6 @@ interface SidebarProps {
   onToggleCollapse: () => void;
   mobileOpen: boolean;
   onMobileOpenChange: (open: boolean) => void;
-  onOpenDemoSettings?: () => void;
 }
 
 export function Sidebar({
@@ -52,7 +50,6 @@ export function Sidebar({
   onToggleCollapse,
   mobileOpen,
   onMobileOpenChange,
-  onOpenDemoSettings,
 }: SidebarProps) {
   const navItems = [
     {
@@ -204,22 +201,6 @@ export function Sidebar({
               </Badge>
             )}
           </div>
-
-          {/* Demo Settings & Diagnostics */}
-          {onOpenDemoSettings && (
-            <Button
-              variant="ghost"
-              size={isIconOnly ? 'icon-sm' : 'sm'}
-              onClick={onOpenDemoSettings}
-              title="Demo options & diagnostics"
-              className={`w-full text-muted-foreground hover:text-foreground text-xs ${
-                isIconOnly ? 'justify-center' : 'justify-start gap-2 h-8 px-2.5'
-              }`}
-            >
-              <Wrench className="h-4 w-4 shrink-0 text-muted-foreground" />
-              {!isIconOnly && <span>Demo options</span>}
-            </Button>
-          )}
 
           {/* Theme Toggle */}
           <div className="flex flex-col gap-1">
