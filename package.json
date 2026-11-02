@@ -12,7 +12,7 @@
     "start:api": "tsx server/index.ts",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
-    "test": "tsx scripts/test-api-base.ts && tsx scripts/test-platform.ts && tsx scripts/test-transcript-format.ts && tsx scripts/test-wav-builder.ts && tsx scripts/test-phone-collection.ts && tsx scripts/test-settings-validation.ts",
+    "test": "tsx scripts/test-api-base.ts && tsx scripts/test-platform.ts && tsx scripts/test-transcript-format.ts && tsx scripts/test-wav-builder.ts && tsx scripts/test-phone-collection.ts && tsx scripts/test-phone-collection-robustness.ts && tsx scripts/test-settings-validation.ts",
     "test:security": "tsx scripts/test-security.ts",
     "test:preview": "tsx scripts/test-preview-abort.ts",
     "test:reconnect": "tsx scripts/test-token-reconnect.ts",

@@ -68,11 +68,12 @@ export function isPhoneRefusal(text: string): boolean {
 
 /**
  * Converts spoken number phrases ("five five five oh one two three") into digits.
- * Handles "double X" and "triple X".
+ * Handles "double X" and "triple X", punctuation, and mixed word/digit strings.
  */
 export function wordsToDigits(text: string): string {
   if (!text) return '';
-  const tokens = text.toLowerCase().replace(/[,.-]/g, ' ').split(/\s+/).filter(Boolean);
+  const cleaned = text.toLowerCase().replace(/[\(\)\[\]{},.+\-_/\\:;!?"']/g, ' ');
+  const tokens = cleaned.split(/\s+/).filter(Boolean);
   let result = '';
 
   for (let i = 0; i < tokens.length; i++) {
@@ -109,6 +110,16 @@ export function wordsToDigits(text: string): string {
 }
 
 /**
+ * Normalizes any phone input (spoken words, formatted numbers, mixed) into raw digits.
+ */
+export function normalizePhoneDigits(raw: string): string {
+  if (!raw) return '';
+  const converted = wordsToDigits(raw);
+  if (converted) return converted;
+  return raw.replace(/\D/g, '');
+}
+
+/**
  * Validates a string of digits and formats into standard E.164 and display representation.
  */
 export function validatePhoneDigits(rawDigits: string, defaultCountry: PhoneCountry = 'US'): ParsedPhone {
@@ -127,13 +138,16 @@ export function validatePhoneDigits(rawDigits: string, defaultCountry: PhoneCoun
   if (digits.length === 10) {
     const firstDigit = digits[0];
     // Indian 10-digit mobile starts with 6, 7, 8, or 9
-    if (defaultCountry === 'IN' && firstDigit >= '6' && firstDigit <= '9') {
-      return {
-        isValid: true,
-        digits,
-        normalized: `+91${digits}`,
-        formatted: `+91 ${digits.slice(0, 5)} ${digits.slice(5)}`,
-      };
+    if (defaultCountry === 'IN') {
+      if (firstDigit >= '6' && firstDigit <= '9') {
+        return {
+          isValid: true,
+          digits,
+          normalized: `+91${digits}`,
+          formatted: `+91 ${digits.slice(0, 5)} ${digits.slice(5)}`,
+        };
+      }
+      return { isValid: false, digits, reason: 'invalid_pattern' };
     }
     // US Area code cannot start with 0 or 1
     if (firstDigit >= '2' && firstDigit <= '9') {
@@ -163,6 +177,7 @@ export function validatePhoneDigits(rawDigits: string, defaultCountry: PhoneCoun
         formatted: `+1 (${area}) ${prefix}-${line}`,
       };
     }
+    return { isValid: false, digits, reason: 'invalid_pattern' };
   }
 
   // 12 digits starting with 91: India with country code
@@ -176,10 +191,11 @@ export function validatePhoneDigits(rawDigits: string, defaultCountry: PhoneCoun
         formatted: `+91 ${mobile.slice(0, 5)} ${mobile.slice(5)}`,
       };
     }
+    return { isValid: false, digits, reason: 'invalid_pattern' };
   }
 
   // General E.164 (11 to 15 digits)
-  if (digits.length >= 10 && digits.length <= 15) {
+  if (digits.length >= 11 && digits.length <= 15) {
     return {
       isValid: true,
       digits,
@@ -195,43 +211,79 @@ export function validatePhoneDigits(rawDigits: string, defaultCountry: PhoneCoun
   return { isValid: false, digits, reason: 'too_long' };
 }
 
+function isLikelyPhoneAttempt(text: string, digits: string, hasPending: boolean): boolean {
+  if (!digits) return false;
+  if (digits.length >= 7) return true;
+  if (hasPending && digits.length >= 1) return true;
+
+  const cleaned = text.toLowerCase().replace(/[\(\)\[\]{},.+\-_/\\:;!?"']/g, ' ');
+  const tokens = cleaned.split(/\s+/).filter(Boolean);
+
+  if (digits.length >= 3) {
+    const nonDigitTokens = tokens.filter(t =>
+      WORD_TO_DIGIT[t] === undefined &&
+      !/^\d+$/.test(t) &&
+      !['double', 'twice', 'triple', 'my', 'number', 'is', 'it', 'it\'s', 'its', 'call', 'at', 'phone'].includes(t)
+    );
+    return nonDigitTokens.length <= 1;
+  }
+
+  return tokens.length > 0 && tokens.every(t => WORD_TO_DIGIT[t] !== undefined || /^\d+$/.test(t));
+}
+
 /**
  * Extracts potential phone number from customer speech or text.
- * Checks both literal digit sequences and spoken number phrases.
+ * Checks formatted digit sequences, spoken phrases, and multi-turn digit stitching.
  */
-export function extractPhoneFromUtterance(text: string, defaultCountry: PhoneCountry = 'US'): ParsedPhone | null {
+export function extractPhoneFromUtterance(
+  text: string,
+  defaultCountry: PhoneCountry = 'US',
+  pendingDigits?: string | null
+): ParsedPhone | null {
   if (!text) return null;
 
-  // 1. First look for formatted or clustered digit sequences (e.g. "(555) 012-3456", "555.012.3456", "555-012-3456", "+1 555 010 1234")
+  // 1. First look for formatted or clustered digit sequences
   const digitClusterRegex = /(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
   const clusterMatches = text.match(digitClusterRegex);
   if (clusterMatches && clusterMatches.length > 0) {
-    // Take the last matched number (latest specified)
     const candidate = clusterMatches[clusterMatches.length - 1];
     const parsed = validatePhoneDigits(candidate, defaultCountry);
     if (parsed.isValid) return parsed;
   }
 
-  // 2. Check for sequences of raw digits (4 to 15 digits)
-  const rawDigitsMatch = text.match(/(?:\+?\d[\d\s\-().]{3,20}\d)/g);
-  if (rawDigitsMatch) {
-    for (let i = rawDigitsMatch.length - 1; i >= 0; i--) {
-      const parsed = validatePhoneDigits(rawDigitsMatch[i], defaultCountry);
-      if (parsed.isValid) return parsed;
-      // If incomplete (e.g. 4-9 digits), keep as candidate if nothing better
-      if (parsed.reason === 'incomplete' && parsed.digits.length >= 4) {
-        return parsed;
-      }
+  // 2. Normalize spoken words and numbers into digits
+  const spokenDigits = normalizePhoneDigits(text);
+  if (!spokenDigits) return null;
+
+  const hasPending = Boolean(pendingDigits && pendingDigits.length > 0);
+  if (!isLikelyPhoneAttempt(text, spokenDigits, hasPending)) {
+    return null;
+  }
+
+  // 2a. Check standalone validation
+  const standaloneParsed = validatePhoneDigits(spokenDigits, defaultCountry);
+  if (standaloneParsed.isValid) {
+    return standaloneParsed;
+  }
+
+  // 2b. If we have pending digits from previous turn(s), try combining
+  if (hasPending) {
+    const combined = pendingDigits! + spokenDigits;
+    const combinedParsed = validatePhoneDigits(combined, defaultCountry);
+    if (combinedParsed.isValid) {
+      return combinedParsed;
+    }
+    if (combined.length < 10) {
+      return { isValid: false, digits: combined, reason: 'incomplete' };
     }
   }
 
-  // 3. Check for spoken number words
-  const spokenDigits = wordsToDigits(text);
-  if (spokenDigits.length >= 4) {
-    return validatePhoneDigits(spokenDigits, defaultCountry);
+  // 2c. If spokenDigits alone is incomplete
+  if (spokenDigits.length < 10) {
+    return { isValid: false, digits: spokenDigits, reason: 'incomplete' };
   }
 
-  return null;
+  return standaloneParsed;
 }
 
 /**

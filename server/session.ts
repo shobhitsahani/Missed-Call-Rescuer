@@ -44,6 +44,7 @@ export interface Session {
   phoneStatus: PhoneStatus;
   verifiedCallerPhone: string | null;
   collectedPhone: string | null;
+  pendingPhoneDigits: string | null;
   lastPhonePromptTurn: number;
   state: string;
   turns: SessionTurn[];
@@ -390,6 +391,7 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
     phoneStatus: initialPhoneStatus,
     verifiedCallerPhone,
     collectedPhone: null,
+    pendingPhoneDigits: null,
     lastPhonePromptTurn: 0,
     state: 'GREETING',
     turns: [],
@@ -591,6 +593,7 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
   if (session.phoneStatus !== 'verified' && session.phoneStatus !== 'validated' && session.phoneStatus !== 'confirmed') {
     if (isPhoneRefusal(text)) {
       session.phoneStatus = 'declined';
+      session.pendingPhoneDigits = null;
       console.log(`[session ${session.id}] Contact status -> declined`);
     }
   }
@@ -599,7 +602,7 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
   // Ambiguous 10-digit numbers follow the business locale: Indian businesses
   // treat 6-9 prefixes as +91, everyone else as NANP +1.
   const phoneCountry: 'US' | 'IN' = /india|kolkata|calcutta/i.test(session.business.timezone || '') ? 'IN' : 'US';
-  const extracted = extractPhoneFromUtterance(text, phoneCountry);
+  const extracted = extractPhoneFromUtterance(text, phoneCountry, session.pendingPhoneDigits);
   if (extracted) {
     if (extracted.isValid && extracted.normalized) {
       const sameAsVerified = session.phoneStatus === 'verified'
@@ -608,6 +611,7 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
         session.phoneStatus = session.phoneStatus === 'verified' ? 'confirmed' : 'validated';
         session.collectedPhone = extracted.normalized;
         session.customerPhone = extracted.normalized;
+        session.pendingPhoneDigits = null;
         console.log(`[session ${session.id}] Contact status -> ${session.phoneStatus} (${maskPhone(extracted.normalized)})`);
         try {
           // Spoken numbers are not carrier caller-ID, so they are stored as
@@ -628,7 +632,8 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
       && session.phoneStatus !== 'confirmed'
     ) {
       session.phoneStatus = 'collected'; // incomplete digits
-      console.log(`[session ${session.id}] Contact status -> collected (incomplete: ${extracted.digits.length} digits)`);
+      session.pendingPhoneDigits = extracted.digits;
+      console.log(`[session ${session.id}] Contact status -> collected (incomplete: ${extracted.digits.length} digits, pending: ${extracted.digits})`);
     }
   }
 
@@ -728,7 +733,15 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
         const isWrappingUp = /goodbye|bye|have a (great|good) (day|rest)|we'?ll (be in touch|follow up|reach out)|take care|thank you for calling/i.test(fullReply) ||
                              /that'?s (all|everything)|thank you|thanks|no that'?s it|bye/i.test(text);
 
-        if (session.phoneStatus === 'unknown' && !askedForPhone && (isWrappingUp || customerTurnCount >= 2)) {
+        // Never prompt if phone is already secured or declined
+        if (
+          session.phoneStatus === 'validated' ||
+          session.phoneStatus === 'confirmed' ||
+          session.phoneStatus === 'verified' ||
+          session.phoneStatus === 'declined'
+        ) {
+          // Phone requirement already satisfied or declined. Do not inject any phone prompts.
+        } else if (session.phoneStatus === 'unknown' && !askedForPhone && (isWrappingUp || customerTurnCount >= 2)) {
           const promptSentence = "Before we wrap up, what is the best phone number for our team to call you back?";
           chunkQueue.push(promptSentence);
           fullReply += (fullReply ? ' ' : '') + promptSentence;
@@ -736,8 +749,17 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
           console.log(`[session ${session.id}] Guard enforced callback phone prompt (turn=${customerTurnCount})`);
         } else if (session.phoneStatus === 'collected' && !askedForPhone) {
           const repeatSentence = "Could you please repeat your full 10-digit phone number?";
-          chunkQueue.push(repeatSentence);
-          fullReply += (fullReply ? ' ' : '') + repeatSentence;
+          // Eliminate duplicate/conflicting questions in a single turn:
+          // If the reply already ended with a question (e.g. "What was your call about?"), replace it
+          if (/[?]\s*$/.test(fullReply.trim())) {
+            const withoutTrailingQ = fullReply.trim().replace(/[A-Z][^?]*\?\s*$/i, '').trim();
+            fullReply = (withoutTrailingQ ? withoutTrailingQ + ' ' : '') + repeatSentence;
+            chunkQueue.length = 0;
+            chunkQueue.push(repeatSentence);
+          } else {
+            chunkQueue.push(repeatSentence);
+            fullReply += (fullReply ? ' ' : '') + repeatSentence;
+          }
           session.lastPhonePromptTurn = customerTurnCount;
           console.log(`[session ${session.id}] Guard enforced repeat phone prompt for incomplete digits`);
         }
@@ -757,9 +779,15 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
     }
     let chunk = chunkQueue.shift()!;
     // Guard against redundant phone requests if phone is already verified or collected
-    if (session.phoneStatus === 'verified' || session.phoneStatus === 'validated') {
-      if (/(what(?:'s|\s+is)\s+(?:the\s+best|your)\s+phone\s+number|can\s+I\s+get\s+your\s+phone\s+number|could\s+you\s+(?:provide|give\s+me)\s+your\s+phone\s+number)/i.test(chunk)) {
-        chunk = chunk.replace(/(what(?:'s|\s+is)\s+(?:the\s+best|your)\s+phone\s+number|can\s+I\s+get\s+your\s+phone\s+number|could\s+you\s+(?:provide|give\s+me)\s+your\s+phone\s+number)[^.!?]*[.!?]?/gi, 'We have your phone number on file.');
+    if (session.phoneStatus === 'verified' || session.phoneStatus === 'validated' || session.phoneStatus === 'confirmed') {
+      const phonePromptPattern = /(what(?:'s|\s+is)\s+(?:the\s+best|your)\s+phone\s+number|can\s+I\s+get\s+your\s+phone\s+number|could\s+you\s+(?:provide|give\s+me|repeat)\s+(?:your\s+)?(?:full\s+)?(?:10-digit\s+)?phone\s+number|please\s+repeat\s+(?:your\s+)?(?:full\s+)?(?:10-digit\s+)?phone\s+number)/i;
+      if (phonePromptPattern.test(chunk)) {
+        chunk = chunk.replace(/(what(?:'s|\s+is)\s+(?:the\s+best|your)\s+phone\s+number|can\s+I\s+get\s+your\s+phone\s+number|could\s+you\s+(?:provide|give\s+me|repeat)\s+(?:your\s+)?(?:full\s+)?(?:10-digit\s+)?phone\s+number|please\s+repeat\s+(?:your\s+)?(?:full\s+)?(?:10-digit\s+)?phone\s+number)[^.!?]*[.!?]?/gi, 'We have your phone number on file.');
+      }
+    } else if (session.phoneStatus === 'declined') {
+      const phonePromptPattern = /(what(?:'s|\s+is)\s+(?:the\s+best|your)\s+phone\s+number|can\s+I\s+get\s+your\s+phone\s+number|could\s+you\s+(?:provide|give\s+me|repeat)\s+(?:your\s+)?(?:full\s+)?(?:10-digit\s+)?phone\s+number|please\s+repeat\s+(?:your\s+)?(?:full\s+)?(?:10-digit\s+)?phone\s+number)/i;
+      if (phonePromptPattern.test(chunk)) {
+        chunk = chunk.replace(/(what(?:'s|\s+is)\s+(?:the\s+best|your)\s+phone\s+number|can\s+I\s+get\s+your\s+phone\s+number|could\s+you\s+(?:provide|give\s+me|repeat)\s+(?:your\s+)?(?:full\s+)?(?:10-digit\s+)?phone\s+number|please\s+repeat\s+(?:your\s+)?(?:full\s+)?(?:10-digit\s+)?phone\s+number)[^.!?]*[.!?]?/gi, 'Understood, no problem.');
       }
     }
 
@@ -945,10 +973,15 @@ export async function endSession(session: Session, reason: string) {
 
   if (shouldNotify && !session.notificationDispatched) {
     session.notificationDispatched = true;
+    const resolvedCustomerPhone = (session.phoneStatus === 'validated' || session.phoneStatus === 'confirmed')
+      ? (session.collectedPhone || session.customerPhone)
+      : session.phoneStatus === 'verified'
+        ? (session.verifiedCallerPhone || session.customerPhone)
+        : (session.phoneStatus === 'declined' ? 'declined' : 'not provided');
     notifyCallSummary({
       callId: session.id,
       businessName: session.business?.name || 'Business',
-      customerPhone: session.collectedPhone || session.verifiedCallerPhone || session.customerPhone,
+      customerPhone: resolvedCustomerPhone,
       endReason: reason,
       summary,
     }).catch((err: unknown) => {

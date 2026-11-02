@@ -72,7 +72,7 @@ export function buildPhonePolicy(context?: CallContext | null): string {
     const masked = maskPhone(context.verifiedCallerPhone);
     return `2. CONTACT DETAILS & PHONE NUMBER POLICY:
 - The customer's caller number is ALREADY VERIFIED on file (${masked}).
-- DO NOT ask the customer for their phone number.
+- DO NOT ask the customer for their phone number under any circumstances.
 - When confirming follow-up, state: "We have your number on file, and our team will follow up with you."
 - If the customer explicitly asks to be called at a different number, note and accept their chosen number.`;
   }
@@ -81,25 +81,33 @@ export function buildPhonePolicy(context?: CallContext | null): string {
     const masked = maskPhone(context.collectedPhone);
     return `2. CONTACT DETAILS & PHONE NUMBER POLICY:
 - The customer has ALREADY provided their callback number (${masked}).
-- DO NOT ask for their phone number again.
-- Move directly to assisting them or confirming follow-up.`;
+- DO NOT ask for their phone number again under any circumstances.
+- If the customer just provided the number, briefly acknowledge it ("Thank you") and ask what their original call was about or how our team can help them.
+- If they already described their issue, focus entirely on assisting them or confirming follow-up.`;
   }
 
   if (context?.phoneStatus === 'declined') {
     return `2. CONTACT DETAILS & PHONE NUMBER POLICY:
 - The customer explicitly DECLINED to provide a phone number.
-- Respect their choice. DO NOT ask for their phone number again.
+- Respect their choice. DO NOT ask for their phone number again under any circumstances.
 - Acknowledge politely and state that they can call the shop directly during business hours or check the website.`;
   }
 
-  // 'unknown' or 'collected' (incomplete)
+  if (context?.phoneStatus === 'collected') {
+    return `2. CONTACT DETAILS & PHONE NUMBER POLICY:
+- The customer provided an INCOMPLETE phone number (fewer than 10 digits).
+- You MUST ask them to repeat the full 10-digit number.
+- Ask concisely: "Could you please repeat your full 10-digit phone number?"
+- DO NOT ask any other conflicting question in the same turn. Focus only on obtaining the complete phone number.`;
+  }
+
+  // 'unknown'
   return `2. CONTACT DETAILS & PHONE NUMBER POLICY:
 - No verified callback number is on file.
 - You MUST ask the customer for the best phone number to reach them at before ending the call.
 - Ask directly and concisely: "What is the best phone number for our team to call you back?"
 - Ask once, ideally in your first reply together with answering the customer's question.
-- If the customer does not provide it, keep helping them and ask again at most one more time when the call is wrapping up. Do not end every reply by asking for the number.
-- If the customer provided an incomplete or invalid number, ask them to repeat the full 10-digit number.`;
+- If the customer does not provide it, keep helping them and ask again at most one more time when the call is wrapping up. Do not end every reply by asking for the number.`;
 }
 
 export function buildSystem(business?: Partial<BusinessRecord> | null, context?: CallContext | null) {
@@ -282,14 +290,36 @@ ${transcript}`;
 
   const applyContext = (summary: StructuredSummary): StructuredSummary => {
     if (context) {
-      if (context.phoneStatus === 'validated' && context.collectedPhone) {
+      if ((context.phoneStatus === 'validated' || context.phoneStatus === 'confirmed') && context.collectedPhone) {
         summary.contact_details = context.collectedPhone;
+        // Suppress contradictory suggested action if phone is already collected
+        if (/(obtain|get|request|ask\s+for|collect|need|find\s+out).*(phone|number|contact)/i.test(summary.suggested_action) ||
+            /follow\s*up\s+to\s+obtain/i.test(summary.suggested_action)) {
+          const reasonClause = summary.reason && summary.reason !== 'not specified' ? ` regarding ${summary.reason}` : '';
+          summary.suggested_action = `Follow up with customer${reasonClause} at ${summary.contact_details}.`;
+        }
       } else if (context.phoneStatus === 'verified' && context.verifiedCallerPhone) {
         summary.contact_details = context.verifiedCallerPhone;
+        if (/(obtain|get|request|ask\s+for|collect|need|find\s+out).*(phone|number|contact)/i.test(summary.suggested_action) ||
+            /follow\s*up\s+to\s+obtain/i.test(summary.suggested_action)) {
+          const reasonClause = summary.reason && summary.reason !== 'not specified' ? ` regarding ${summary.reason}` : '';
+          summary.suggested_action = `Follow up with customer${reasonClause} at ${summary.contact_details}.`;
+        }
       } else if (context.phoneStatus === 'declined') {
         summary.contact_details = 'declined by customer';
-      } else if (context.phoneStatus === 'unknown' && (!summary.contact_details || summary.contact_details === 'not specified')) {
+        if (/call\s+(customer|them)\s+at/i.test(summary.suggested_action)) {
+          summary.suggested_action = 'Customer declined callback number. Follow up if alternate contact method is available.';
+        }
+      } else if (context.phoneStatus === 'collected') {
+        summary.contact_details = 'incomplete / unverified';
+        if (!/(phone|number|contact)/i.test(summary.suggested_action)) {
+          summary.suggested_action = `Follow up to obtain a valid 10-digit phone number regarding ${summary.reason || 'inquiry'}.`;
+        }
+      } else if (context.phoneStatus === 'unknown') {
         summary.contact_details = 'not provided';
+        if (!/(phone|number|contact)/i.test(summary.suggested_action)) {
+          summary.suggested_action = `Follow up to obtain a valid callback number regarding ${summary.reason || 'inquiry'}.`;
+        }
       }
     }
     return summary;
