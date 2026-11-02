@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-Missed-Call Rescuer is an automated voice callback agent for small service businesses. When a call is missed, the system records the missed call and provides a callback URL (`/call/{id}`). The voice assistant greets the caller, confirms caller intent, handles barge-in interruptions, and records a structured summary for the business owner dashboard.
+Missed-Call Rescuer is an automated voice callback agent for small service businesses. When a call is missed, the system records the missed call and provides a callback URL (`/call/{token}`). The voice assistant greets the caller, confirms caller intent, handles barge-in interruptions, and records a structured summary for the business owner dashboard.
 
 For measured latency benchmarks (Turn Detection, Time-to-First-Token, Time-to-First-Audio, and total time to first audio byte), see the [Latency section of README.md](file:///c:/projects/Missed-Call-Rescuer/README.md#latency).
 
@@ -61,21 +61,29 @@ flowchart TD
 
 ### 3.1. Express Server & WebSocket Routing ([`server/index.ts`](file:///c:/projects/Missed-Call-Rescuer/server/index.ts))
 - Runs on port 4000 (configurable via `PORT` environment variable).
+- **Security & Access Control**:
+  - Open demo access mode: judges access the dashboard immediately without an access code.
+  - `GET /api/call-token/:token`: Public validation for customer callback links (validates 128-bit random token, 30-minute expiry, and single-use).
+  - `POST /api/admin/clear-test-data`: Protected test and demo data clearing action (open in local development; in production requires `ADMIN_TOKEN` via the `x-admin-token` header, or is disabled if that variable is unset).
+  - Rate limiting per IP: `POST /api/missed-calls/simulate` (5/min), WebSocket joins (10/min), voice preview (10/min), test/resend notifications (1/30s).
+  - Call budget bounds: `MAX_CONCURRENT_CALLS=2`, `MAX_CALLS_PER_DAY=100`, `MAX_CALL_SECONDS=300`.
+  - Strict CORS origin validation (`ALLOWED_ORIGINS`) and WebSocket/SSE upgrade origin checks.
 - **REST Endpoints**:
   - `GET /api/business`: Returns the configured business profile plus active `sttProvider`.
   - `GET /api/missed-calls`: Returns missed calls ordered by time descending.
-  - `POST /api/missed-calls/simulate`: Creates a missed call record (`mc_<timestamp>`), queues a row in `callback_jobs` (`job_<timestamp>`), updates missed call status to `queued`, and broadcasts a `missed_call` SSE event.
-  - `GET /api/calls`: Returns calls ordered by start time with parsed `latency` and `usage` JSON.
+  - `POST /api/missed-calls/simulate`: Creates a missed call record with an unguessable 128-bit hex token, queues a row in `callback_jobs`, and broadcasts a `missed_call` SSE event.
+  - `GET /api/calls`: Returns calls ordered by start time with honest completion calculation (`is_completed`), parsed `latency`, and `usage` JSON.
   - `GET /api/calls/:id`: Returns single call record, dialogue turns, and summary.
+  - `GET /api/calls/:id/transcript`: Downloads full transcript in formatted TXT or JSON.
   - `GET /api/summaries/:callId`: Returns summary record for a call.
   - `POST /api/notify/test`: Sends a test notification to the configured owner channel (Telegram or Discord).
   - `POST /api/calls/:id/notify`: Re-triggers owner notification for a specific call (rate limited to 1 per 30s per call).
   - `GET /api/events`: Server-Sent Events (SSE) stream for real-time dashboard updates.
   - `GET /api/health`: Healthcheck endpoint returning `{ ok: true }`.
 - **WebSocket Upgrade (`/ws`)**:
-  - Attached to the HTTP server for `/ws` connections.
+  - Attached to the HTTP server for `/ws` connections, with strict Origin validation in production and join rate limiting (10/min/IP).
   - Incoming client messages:
-    - `{ type: "join", missedCallId: string }`
+    - `{ type: "join", token: string }`
     - `{ type: "transcript", final: true, text: string }` (browser fallback)
     - `{ type: "barge_in" }`
     - `{ type: "end", reason?: string }`
@@ -173,25 +181,25 @@ flowchart TD
 
 The primary latency metric is strictly defined as the **time from arrival of the end-of-turn event to the first playable audio byte**. Turn detection delay is tracked and presented separately.
 
-### Measured Turn Latency Stages (Average from automated 5-turn run)
+For the verified 3-run latency benchmark table and methodology, refer directly to the [Latency section of README.md](file:///c:/projects/Missed-Call-Rescuer/README.md#latency--turnaround-time).
+
+### Measured Turn Latency Stages (3-Run Verified Average across 15 turns)
 
 ```
 0 ms ── Customer stops speaking
   │
-  ├─ 0 to 389 ms (389 ms): AssemblyAI STT Turn Detection (endpointing silence threshold)
+  ├─ 0 to 289 ms (289 ms): AssemblyAI STT Turn Detection (endpointing silence threshold)
   │                         [t_turn_end timestamp marked on end_of_turn: true]
   │
-  ├─ 389 to 709 ms (320 ms): LLM TTFT (Groq qwen/qwen3.8-27b streams first clause / 6 words)
+  ├─ 289 to 1645 ms (1356 ms): LLM TTFT (Groq streams first clause / 6 words)
   │
-  ├─ 709 to 732 ms (23 ms): Early chunk boundary extraction & TTS WebSocket dispatch
-  │
-  └─ 732 to 1100 ms (368 ms): AssemblyAI TTS first audio chunk delivered to browser
+  └─ 1645 to 2036 ms (365 ms): AssemblyAI TTS first audio chunk delivered to browser
                               │
-                            711 ms Processing Pipeline (t_turn_end to first audio byte)
-                            1100 ms End-to-End Turnaround Time
+                            1747 ms Processing Pipeline (t_turn_end to first audio byte)
+                            2036 ms End-to-End Turnaround Time
 ```
 
-- **Early Chunking ([`extractNextChunk`](file:///c:/projects/Missed-Call-Rescuer/server/session.ts#L31-L74))**: First chunk is dispatched to TTS when punctuation (`,`, `;`, `:`, `—`, `--`, `.`, `!`, `?`) occurs OR at least 6 words (`FIRST_CHUNK_MIN_WORDS`) are collected. Subsequent chunks split on sentence punctuation (`.`, `!`, `?`).
+- **Early Chunking ([`extractNextChunk`](file:///c:/projects/Missed-Call-Rescuer/server/session.ts))**: First chunk is dispatched to TTS when punctuation (`,`, `;`, `:`, `—`, `--`, `.`, `!`, `?`) occurs OR at least 6 words (`FIRST_CHUNK_MIN_WORDS`) are collected. Subsequent chunks split on sentence punctuation (`.`, `!`, `?`).
 - **Deferred Persistence**: SQLite writes for customer turns are deferred to the next event-loop turn (`setImmediate`) to keep database I/O off the critical turn path.
 
 ---

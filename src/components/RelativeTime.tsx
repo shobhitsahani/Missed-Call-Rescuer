@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useSyncExternalStore } from 'react';
 import { formatRelativeTime, formatFullDateTime } from '@/lib/format';
 
 interface RelativeTimeProps {
@@ -9,11 +9,11 @@ interface RelativeTimeProps {
 }
 
 export function RelativeTime({ date, className = '' }: RelativeTimeProps) {
-  const [mounted, setMounted] = useState(false);
-
-  useEffect(() => {
-    setMounted(true);
-  }, []);
+  const mounted = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false
+  );
 
   if (!date) return <span className={className}>—</span>;
   const full = formatFullDateTime(date);

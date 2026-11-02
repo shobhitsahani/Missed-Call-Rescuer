@@ -4,7 +4,7 @@ import * as React from 'react';
 import { StatusBadge } from './StatusBadge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { MessageSquare, Calendar, User, Lightbulb, HeartHandshake, Sparkles } from 'lucide-react';
+import { MessageSquare, Calendar, User, Lightbulb, Sparkles } from 'lucide-react';
 
 export interface SummaryData {
   call_id?: string;

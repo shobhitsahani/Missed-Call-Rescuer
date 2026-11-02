@@ -10,6 +10,14 @@ export interface TtsOptions {
   language?: string;
 }
 
+export interface TtsFrame {
+  type: string;
+  audio?: string;
+  error?: string;
+  error_code?: string | number;
+  [key: string]: unknown;
+}
+
 export class TtsClient {
   private ws: WebSocket | null = null;
   private apiKey: string;
@@ -22,8 +30,8 @@ export class TtsClient {
   private reconnectAttempted = false;
   private cancelled = false;
   private generation = 0;
-  private frameWaiters: Array<(f: any) => void> = [];
-  private frameQueue: any[] = [];
+  private frameWaiters: Array<(f: TtsFrame) => void> = [];
+  private frameQueue: TtsFrame[] = [];
   private closed = false;
 
   constructor(opts: TtsOptions) {
@@ -43,7 +51,7 @@ export class TtsClient {
     return `${TTS_URL}?${params.toString()}`;
   }
 
-  private pushFrame(f: any) {
+  private pushFrame(f: TtsFrame) {
     if (this.frameWaiters.length > 0) {
       const w = this.frameWaiters.shift()!;
       w(f);
@@ -52,9 +60,9 @@ export class TtsClient {
     }
   }
 
-  private nextFrame(timeoutMs = 30000): Promise<any> {
+  private nextFrame(timeoutMs = 30000): Promise<TtsFrame> {
     if (this.frameQueue.length > 0) {
-      return Promise.resolve(this.frameQueue.shift());
+      return Promise.resolve(this.frameQueue.shift()!);
     }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -62,7 +70,7 @@ export class TtsClient {
         if (idx >= 0) this.frameWaiters.splice(idx, 1);
         reject(new Error('TTS frame timeout'));
       }, timeoutMs);
-      const wrapped = (f: any) => {
+      const wrapped = (f: TtsFrame) => {
         clearTimeout(timer);
         resolve(f);
       };
@@ -101,7 +109,7 @@ export class TtsClient {
       };
 
       ws.on('message', (data: WebSocket.RawData) => {
-        let msg: any;
+        let msg: TtsFrame;
         try { msg = JSON.parse(data.toString()); } catch { return; }
         if (!this.connected && msg.type === 'Begin') {
           cleanupTimeout();
@@ -114,6 +122,9 @@ export class TtsClient {
           if (!settled) { settled = true; reject(new Error(`TTS ${msg.error_code}: ${msg.error} (voice_id=${this.voiceId})`)); }
           return;
         }
+        // Tag every frame with the generation active when it arrived. Frames
+        // from a cancelled utterance must never be consumed by the next one.
+        (msg as TtsFrame & { __gen?: number }).__gen = this.generation;
         this.pushFrame(msg);
       });
 
@@ -127,17 +138,19 @@ export class TtsClient {
           settled = true;
           reject(err);
         }
-        this.connected = false;
+        if (this.ws === ws) this.connected = false;
       });
 
       ws.on('close', () => {
         cleanupTimeout();
+        // Ignore close events from a socket that has already been replaced by a retry.
+        if (this.ws !== ws) return;
         this.connected = false;
         this.ws = null;
         // unblock any waiters
         while (this.frameWaiters.length) {
           const w = this.frameWaiters.shift()!;
-          w({ type: 'Error', error_code: 1006, error: 'connection closed' });
+          w({ type: 'Error', error_code: 1006, error: 'connection closed', __gen: this.generation });
         }
       });
     });
@@ -178,7 +191,7 @@ export class TtsClient {
         // cancelled; stop yielding
         break;
       }
-      let frame: any;
+      let frame: TtsFrame;
       try {
         frame = await this.nextFrame();
       } catch (e) {
@@ -186,6 +199,11 @@ export class TtsClient {
       }
       if (!frame) break;
       if (this.generation !== myGen) break;
+      // Ignore frames that were emitted for a previous/cancelled utterance.
+      if (typeof (frame as TtsFrame & { __gen?: number }).__gen === 'number' &&
+          (frame as TtsFrame & { __gen?: number }).__gen !== myGen) {
+        continue;
+      }
       switch (frame.type) {
         case 'Audio':
           if (this.cancelled || this.generation !== myGen) {
@@ -236,6 +254,13 @@ export class TtsClient {
   }
 
   async close() {
+    this.closed = true;
+    this.cancelled = true;
+    this.frameQueue = [];
+    while (this.frameWaiters.length) {
+      const w = this.frameWaiters.shift()!;
+      w({ type: 'Cancelled' });
+    }
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try { this.ws.send(JSON.stringify({ type: 'Terminate' })); } catch {}
     }

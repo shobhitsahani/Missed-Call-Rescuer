@@ -203,10 +203,11 @@ async function postWithRetry(
       }
 
       return { ok: false, error: `${providerLabel} error (${res.status}): ${sanitized}` };
-    } catch (err: any) {
+    } catch (err: unknown) {
       clearTimeout(timeout);
-      const isAbort = err?.name === 'AbortError' || err?.message?.includes('aborted');
-      const errDesc = isAbort ? 'Request timed out after 5s' : sanitizeError(err?.message || 'Network error');
+      const errObj = err as Error;
+      const isAbort = errObj?.name === 'AbortError' || errObj?.message?.includes('aborted');
+      const errDesc = isAbort ? 'Request timed out after 5s' : sanitizeError(errObj?.message || 'Network error');
       lastError = `${providerLabel} network failure: ${errDesc}`;
 
       if (attempt < maxRetries) {
@@ -280,7 +281,7 @@ export async function notifyCallSummary(payload: NotifyPayload): Promise<void> {
     }
 
     // Guard idempotency: check if already notified in database
-    const existing: any = db.prepare('SELECT notify_status FROM calls WHERE id=?').get(payload.callId);
+    const existing = db.prepare('SELECT notify_status FROM calls WHERE id=?').get(payload.callId) as { notify_status: string } | undefined;
     if (existing && existing.notify_status === 'sent') {
       return;
     }
@@ -325,8 +326,9 @@ export async function notifyCallSummary(payload: NotifyPayload): Promise<void> {
         notify_error: sanitized,
       });
     }
-  } catch (err: any) {
-    const sanitized = sanitizeError(err?.message || 'Unexpected failure');
+  } catch (err: unknown) {
+    const errObj = err as Error;
+    const sanitized = sanitizeError(errObj?.message || 'Unexpected failure');
     console.error(`[notify] Unexpected error sending owner notification: ${sanitized}`);
     try {
       db.prepare('UPDATE calls SET notify_status=?, notify_error=? WHERE id=?')
@@ -346,13 +348,21 @@ export async function resendCallNotification(
     return { ok: false, provider: 'none', error: 'No notification provider configured (NOTIFY_PROVIDER=none).' };
   }
 
-  const call: any = db.prepare('SELECT * FROM calls WHERE id=?').get(callId);
+  const call = db.prepare('SELECT * FROM calls WHERE id=?').get(callId) as {
+    id: string;
+    customer_phone: string;
+    latency_json: string;
+    usage_json: string;
+    start_time: string;
+    end_time: string;
+    end_reason: string;
+  } | undefined;
   if (!call) {
     return { ok: false, provider, error: 'Call not found.' };
   }
 
-  const summary: any = db.prepare('SELECT * FROM summaries WHERE call_id=?').get(callId);
-  const business: any = db.prepare('SELECT name FROM businesses LIMIT 1').get();
+  const summary = db.prepare('SELECT * FROM summaries WHERE call_id=?').get(callId) as Record<string, unknown> | undefined;
+  const business = db.prepare('SELECT name FROM businesses LIMIT 1').get() as { name: string } | undefined;
 
   const payload: NotifyPayload = {
     callId: call.id,

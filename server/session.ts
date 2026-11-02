@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
+import WebSocket from 'ws';
 import db from './db';
 import * as llm from './llm';
 import * as events from './events';
@@ -6,8 +7,68 @@ import { TtsClient } from './tts';
 import { SttClient } from './stt';
 import { notifyCallSummary } from './notify';
 import { isValidVoiceId } from '../src/lib/voices';
+import { checkCallBudget, MAX_CALL_SECONDS } from './security';
+import { PhoneStatus, isPhoneRefusal, extractPhoneFromUtterance, maskPhone } from './phone';
 
-const sessions = new Map<string, any>();
+export interface SessionTurn {
+  role: string;
+  text: string;
+  interrupted: boolean;
+}
+
+export interface SessionUsage {
+  ttsChars: number;
+  sttSeconds: number;
+  llmTokens: number;
+}
+
+export interface SessionBusiness {
+  id: string;
+  name: string;
+  hours: string;
+  services: string;
+  faqs: string;
+  tone: string;
+  voice: string;
+  language?: string;
+  timezone: string;
+  owner_email?: string;
+}
+
+export interface Session {
+  id: string;
+  ws: WebSocket | null;
+  business: SessionBusiness;
+  missedCallId: string | null;
+  customerPhone: string;
+  phoneStatus: PhoneStatus;
+  verifiedCallerPhone: string | null;
+  collectedPhone: string | null;
+  lastPhonePromptTurn: number;
+  state: string;
+  turns: SessionTurn[];
+  turnOrder: number;
+  generating: boolean;
+  cancelGeneration: boolean;
+  abortController: AbortController | null;
+  ended: boolean;
+  startedAt: number;
+  latencies: number[];
+  usage: SessionUsage;
+  silenceTimer: NodeJS.Timeout | null;
+  maxTimer: NodeJS.Timeout | null;
+  tts: TtsClient;
+  stt: SttClient | null;
+  keepAliveTimer: NodeJS.Timeout | null;
+  ttsFailed: boolean;
+  currentAgentText: string;
+  agentSpeakingStartTime: number;
+  sttProvider: string;
+  notificationDispatched?: boolean;
+  disconnectTimer?: NodeJS.Timeout | null;
+}
+
+export const sessions = new Map<string, Session>();
 
 export const STT_PROVIDER = process.env.STT_PROVIDER || 'assemblyai';
 
@@ -15,11 +76,34 @@ const OPT_OUT_PHRASES = ['stop calling', 'do not call', "don't call", 'remove me
 const WRONG_NUMBER = ['wrong number', 'not the right person', 'you have the wrong'];
 
 function getBusinessRow() {
-  return db.prepare('SELECT * FROM businesses LIMIT 1').get();
+  return db.prepare('SELECT * FROM businesses LIMIT 1').get() as Record<string, unknown> | undefined;
 }
 
-function rowToBiz(r: any) {
-  return { id: r.id, name: r.name, hours: r.hours, services: r.services, faqs: r.faqs, tone: r.tone, voice: r.voice, language: r.language, timezone: r.timezone, owner_email: r.owner_email };
+function rowToBiz(r?: Record<string, unknown>): SessionBusiness {
+  if (!r) {
+    return {
+      id: 'default',
+      name: 'Business',
+      hours: '',
+      services: '',
+      faqs: '',
+      tone: 'friendly, professional, concise',
+      voice: 'aai-jane',
+      timezone: 'UTC',
+    };
+  }
+  return {
+    id: String(r.id || 'default'),
+    name: String(r.name || 'Business'),
+    hours: String(r.hours || ''),
+    services: String(r.services || ''),
+    faqs: String(r.faqs || ''),
+    tone: String(r.tone || 'friendly, professional, concise'),
+    voice: String(r.voice || 'aai-jane'),
+    language: r.language ? String(r.language) : undefined,
+    timezone: String(r.timezone || 'UTC'),
+    owner_email: r.owner_email ? String(r.owner_email) : undefined,
+  };
 }
 
 function detectOptOut(text: string) {
@@ -111,24 +195,24 @@ function extractNextChunk(buf: string, isFirst: boolean): { chunk: string; remai
   }
 }
 
-function send(session: any, msg: any) {
+function send(session: Session, msg: Record<string, unknown>) {
   if (session.ws && session.ws.readyState === 1) {
-    try { session.ws.send(JSON.stringify(msg)); } catch (e) {}
+    try { session.ws.send(JSON.stringify(msg)); } catch {}
   }
 }
 
-function sendBinary(session: any, data: Uint8Array) {
+function sendBinary(session: Session, data: Uint8Array) {
   if (session.ws && session.ws.readyState === 1) {
-    try { session.ws.send(data, { binary: true }); } catch (e) {}
+    try { session.ws.send(data, { binary: true }); } catch {}
   }
 }
 
-function setState(session: any, state: string) {
+function setState(session: Session, state: string) {
   session.state = state;
   send(session, { type: 'state', state });
 }
 
-function addTurn(session: any, role: string, text: string, interrupted = false, deferDb = false) {
+function addTurn(session: Session, role: string, text: string, interrupted = false, deferDb = false) {
   session.turnOrder += 1;
   const orderIdx = session.turnOrder;
   const turnId = uuidv4();
@@ -139,8 +223,9 @@ function addTurn(session: any, role: string, text: string, interrupted = false, 
     try {
       db.prepare('INSERT INTO turns (id, call_id, order_idx, role, text, interrupted, ts) VALUES (?,?,?,?,?,?,?)')
         .run(turnId, session.id, orderIdx, role, text, interrupted ? 1 : 0, ts);
-    } catch (e: any) {
-      console.error('Failed to insert turn:', e?.message);
+    } catch (e: unknown) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      console.error('Failed to insert turn:', errMsg);
     }
   };
 
@@ -152,7 +237,7 @@ function addTurn(session: any, role: string, text: string, interrupted = false, 
 }
 
 async function speakSentence(
-  session: any,
+  session: Session,
   sentence: string,
   onFirstAudio?: () => void,
   onGenerateSent?: () => void
@@ -181,15 +266,17 @@ async function speakSentence(
 
   try {
     return await trySpeak();
-  } catch (err: any) {
+  } catch (err: unknown) {
     if (session.cancelGeneration || session.ended) return true;
-    console.error('TTS error:', err?.message);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error('TTS error:', errMsg);
     // retry once
     try {
       await session.tts.connectWithRetry();
       return await trySpeak();
-    } catch (err2: any) {
-      console.error('TTS retry failed:', err2?.message);
+    } catch (err2: unknown) {
+      const err2Msg = err2 instanceof Error ? err2.message : String(err2);
+      console.error('TTS retry failed:', err2Msg);
       send(session, { type: 'error', message: 'Voice synthesis failed. Ending call.' });
       await endSession(session, 'error');
       return false;
@@ -197,14 +284,91 @@ async function speakSentence(
   }
 }
 
-export async function startSession(ws: any, missedCallId?: string) {
-  const missed: any = missedCallId ? db.prepare('SELECT * FROM missed_calls WHERE id=?').get(missedCallId) : null;
+export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) {
+  const budget = checkCallBudget();
+  if (!budget.allowed) {
+    throw new Error(budget.reason || 'Demo is busy, try again in a minute');
+  }
+
+  interface MissedRow {
+    id: string;
+    business_id: string;
+    customer_phone: string;
+    token_expires_at?: string;
+    call_started_at?: string;
+    phone_verified?: number;
+    source?: string;
+  }
+
+  let missed: MissedRow | undefined = undefined;
+  if (missedCallTokenOrId) {
+    // Only opaque callback tokens are accepted. Guessable database IDs
+    // (mc_<timestamp>) must never be usable to join someone else's call.
+    if (missedCallTokenOrId.startsWith('mc_') || !/^[a-f0-9]{32}$/i.test(missedCallTokenOrId)) {
+      throw new Error('Invalid callback token');
+    }
+    missed = db.prepare('SELECT * FROM missed_calls WHERE token = ?').get(missedCallTokenOrId) as MissedRow | undefined;
+  }
+  if (!missed) {
+    throw new Error('Callback session not found');
+  }
+
+  // Token expiration check (30 minutes)
+  if (missed.token_expires_at) {
+    const expiresAt = new Date(missed.token_expires_at).getTime();
+    if (Date.now() > expiresAt) {
+      throw new Error('Callback link has expired (valid for 30 minutes)');
+    }
+  }
+
+  // Single-use check: atomically claim the link. If another socket already
+  // started it, only an active reconnect for the same missed call is allowed.
+  if (missed.call_started_at) {
+    const existingSession = Array.from(sessions.values()).find(
+      (s) => s.missedCallId === missed?.id && !s.ended
+    );
+    if (existingSession) {
+      if (existingSession.disconnectTimer) {
+        clearTimeout(existingSession.disconnectTimer);
+        existingSession.disconnectTimer = null;
+      }
+      existingSession.ws = ws;
+      console.log(`[session ${existingSession.id}] Client reconnected WebSocket to active session`);
+      send(existingSession, { type: 'config', sttProvider: STT_PROVIDER });
+      send(existingSession, { type: 'state', state: existingSession.state });
+      for (const turn of existingSession.turns) {
+        if (turn.role === 'agent') {
+          send(existingSession, { type: 'agent_text', text: turn.text });
+        } else {
+          send(existingSession, { type: 'customer_transcript', text: turn.text });
+        }
+      }
+      return existingSession;
+    }
+    throw new Error('This callback link has already been used');
+  } else {
+    const claim = db.prepare('UPDATE missed_calls SET call_started_at = ? WHERE id = ? AND call_started_at IS NULL')
+      .run(new Date().toISOString(), missed.id);
+    if (claim.changes === 0) {
+      throw new Error('This callback link has already been used');
+    }
+  }
+
   const business = rowToBiz(getBusinessRow());
   const callId = uuidv4();
+  const isCallerVerified = Boolean(
+    missed &&
+    missed.phone_verified === 1 &&
+    missed.customer_phone &&
+    missed.customer_phone !== 'unknown'
+  );
+
+  const initialPhoneStatus: PhoneStatus = isCallerVerified ? 'verified' : 'unknown';
+  const verifiedCallerPhone = isCallerVerified ? missed!.customer_phone : null;
   const customerPhone = missed ? missed.customer_phone : 'unknown';
   const businessId = missed ? missed.business_id : business.id;
-  db.prepare('INSERT INTO calls (id, missed_call_id, business_id, customer_phone, start_time) VALUES (?,?,?,?,?)')
-    .run(callId, missed ? missed.id : null, businessId, customerPhone, new Date().toISOString());
+  db.prepare('INSERT INTO calls (id, missed_call_id, business_id, customer_phone, start_time, phone_verified) VALUES (?,?,?,?,?,?)')
+    .run(callId, missed ? missed.id : null, businessId, customerPhone, new Date().toISOString(), isCallerVerified ? 1 : 0);
   if (missed) {
     db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run('calling', missed.id);
   }
@@ -217,12 +381,16 @@ export async function startSession(ws: any, missedCallId?: string) {
   const apiKey = process.env.ASSEMBLYAI_API_KEY || '';
   const tts = new TtsClient({ apiKey, voiceId, sampleRate: 24000, encoding: 'pcm_s16le', language: 'english' });
 
-  const session: any = {
+  const session: Session = {
     id: callId,
     ws,
     business,
     missedCallId: missed ? missed.id : null,
     customerPhone,
+    phoneStatus: initialPhoneStatus,
+    verifiedCallerPhone,
+    collectedPhone: null,
+    lastPhonePromptTurn: 0,
     state: 'GREETING',
     turns: [],
     turnOrder: 0,
@@ -252,8 +420,8 @@ export async function startSession(ws: any, missedCallId?: string) {
   send(session, { type: 'progress', stage: 'tts_connect', message: 'Connecting audio...' });
   try {
     await withStageTimeout(tts.connectWithRetry(), 10000, 'TTS connect');
-  } catch (err: any) {
-    const errorMsg = sanitizeErrorMsg(err?.message);
+  } catch (err: unknown) {
+    const errorMsg = sanitizeErrorMsg(err instanceof Error ? err.message : String(err));
     console.error(`[session ${session.id}] stage=tts_connect error=${errorMsg}`);
     send(session, {
       type: 'error',
@@ -267,10 +435,13 @@ export async function startSession(ws: any, missedCallId?: string) {
   // connect AssemblyAI STT if enabled
   if (STT_PROVIDER === 'assemblyai') {
     send(session, { type: 'progress', stage: 'stt_connect', message: 'Connecting speech recognition...' });
-    const stt = new SttClient({ apiKey });
+    const stt = new SttClient({
+      apiKey,
+      speechModel: process.env.ASSEMBLYAI_SPEECH_MODEL || undefined,
+    });
     session.stt = stt;
 
-    stt.onSpeechStart((_audioStartMs) => {
+    stt.onSpeechStart(() => {
       // Speech started signal available if needed
     });
 
@@ -296,10 +467,13 @@ export async function startSession(ws: any, missedCallId?: string) {
       send(session, { type: 'partial', text: '' });
       send(session, { type: 'customer_transcript', text: cleaned });
       if (session.generating) {
-        // drop overlapping utterances while reply is generating
-        return;
+        // Customer spoke over the agent: cancel the current reply, then
+        // process this final utterance instead of silently dropping it.
+        bargeIn(session);
       }
-      handleCustomerUtterance(session, cleaned, turnDetectionMs);
+      void handleCustomerUtterance(session, cleaned, turnDetectionMs).catch((err: unknown) => {
+        console.error(`[session ${session.id}] handleCustomerUtterance error:`, err instanceof Error ? err.message : String(err));
+      });
     });
 
     stt.onReconnecting((attempt) => {
@@ -328,8 +502,8 @@ export async function startSession(ws: any, missedCallId?: string) {
 
     try {
       await withStageTimeout(stt.connectWithRetry(), 10000, 'STT connect');
-    } catch (err: any) {
-      const errorMsg = sanitizeErrorMsg(err?.message);
+    } catch (err: unknown) {
+      const errorMsg = sanitizeErrorMsg(err instanceof Error ? err.message : String(err));
       console.error(`[session ${session.id}] stage=stt_connect error=${errorMsg}`);
       send(session, {
         type: 'error',
@@ -341,7 +515,7 @@ export async function startSession(ws: any, missedCallId?: string) {
     }
   }
 
-  session.maxTimer = setTimeout(() => endSession(session, 'timeout'), 5 * 60 * 1000);
+  session.maxTimer = setTimeout(() => endSession(session, 'timeout'), MAX_CALL_SECONDS * 1000);
   session.keepAliveTimer = setInterval(() => {
     if (!session.ended) {
       try { session.tts.keepAlive(); } catch {}
@@ -358,8 +532,8 @@ export async function startSession(ws: any, missedCallId?: string) {
   try {
     const ok = await withStageTimeout(speakSentence(session, greeting, () => {}), 10000, 'Greeting audio playback');
     if (!ok || session.ended) return session;
-  } catch (err: any) {
-    const errorMsg = sanitizeErrorMsg(err?.message);
+  } catch (err: unknown) {
+    const errorMsg = sanitizeErrorMsg(err instanceof Error ? err.message : String(err));
     console.error(`[session ${session.id}] stage=greeting error=${errorMsg}`);
     send(session, {
       type: 'error',
@@ -377,7 +551,7 @@ export async function startSession(ws: any, missedCallId?: string) {
   return session;
 }
 
-export async function handleCustomerUtterance(session: any, text: string, turnDetectionMs?: number | null) {
+export async function handleCustomerUtterance(session: Session, text: string, turnDetectionMs?: number | null) {
   if (session.ended) return;
   text = (text || '').trim();
   if (!text) return;
@@ -413,8 +587,61 @@ export async function handleCustomerUtterance(session: any, text: string, turnDe
     return;
   }
 
+  // 1. Phone refusal check
+  if (session.phoneStatus !== 'verified' && session.phoneStatus !== 'validated' && session.phoneStatus !== 'confirmed') {
+    if (isPhoneRefusal(text)) {
+      session.phoneStatus = 'declined';
+      console.log(`[session ${session.id}] Contact status -> declined`);
+    }
+  }
+
+  // 2. Phone extraction & validation check
+  // Ambiguous 10-digit numbers follow the business locale: Indian businesses
+  // treat 6-9 prefixes as +91, everyone else as NANP +1.
+  const phoneCountry: 'US' | 'IN' = /india|kolkata|calcutta/i.test(session.business.timezone || '') ? 'IN' : 'US';
+  const extracted = extractPhoneFromUtterance(text, phoneCountry);
+  if (extracted) {
+    if (extracted.isValid && extracted.normalized) {
+      const sameAsVerified = session.phoneStatus === 'verified'
+        && session.verifiedCallerPhone === extracted.normalized;
+      if (!sameAsVerified) {
+        session.phoneStatus = session.phoneStatus === 'verified' ? 'confirmed' : 'validated';
+        session.collectedPhone = extracted.normalized;
+        session.customerPhone = extracted.normalized;
+        console.log(`[session ${session.id}] Contact status -> ${session.phoneStatus} (${maskPhone(extracted.normalized)})`);
+        try {
+          // Spoken numbers are not carrier caller-ID, so they are stored as
+          // collected/confirmed rather than verified.
+          db.prepare('UPDATE calls SET customer_phone = ?, phone_verified = 0 WHERE id = ?').run(extracted.normalized, session.id);
+          if (session.missedCallId) {
+            db.prepare('UPDATE missed_calls SET customer_phone = ?, phone_verified = 0 WHERE id = ?').run(extracted.normalized, session.missedCallId);
+          }
+        } catch (dbErr) {
+          console.error('Failed to update call customer_phone:', dbErr);
+        }
+      }
+    } else if (
+      extracted.reason === 'incomplete'
+      && session.phoneStatus !== 'declined'
+      && session.phoneStatus !== 'verified'
+      && session.phoneStatus !== 'validated'
+      && session.phoneStatus !== 'confirmed'
+    ) {
+      session.phoneStatus = 'collected'; // incomplete digits
+      console.log(`[session ${session.id}] Contact status -> collected (incomplete: ${extracted.digits.length} digits)`);
+    }
+  }
+
   // Add turn in memory immediately, defer SQLite DB write off critical path
   addTurn(session, 'customer', text, false, true);
+
+  const customerTurnCount = session.turns.filter((t: SessionTurn) => t.role === 'customer').length;
+  const callContext: llm.CallContext = {
+    phoneStatus: session.phoneStatus,
+    verifiedCallerPhone: session.verifiedCallerPhone,
+    collectedPhone: session.collectedPhone,
+    turnCount: customerTurnCount,
+  };
 
   setState(session, 'THINKING');
   session.generating = true;
@@ -452,9 +679,9 @@ export async function handleCustomerUtterance(session: any, text: string, turnDe
     console.log(`[turn] turn_detection=${turnDetectionMs ?? '-'}ms llm_first_token=${llmFirstTokenMs ?? '-'}ms tts_first_audio=${ttsFirstAudioMs ?? '-'}ms total=${totalMs}ms`);
   };
 
-  const messages = session.turns
-    .filter((t: any) => t.role === 'customer' || t.role === 'agent')
-    .map((t: any) => ({ role: t.role === 'agent' ? 'assistant' : 'user', content: t.text }));
+  const messages: llm.ChatMessage[] = session.turns
+    .filter((t: SessionTurn) => t.role === 'customer' || t.role === 'agent')
+    .map((t: SessionTurn) => ({ role: (t.role === 'agent' ? 'assistant' : 'user') as 'assistant' | 'user', content: t.text }));
 
   // chunk queue consumer
   const chunkQueue: string[] = [];
@@ -479,16 +706,43 @@ export async function handleCustomerUtterance(session: any, text: string, turnDe
             isFirstChunk = false;
           }
         }
-      }, controller.signal);
-    } catch (e: any) {
+      }, controller.signal, callContext);
+    } catch (e: unknown) {
       if (!session.cancelGeneration) {
-        console.error(`[session ${session.id}] stage=llm error=${sanitizeErrorMsg(e?.message)}`);
+        const errMsg = e instanceof Error ? e.message : String(e);
+        console.error(`[session ${session.id}] stage=llm error=${sanitizeErrorMsg(errMsg)}`);
       }
     } finally {
       const rest = buffer.trim();
       if (rest && !session.cancelGeneration) {
         chunkQueue.push(rest);
       }
+
+      // Deterministic Contact Policy Guard
+      if (!session.cancelGeneration && !session.ended) {
+        const askedForPhone = /phone\s*(number)?|callback\s*number|reach\s*you|best\s*number/i.test(fullReply);
+        if (askedForPhone) {
+          session.lastPhonePromptTurn = customerTurnCount;
+        }
+
+        const isWrappingUp = /goodbye|bye|have a (great|good) (day|rest)|we'?ll (be in touch|follow up|reach out)|take care|thank you for calling/i.test(fullReply) ||
+                             /that'?s (all|everything)|thank you|thanks|no that'?s it|bye/i.test(text);
+
+        if (session.phoneStatus === 'unknown' && !askedForPhone && (isWrappingUp || customerTurnCount >= 2)) {
+          const promptSentence = "Before we wrap up, what is the best phone number for our team to call you back?";
+          chunkQueue.push(promptSentence);
+          fullReply += (fullReply ? ' ' : '') + promptSentence;
+          session.lastPhonePromptTurn = customerTurnCount;
+          console.log(`[session ${session.id}] Guard enforced callback phone prompt (turn=${customerTurnCount})`);
+        } else if (session.phoneStatus === 'collected' && !askedForPhone) {
+          const repeatSentence = "Could you please repeat your full 10-digit phone number?";
+          chunkQueue.push(repeatSentence);
+          fullReply += (fullReply ? ' ' : '') + repeatSentence;
+          session.lastPhonePromptTurn = customerTurnCount;
+          console.log(`[session ${session.id}] Guard enforced repeat phone prompt for incomplete digits`);
+        }
+      }
+
       llmDone = true;
     }
   })();
@@ -501,7 +755,14 @@ export async function handleCustomerUtterance(session: any, text: string, turnDe
       await new Promise((r) => setTimeout(r, 15));
       continue;
     }
-    const chunk = chunkQueue.shift()!;
+    let chunk = chunkQueue.shift()!;
+    // Guard against redundant phone requests if phone is already verified or collected
+    if (session.phoneStatus === 'verified' || session.phoneStatus === 'validated') {
+      if (/(what(?:'s|\s+is)\s+(?:the\s+best|your)\s+phone\s+number|can\s+I\s+get\s+your\s+phone\s+number|could\s+you\s+(?:provide|give\s+me)\s+your\s+phone\s+number)/i.test(chunk)) {
+        chunk = chunk.replace(/(what(?:'s|\s+is)\s+(?:the\s+best|your)\s+phone\s+number|can\s+I\s+get\s+your\s+phone\s+number|could\s+you\s+(?:provide|give\s+me)\s+your\s+phone\s+number)[^.!?]*[.!?]?/gi, 'We have your phone number on file.');
+      }
+    }
+
     session.state = 'SPEAKING';
     send(session, { type: 'state', state: 'SPEAKING' });
 
@@ -525,7 +786,10 @@ export async function handleCustomerUtterance(session: any, text: string, turnDe
   session.abortController = null;
 
   if (session.cancelGeneration) {
-    // barge-in: discard
+    // Persist the partial agent reply as interrupted so the transcript and
+    // summary reflect what the customer actually heard.
+    const partialReply = fullReply.trim();
+    if (partialReply) addTurn(session, 'agent', partialReply, true);
     return;
   }
 
@@ -537,7 +801,7 @@ export async function handleCustomerUtterance(session: any, text: string, turnDe
   }
 }
 
-export function bargeIn(session: any) {
+export function bargeIn(session: Session) {
   if (session.ended) return;
   session.cancelGeneration = true;
   session.generating = false;
@@ -545,17 +809,32 @@ export function bargeIn(session: any) {
     try { session.abortController.abort(); } catch {}
   }
   try { session.tts.cancel(); } catch {}
-  const row = db.prepare('SELECT id FROM turns WHERE call_id=? AND role=? ORDER BY order_idx DESC LIMIT 1').get(session.id, 'agent');
-  if (row) db.prepare('UPDATE turns SET interrupted=1 WHERE id=?').run((row as any).id);
-  const last = session.turns.slice().reverse().find((t: any) => t.role === 'agent');
-  if (last) last.interrupted = true;
   send(session, { type: 'stop_audio' });
   setState(session, 'LISTENING');
 }
 
-export async function endSession(session: any, reason: string) {
+export function handleSocketDisconnect(session: Session) {
+  if (session.ended) return;
+  session.ws = null;
+  if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
+  // Give mid-call page reloads or transient network disconnects a 12-second grace period
+  // to reconnect without terminating the ongoing call session.
+  session.disconnectTimer = setTimeout(() => {
+    session.disconnectTimer = null;
+    if (!session.ended && !session.ws) {
+      console.log(`[session ${session.id}] Disconnect grace period elapsed without reconnect. Ending call.`);
+      endSession(session, 'disconnect').catch(() => {});
+    }
+  }, 12000);
+}
+
+export async function endSession(session: Session, reason: string) {
   if (session.ended) return;
   session.ended = true;
+  if (session.disconnectTimer) {
+    clearTimeout(session.disconnectTimer);
+    session.disconnectTimer = null;
+  }
   if (session.silenceTimer) clearTimeout(session.silenceTimer);
   if (session.maxTimer) clearTimeout(session.maxTimer);
   if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
@@ -566,59 +845,102 @@ export async function endSession(session: any, reason: string) {
   }
 
   setState(session, 'ENDING');
-  db.prepare('UPDATE calls SET end_time=?, end_reason=?, latency_json=?, usage_json=? WHERE id=?')
-    .run(new Date().toISOString(), reason, JSON.stringify(session.latencies), JSON.stringify(session.usage), session.id);
-  if (session.missedCallId) {
-    const status = reason === 'opted_out' ? 'opted_out' : 'done';
-    db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run(status, session.missedCallId);
+  try {
+    db.prepare('UPDATE calls SET end_time=?, end_reason=?, latency_json=?, usage_json=? WHERE id=?')
+      .run(new Date().toISOString(), reason, JSON.stringify(session.latencies), JSON.stringify(session.usage), session.id);
+    if (session.missedCallId) {
+      const status = reason === 'opted_out' ? 'opted_out' : 'done';
+      db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run(status, session.missedCallId);
+    }
+  } catch (dbErr) {
+    console.error(`[session ${session.id}] Failed to persist call end:`, dbErr);
   }
 
   setState(session, 'SUMMARIZING');
-  const transcript = session.turns.map((t: any) => `${t.role === 'agent' ? 'Agent' : 'Customer'}: ${t.text}`).join('\n');
-  const { parsed, raw } = await llm.summarize(transcript, session.business);
+
+  // Close provider connections before summary generation. A slow or hung LLM
+  // must never keep the STT/TTS sockets or the session alive.
+  const stt = session.stt;
+  session.stt = null;
+  if (stt) {
+    try { await stt.close(); } catch {}
+  }
+  try { await session.tts.close(); } catch {}
+
+  const transcript = session.turns.map((t: SessionTurn) => `${t.role === 'agent' ? 'Agent' : 'Customer'}: ${t.text}`).join('\n');
+  const callContext: llm.CallContext = {
+    phoneStatus: session.phoneStatus,
+    verifiedCallerPhone: session.verifiedCallerPhone,
+    collectedPhone: session.collectedPhone,
+    turnCount: session.turns.filter((t: SessionTurn) => t.role === 'customer').length,
+  };
+
+  let parsed: llm.StructuredSummary | null = null;
+  let raw = '';
+  let summaryStatus: 'completed' | 'unavailable' = 'unavailable';
+  try {
+    const result = await withStageTimeout(
+      llm.summarize(transcript, session.business, callContext),
+      20000,
+      'Summary generation'
+    );
+    parsed = result.parsed;
+    raw = result.raw;
+    summaryStatus = result.status;
+  } catch (summaryErr) {
+    const msg = summaryErr instanceof Error ? summaryErr.message : String(summaryErr);
+    console.error(`[session ${session.id}] Summary generation failed:`, sanitizeErrorMsg(msg));
+    raw = 'Summary generation failed or timed out.';
+  }
+
   const summaryId = uuidv4();
-  const s = parsed || {};
-  db.prepare(`INSERT INTO summaries (id, call_id, reason, urgency, preferred_time, contact_details, suggested_action, short_summary, sentiment, raw) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-    .run(summaryId, session.id,
-      s.reason || 'not specified',
-      s.urgency || 'medium',
-      s.preferred_time || 'not specified',
-      s.contact_details || 'not provided',
-      s.suggested_action || 'Follow up with customer',
-      s.short_summary || transcript.slice(0, 120),
-      s.sentiment || 'neutral',
-      raw);
+  const isUnavailable = summaryStatus === 'unavailable' || !parsed;
+  const finalStatus = isUnavailable ? 'unavailable' : 'completed';
+
   const summary = {
     id: summaryId,
     callId: session.id,
-    reason: s.reason || 'not specified',
-    urgency: s.urgency || 'medium',
-    preferred_time: s.preferred_time || 'not specified',
-    contact_details: s.contact_details || 'not provided',
-    suggested_action: s.suggested_action || 'Follow up with customer',
-    short_summary: s.short_summary || '',
-    sentiment: s.sentiment || 'neutral',
+    reason: isUnavailable ? 'Summary unavailable' : parsed!.reason,
+    urgency: isUnavailable ? '' : parsed!.urgency,
+    preferred_time: isUnavailable ? 'not specified' : parsed!.preferred_time,
+    contact_details: isUnavailable ? 'not provided' : parsed!.contact_details,
+    suggested_action: isUnavailable ? 'Manual follow-up needed' : parsed!.suggested_action,
+    short_summary: isUnavailable ? 'Structured summary could not be extracted.' : parsed!.short_summary,
+    sentiment: isUnavailable ? '' : parsed!.sentiment,
+    status: finalStatus,
   };
 
-  // close STT and TTS
-  if (session.stt) {
-    try { await session.stt.close(); } catch {}
-    session.stt = null;
+  try {
+    db.prepare(`INSERT INTO summaries (id, call_id, reason, urgency, preferred_time, contact_details, suggested_action, short_summary, sentiment, raw, status) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(summaryId, session.id,
+        summary.reason,
+        summary.urgency,
+        summary.preferred_time,
+        summary.contact_details,
+        summary.suggested_action,
+        summary.short_summary,
+        summary.sentiment,
+        raw,
+        finalStatus);
+  } catch (dbErr) {
+    console.error(`[session ${session.id}] Failed to persist summary:`, dbErr);
   }
-  try { await session.tts.close(); } catch {}
 
   setState(session, 'DONE');
   send(session, { type: 'summary', summary });
   setTimeout(() => {
-    try { session.ws.close(); } catch (e) {}
+    try { session.ws?.close(); } catch {}
   }, 500);
 
   sessions.delete(session.id);
-  events.broadcast('call_ended', { callId: session.id, summary });
-  events.broadcast('summary_ready', { callId: session.id, summary });
+
+  // Public SSE carries only the call id. Phone numbers and tokens stay out of
+  // broadcast payloads; the dashboard fetches details through its normal API.
+  events.broadcast('call_ended', { callId: session.id });
+  events.broadcast('summary_ready', { callId: session.id });
 
   // Fire-and-forget owner notification: send nothing if 0 customer turns, unless opted_out
-  const customerTurns = (session.turns || []).filter((t: any) => t.role === 'customer');
+  const customerTurns = (session.turns || []).filter((t: SessionTurn) => t.role === 'customer');
   const shouldNotify = customerTurns.length > 0 || reason === 'opted_out';
 
   if (shouldNotify && !session.notificationDispatched) {
@@ -626,11 +948,12 @@ export async function endSession(session: any, reason: string) {
     notifyCallSummary({
       callId: session.id,
       businessName: session.business?.name || 'Business',
-      customerPhone: session.customerPhone,
+      customerPhone: session.collectedPhone || session.verifiedCallerPhone || session.customerPhone,
       endReason: reason,
       summary,
-    }).catch((err: any) => {
-      console.error('[session] Owner notification dispatch error:', err?.message);
+    }).catch((err: unknown) => {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error('[session] Owner notification dispatch error:', errMsg);
     });
   }
 }

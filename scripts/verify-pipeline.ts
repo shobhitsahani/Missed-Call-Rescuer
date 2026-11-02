@@ -1,21 +1,23 @@
 import dotenv from 'dotenv';
-dotenv.config({ override: true });
+dotenv.config();
 import WebSocket from 'ws';
 import fs from 'fs';
 import path from 'path';
 import { TtsClient } from '../server/tts';
 
-const API_BASE = 'http://localhost:4000';
-const WS_BASE = 'ws://localhost:4000/ws';
+const API_BASE = process.env.API_BASE || 'http://localhost:4000';
+const WS_BASE = process.env.WS_BASE || 'ws://localhost:4000/ws';
 
 async function simulateCall(): Promise<string> {
   const res = await fetch(`${API_BASE}/api/missed-calls/simulate`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ phone: '+1 (555) 012-3456' }),
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ phone: '+1 (555) 012-3456', source: 'test' }),
   });
   const data = await res.json();
-  return data.missedCallId;
+  return data.token || data.missedCallId;
 }
 
 interface TurnMetric {
@@ -112,7 +114,7 @@ async function run5Turns(fixtures: Record<string, Buffer>): Promise<TurnMetric[]
   ];
 
   const missedCallId = await simulateCall();
-  const ws = new WebSocket(WS_BASE);
+  const ws = new WebSocket(WS_BASE, { headers: { Origin: 'http://localhost:3010' } });
 
   const turnMetrics: TurnMetric[] = [];
 
@@ -149,7 +151,7 @@ async function run5Turns(fixtures: Record<string, Buffer>): Promise<TurnMetric[]
     }
 
     ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'join', missedCallId }));
+      ws.send(JSON.stringify({ type: 'join', token: missedCallId, missedCallId }));
     });
 
     ws.on('message', (data, isBinary) => {
@@ -252,7 +254,7 @@ async function testBargeIn(fixtures: Record<string, Buffer>): Promise<boolean> {
 
   const bargeInPcm = fixtures['barge_in'];
   const missedCallId = await simulateCall();
-  const ws = new WebSocket(WS_BASE);
+  const ws = new WebSocket(WS_BASE, { headers: { Origin: 'http://localhost:3010' } });
 
   return new Promise<boolean>((resolve, reject) => {
     let greetingDone = false;
@@ -371,7 +373,7 @@ async function testOptOut(fixtures: Record<string, Buffer>): Promise<boolean> {
 
   const optOutPcm = fixtures['opt_out'];
   const missedCallId = await simulateCall();
-  const ws = new WebSocket(WS_BASE);
+  const ws = new WebSocket(WS_BASE, { headers: { Origin: 'http://localhost:3010' } });
 
   return new Promise<boolean>((resolve, reject) => {
     let greetingDone = false;
@@ -388,7 +390,7 @@ async function testOptOut(fixtures: Record<string, Buffer>): Promise<boolean> {
     }
 
     ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'join', missedCallId }));
+      ws.send(JSON.stringify({ type: 'join', token: missedCallId, missedCallId }));
     });
 
     ws.on('message', (data, isBinary) => {
@@ -420,7 +422,7 @@ async function testOptOut(fixtures: Record<string, Buffer>): Promise<boolean> {
         setTimeout(async () => {
           const res = await fetch(`${API_BASE}/api/missed-calls`);
           const calls = await res.json();
-          const mc = calls.find((c: any) => c.id === missedCallId);
+          const mc = calls.find((c: any) => c.id === missedCallId || c.token === missedCallId);
           console.log(`Missed call DB status: ${mc?.status}`);
           resolve(optOutAckReceived && mc?.status === 'opted_out');
         }, 300);

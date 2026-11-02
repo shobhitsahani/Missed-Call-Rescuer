@@ -2,6 +2,7 @@
 
 import * as React from 'react';
 import { useEffect } from 'react';
+import Link from 'next/link';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { AlertCircle, RotateCcw } from 'lucide-react';
@@ -36,7 +37,7 @@ export default function ErrorBoundary({
               <span>Try again</span>
             </Button>
             <Button asChild variant="outline" size="sm" className="text-xs">
-              <a href="/">Go to dashboard</a>
+              <Link href="/">Go to dashboard</Link>
             </Button>
           </div>
         </CardContent>

@@ -14,7 +14,7 @@ export interface SttOptions {
 export type PartialCallback = (text: string) => void;
 export type FinalTurnCallback = (
   text: string,
-  words: any[],
+  words: Array<{ text?: string; start?: number; end?: number; confidence?: number }>,
   turnOrder?: number,
   confidence?: number,
   turnDetectionMs?: number | null
@@ -177,7 +177,14 @@ export class SttClient {
       });
 
       ws.on('message', (data: WebSocket.RawData) => {
-        let msg: any;
+        let msg: {
+          type?: string;
+          error?: string;
+          error_code?: string | number;
+          text?: string;
+          words?: Array<{ text?: string; start?: number; end?: number; confidence?: number }>;
+          [key: string]: unknown;
+        };
         try {
           msg = JSON.parse(data.toString());
         } catch {
@@ -326,14 +333,15 @@ export class SttClient {
         this.flushPendingChunks();
 
         this.reconnectedCallback?.();
-      } catch (err: any) {
+      } catch (err: unknown) {
         this.isReconnecting = false;
-        if (isFatalAuthOrParamError(undefined, err?.message)) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (isFatalAuthOrParamError(undefined, errMsg)) {
           this.closed = true;
-          this.errorCallback?.(err);
+          this.errorCallback?.(err instanceof Error ? err : new Error(errMsg));
           return;
         }
-        this.triggerReconnect(err?.message || 'Reconnect connection failed');
+        this.triggerReconnect(errMsg || 'Reconnect connection failed');
       }
     }, delay);
   }
@@ -399,8 +407,9 @@ export class SttClient {
     this.totalAudioBytesSent += chunk.length;
     try {
       this.ws.send(chunk, { binary: true });
-    } catch (e: any) {
-      this.handleSocketFailure(e?.message || 'Send audio error');
+    } catch (e: unknown) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      this.handleSocketFailure(errMsg || 'Send audio error');
     }
   }
 
@@ -412,15 +421,16 @@ export class SttClient {
       try {
         await this.connect();
         return;
-      } catch (err: any) {
-        if (isFatalAuthOrParamError(undefined, err?.message)) {
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (isFatalAuthOrParamError(undefined, errMsg)) {
           throw err;
         }
         if (attempt === 3) {
           throw err;
         }
         const delay = attempt === 1 ? 500 : 1500;
-        console.log(`[SttClient] Initial connect attempt ${attempt} failed (${err?.message}). Retrying in ${delay}ms...`);
+        console.log(`[SttClient] Initial connect attempt ${attempt} failed (${errMsg}). Retrying in ${delay}ms...`);
         await new Promise((r) => setTimeout(r, delay));
       }
     }
@@ -450,7 +460,7 @@ export class SttClient {
     if (this.ws) {
       console.log('[SttClient] Force disconnecting upstream STT WebSocket for testing');
       try {
-        const sock = (this.ws as any)._socket;
+        const sock = (this.ws as unknown as { _socket?: { destroy: (e?: Error) => void } })._socket;
         if (sock && typeof sock.destroy === 'function') {
           sock.destroy(new Error('ECONNRESET: connection reset by peer'));
         } else {
@@ -465,7 +475,7 @@ export class SttClient {
     if (this.ws) {
       try {
         this.ws.removeAllListeners();
-        const sock = (this.ws as any)._socket;
+        const sock = (this.ws as unknown as { _socket?: { destroy: () => void } })._socket;
         if (sock && typeof sock.destroy === 'function') {
           sock.destroy();
         } else {

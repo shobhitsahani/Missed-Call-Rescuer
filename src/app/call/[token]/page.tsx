@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { API_BASE, api } from '@/lib/api';
+import { getApiBase } from '@/lib/api';
 import { SummaryCard } from '@/components/SummaryCard';
 import { TranscriptBubble } from '@/components/TranscriptBubble';
 import { AgentStatusVisualizer } from '@/components/AgentStatusVisualizer';
@@ -18,7 +18,6 @@ import {
   AlertCircle,
   Activity,
   CheckCircle2,
-  Sparkles,
   Loader2,
   ShieldAlert,
 } from 'lucide-react';
@@ -39,27 +38,32 @@ type TranscriptItem = {
 export default function CallPage() {
   const params = useParams();
   const token = params?.token as string;
-  const [business, setBusiness] = useState<any>(null);
-  const [sttProvider, setSttProvider] = useState<string>('assemblyai');
+  const [business, setBusiness] = useState<{ name: string; voice: string } | null>(null);
   const [status, setStatus] = useState('idle');
   const [started, setStarted] = useState(false);
   const [state, setState] = useState('GREETING');
   const [transcript, setTranscript] = useState<TranscriptItem[]>([]);
   const [livePartial, setLivePartial] = useState<string>('');
-  const [summary, setSummary] = useState<any>(null);
+  const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
   const [latestMetric, setLatestMetric] = useState<TurnMetric | null>(null);
-  const [_metricsHistory, setMetricsHistory] = useState<TurnMetric[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [tokenError, setTokenError] = useState<string | null>(null);
+  const [validatingToken, setValidatingToken] = useState(true);
+  const [coldStartNotice, setColdStartNotice] = useState<string | null>(null);
+  const [isReconnect, setIsReconnect] = useState(false);
   const [progressMessage, setProgressMessage] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const recRef = useRef<any>(null);
+  const recRef = useRef<{ stop?: () => void } | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const micCtxRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const connectionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const endFallbackRef = useRef<NodeJS.Timeout | null>(null);
+  const connectingRef = useRef(false);
 
   const endedRef = useRef(false);
+  const summaryReceivedRef = useRef(false);
   const stateRef = useRef(state);
   const transcriptBottomRef = useRef<HTMLDivElement | null>(null);
 
@@ -67,17 +71,110 @@ export default function CallPage() {
     stateRef.current = state;
   }, [state]);
 
-  // Load business details for caller banner and STT provider flag
+  // Validate callback token and fetch session metadata via public endpoint
+  // Accommodates Render free-tier cold starts with bounded retry and user feedback
   useEffect(() => {
-    api('/api/business')
-      .then((b) => {
-        setBusiness(b);
-        if (b?.sttProvider) {
-          setSttProvider(b.sttProvider);
+    let isCancelled = false;
+    let abortController: AbortController | null = null;
+    let coldStartTimer: NodeJS.Timeout | null = null;
+
+    async function validateTokenWithRetry() {
+      const startTime = Date.now();
+      const MAX_VALIDATE_DURATION_MS = 60000;
+      let attempt = 0;
+
+      coldStartTimer = setTimeout(() => {
+        if (!isCancelled) {
+          setColdStartNotice('Waking up the server. This may take up to a minute on Render free tier...');
         }
-      })
-      .catch(() => {});
-  }, []);
+      }, 3500);
+
+      while (!isCancelled) {
+        attempt++;
+        abortController = new AbortController();
+        const attemptTimeout = setTimeout(() => abortController?.abort(), 20000);
+
+        try {
+          const res = await fetch(`${getApiBase()}/api/call-token/${encodeURIComponent(token)}`, {
+            signal: abortController.signal,
+          });
+          clearTimeout(attemptTimeout);
+          const data = await res.json().catch(() => null);
+          if (isCancelled) return;
+
+          if (!res.ok) {
+            // Permanent errors: stop retrying immediately
+            if (res.status === 400) {
+              setTokenError(data?.error || 'Invalid or malformed callback link.');
+              return;
+            }
+            if (res.status === 404) {
+              setTokenError(data?.error || 'Callback session not found or link is invalid.');
+              return;
+            }
+            if (res.status === 410) {
+              setTokenError(data?.error || 'This callback link has expired (links are valid for 30 minutes).');
+              return;
+            }
+            if (res.status === 409) {
+              setTokenError(data?.error || 'This call has already concluded.');
+              return;
+            }
+            if (res.status === 429) {
+              setTokenError(data?.error || 'Demo is busy, try again in a minute.');
+              return;
+            }
+
+            // Transient server errors (502, 503, 504): retry if within budget
+            const elapsed = Date.now() - startTime;
+            if (elapsed + 3000 < MAX_VALIDATE_DURATION_MS) {
+              setColdStartNotice(`Connecting to server (attempt ${attempt})...`);
+              await new Promise((r) => setTimeout(r, 2000));
+              continue;
+            } else {
+              setTokenError('The callback server is temporarily unavailable. Please try again in a moment.');
+              return;
+            }
+          }
+
+          if (data?.valid) {
+            setBusiness({ name: data.businessName, voice: data.voice });
+            if (data.isReconnect) {
+              setIsReconnect(true);
+            }
+            setColdStartNotice(null);
+            return;
+          }
+        } catch (err: unknown) {
+          clearTimeout(attemptTimeout);
+          if (isCancelled) return;
+          const elapsed = Date.now() - startTime;
+          if (elapsed + 3000 < MAX_VALIDATE_DURATION_MS) {
+            setColdStartNotice('Waking up the server. This may take up to a minute on Render free tier...');
+            await new Promise((r) => setTimeout(r, 2500));
+            continue;
+          } else {
+            const isAborted = err instanceof DOMException && err.name === 'AbortError';
+            setTokenError(isAborted ? 'Connection timed out waiting for the server to wake up.' : 'Unable to connect to the callback server.');
+            return;
+          }
+        }
+      }
+    }
+
+    validateTokenWithRetry().finally(() => {
+      if (coldStartTimer) clearTimeout(coldStartTimer);
+      if (!isCancelled) {
+        setValidatingToken(false);
+      }
+    });
+
+    return () => {
+      isCancelled = true;
+      if (coldStartTimer) clearTimeout(coldStartTimer);
+      if (abortController) abortController.abort();
+    };
+  }, [token]);
 
   // Auto-scroll transcript container to latest message or partial
   useEffect(() => {
@@ -99,19 +196,23 @@ export default function CallPage() {
   }, [state]);
 
   function initAudio() {
+    if (audioCtxRef.current?.state === 'closed') {
+      audioCtxRef.current = null;
+    }
     if (!audioCtxRef.current) {
-      const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext;
+      const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       audioCtxRef.current = new Ctx({ sampleRate: 24000 });
     }
-    const ctx = audioCtxRef.current!;
+    const ctx = audioCtxRef.current;
     if (ctx.state === 'suspended') {
       ctx.resume();
     }
-    return audioCtxRef.current!;
+    return audioCtxRef.current;
   }
 
   function playPcmChunk(arrayBuffer: ArrayBuffer) {
     const ctx = initAudio();
+    if (ctx.state === 'closed') return;
     const int16 = new Int16Array(arrayBuffer);
     const float32 = new Float32Array(int16.length);
     for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
@@ -153,6 +254,58 @@ export default function CallPage() {
     if (audioCtxRef.current) nextStartRef.current = audioCtxRef.current.currentTime;
   }
 
+  function releaseMedia() {
+    // Prevent SpeechRecognition.onend from restarting during teardown.
+    endedRef.current = true;
+    try {
+      recRef.current?.stop?.();
+    } catch {}
+    recRef.current = null;
+    try {
+      workletNodeRef.current?.disconnect();
+    } catch {}
+    workletNodeRef.current = null;
+    try {
+      mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    } catch {}
+    mediaStreamRef.current = null;
+    try {
+      micCtxRef.current?.close();
+    } catch {}
+    micCtxRef.current = null;
+  }
+
+  function releaseAudio() {
+    stopAllAudio();
+    if (audioCtxRef.current) {
+      try {
+        audioCtxRef.current.close();
+      } catch {}
+      audioCtxRef.current = null;
+    }
+    nextStartRef.current = 0;
+  }
+
+  // Release mic, audio context and socket if the page is unmounted mid-call.
+  useEffect(() => {
+    return () => {
+      endedRef.current = true;
+      if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+      if (endFallbackRef.current) clearTimeout(endFallbackRef.current);
+      releaseMedia();
+      releaseAudio();
+      const ws = wsRef.current;
+      wsRef.current = null;
+      if (ws && ws.readyState !== WebSocket.CLOSED) {
+        try {
+          ws.close();
+        } catch {}
+      }
+    };
+    // Cleanup helpers only touch refs; run once on unmount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function similar(a: string, b: string) {
     const na = a.toLowerCase().replace(/[^\w\s]/g, '').trim();
     const nb = b.toLowerCase().replace(/[^\w\s]/g, '').trim();
@@ -167,11 +320,14 @@ export default function CallPage() {
   }
 
   async function connect() {
-    if (started) return;
+    if (connectingRef.current) return;
+    connectingRef.current = true;
+    endedRef.current = false;
+    summaryReceivedRef.current = false;
     setStarted(true);
     setStatus('connecting');
     setError(null);
-    setProgressMessage('Connecting audio...');
+    setProgressMessage(isReconnect ? 'Resuming active call...' : 'Connecting audio...');
     initAudio();
 
     if (connectionTimeoutRef.current) {
@@ -181,12 +337,16 @@ export default function CallPage() {
       if (stateRef.current === 'GREETING' && !endedRef.current) {
         setError('Connection timed out waiting for the assistant to start. Please check your connection and try again.');
       }
-    }, 10000);
+    }, 25000);
 
-    const provider = business?.sttProvider || sttProvider;
+    const wsUrl = getApiBase().replace(/^http/, 'ws') + '/ws';
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    wsRef.current = ws;
 
-    // In AssemblyAI mode, acquire mic before connecting WS
-    if (provider === 'assemblyai') {
+    // Capture microphone PCM and stream it to the server (server-side STT).
+    async function setupMic(target: WebSocket) {
+      if (mediaStreamRef.current) return;
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -195,9 +355,13 @@ export default function CallPage() {
             autoGainControl: true,
           },
         });
+        if (endedRef.current || target !== wsRef.current) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
         mediaStreamRef.current = stream;
 
-        const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+        const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
         const micCtx = new AudioCtx();
         micCtxRef.current = micCtx;
         if (micCtx.state === 'suspended') {
@@ -212,120 +376,59 @@ export default function CallPage() {
         workletNodeRef.current = workletNode;
 
         workletNode.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(event.data);
+          if (target === wsRef.current && target.readyState === WebSocket.OPEN) {
+            target.send(event.data);
           }
         };
 
         micSource.connect(workletNode);
-      } catch (err: any) {
+        setProgressMessage('Listening...');
+      } catch (err: unknown) {
         if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+        try { target.close(); } catch {}
+        if (target === wsRef.current) wsRef.current = null;
+        connectingRef.current = false;
+        endedRef.current = true;
+        releaseMedia();
         setStarted(false);
         setStatus('idle');
-        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        const errObj = err as Error;
+        if (errObj.name === 'NotAllowedError' || errObj.name === 'PermissionDeniedError') {
           setError('Microphone access blocked. Please enable microphone permissions in your browser to start the call.');
         } else {
-          setError(`Microphone error: ${err.message || 'Unable to access audio device.'}`);
+          setError(`Microphone error: ${errObj.message || 'Unable to access audio device.'}`);
         }
-        return;
       }
     }
 
-    const wsUrl = API_BASE.replace(/^http/, 'ws') + '/ws';
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = 'arraybuffer';
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setStatus('connected');
-      ws.send(JSON.stringify({ type: 'join', missedCallId: token }));
-    };
-
-    ws.onmessage = (ev) => {
-      if (ev.data instanceof ArrayBuffer) {
-        playPcmChunk(ev.data);
-        return;
-      }
-      let msg: any;
-      try {
-        msg = JSON.parse(ev.data);
-      } catch {
-        return;
-      }
-      switch (msg.type) {
-        case 'config':
-          if (msg.sttProvider) {
-            setSttProvider(msg.sttProvider);
-          }
-          break;
-        case 'progress':
-          if (msg.message) {
-            setProgressMessage(msg.message);
-          }
-          break;
-        case 'state':
-          setState(msg.state);
-          if (msg.state === 'SPEAKING' || msg.state === 'LISTENING') {
-            if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
-          }
-          break;
-        case 'agent_text':
-          if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
-          currentAgentTextRef.current = msg.text;
-          setTranscript((t) => [...t, { role: 'agent', text: msg.text }]);
-          break;
-        case 'partial':
-          setLivePartial(msg.text || '');
-          break;
-        case 'customer_transcript':
-          setLivePartial('');
-          setTranscript((t) => [...t, { role: 'customer', text: msg.text }]);
-          break;
-        case 'stop_audio':
-          stopAllAudio();
-          markLastAgentTurnInterrupted();
-          break;
-        case 'metrics': {
-          const total = typeof msg.totalMs === 'number' ? msg.totalMs : msg.timeToFirstAudio;
-          const llm = typeof msg.llmFirstTokenMs === 'number' ? msg.llmFirstTokenMs : null;
-          const tts = typeof msg.ttsFirstAudioMs === 'number' ? msg.ttsFirstAudioMs : null;
-          const turnDetection = typeof msg.turnDetectionMs === 'number' ? msg.turnDetectionMs : null;
-          if (typeof total === 'number') {
-            const m: TurnMetric = {
-              totalMs: total,
-              llmFirstTokenMs: llm,
-              ttsFirstAudioMs: tts,
-              turnDetectionMs: turnDetection,
-            };
-            setLatestMetric(m);
-            setMetricsHistory((prev) => [...prev, m]);
-          }
-          break;
-        }
-        case 'summary':
-          setSummary(msg.summary);
-          break;
-        case 'error':
-          if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
-          setError(msg.message || 'An unexpected error occurred during the call.');
-          break;
-      }
-    };
-
-    ws.onclose = () => {
-      setStatus('closed');
-    };
-
-    ws.onerror = () => {
-      if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
-      setError('Connection lost. Could not communicate with the voice server.');
-    };
-
-    // If STT provider is browser fallback, setup SpeechRecognition
-    if (provider === 'browser') {
-      const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    // Browser SpeechRecognition fallback (no server-side STT).
+    function startBrowserStt(target: WebSocket) {
+      if (recRef.current) return;
+      type SpeechRecognitionCtor = new () => {
+        continuous: boolean;
+        interimResults: boolean;
+        lang: string;
+        start: () => void;
+        stop: () => void;
+        onresult: (e: {
+          resultIndex: number;
+          results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }>;
+        }) => void;
+        onerror: (e: { error: string }) => void;
+        onend: () => void;
+      };
+      const win = window as unknown as {
+        SpeechRecognition?: SpeechRecognitionCtor;
+        webkitSpeechRecognition?: SpeechRecognitionCtor;
+      };
+      const SR = win.SpeechRecognition || win.webkitSpeechRecognition;
       if (!SR) {
         setError('Browser speech recognition is not supported in this browser. Please use Chrome or Edge.');
+        try { target.close(); } catch {}
+        if (target === wsRef.current) wsRef.current = null;
+        connectingRef.current = false;
+        setStarted(false);
+        setStatus('idle');
         return;
       }
 
@@ -334,7 +437,7 @@ export default function CallPage() {
       rec.interimResults = true;
       rec.lang = 'en-US';
 
-      rec.onresult = (e: any) => {
+      rec.onresult = (e) => {
         let interim = '';
         let final = '';
         for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -353,7 +456,7 @@ export default function CallPage() {
           const speakingFor = Date.now() - agentSpeakingStartRef.current;
           if (words >= 2 && speakingFor >= 400 && !similar(interim, currentAgentTextRef.current)) {
             try {
-              ws.send(JSON.stringify({ type: 'barge_in' }));
+              target.send(JSON.stringify({ type: 'barge_in' }));
             } catch {}
             stopAllAudio();
             markLastAgentTurnInterrupted();
@@ -364,12 +467,12 @@ export default function CallPage() {
           setLivePartial('');
           setTranscript((t) => [...t, { role: 'customer', text: final.trim() }]);
           try {
-            ws.send(JSON.stringify({ type: 'transcript', final: true, text: final.trim() }));
+            target.send(JSON.stringify({ type: 'transcript', final: true, text: final.trim() }));
           } catch {}
         }
       };
 
-      rec.onerror = (e: any) => {
+      rec.onerror = (e: { error: string }) => {
         if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
           setError('Microphone access blocked. Please enable microphone permissions in your browser.');
         } else if (e.error === 'network') {
@@ -380,7 +483,7 @@ export default function CallPage() {
       };
 
       rec.onend = () => {
-        if (!endedRef.current) {
+        if (!endedRef.current && !summaryReceivedRef.current && target.readyState === WebSocket.OPEN) {
           try {
             rec.start();
           } catch {}
@@ -390,47 +493,191 @@ export default function CallPage() {
       recRef.current = rec;
       try {
         rec.start();
+        setProgressMessage('Listening...');
       } catch (e) {
         console.error(e);
       }
     }
+
+    ws.onopen = () => {
+      setStatus('connected');
+      ws.send(JSON.stringify({ type: 'join', token }));
+    };
+
+    ws.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        playPcmChunk(ev.data);
+        return;
+      }
+      let msg: {
+        type?: string;
+        sttProvider?: string;
+        message?: string;
+        state?: string;
+        text?: string;
+        totalMs?: number;
+        timeToFirstAudio?: number;
+        llmFirstTokenMs?: number | null;
+        ttsFirstAudioMs?: number | null;
+        turnDetectionMs?: number | null;
+        summary?: Record<string, unknown>;
+      };
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      switch (msg.type) {
+        case 'config':
+          if (msg.sttProvider) {
+            // The provider is known only after the server replies, so wire the
+            // microphone path here instead of guessing at connect time.
+            if (msg.sttProvider === 'browser') {
+              startBrowserStt(ws);
+            } else {
+              void setupMic(ws);
+            }
+          }
+          break;
+        case 'progress':
+          if (msg.message) {
+            setProgressMessage(msg.message);
+          }
+          break;
+        case 'state':
+          if (msg.state) {
+            setState(msg.state);
+            if (msg.state === 'SPEAKING' || msg.state === 'LISTENING') {
+              if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+            }
+          }
+          break;
+        case 'agent_text':
+          if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+          currentAgentTextRef.current = msg.text || '';
+          setTranscript((t) => [...t, { role: 'agent', text: msg.text || '' }]);
+          break;
+        case 'partial':
+          setLivePartial(msg.text || '');
+          break;
+        case 'customer_transcript':
+          setLivePartial('');
+          setTranscript((t) => [...t, { role: 'customer', text: msg.text || '' }]);
+          break;
+        case 'stop_audio':
+          stopAllAudio();
+          markLastAgentTurnInterrupted();
+          break;
+        case 'metrics': {
+          const total = typeof msg.totalMs === 'number' ? msg.totalMs : msg.timeToFirstAudio;
+          const llm = typeof msg.llmFirstTokenMs === 'number' ? msg.llmFirstTokenMs : null;
+          const tts = typeof msg.ttsFirstAudioMs === 'number' ? msg.ttsFirstAudioMs : null;
+          const turnDetection = typeof msg.turnDetectionMs === 'number' ? msg.turnDetectionMs : null;
+          if (typeof total === 'number') {
+            const m: TurnMetric = {
+              totalMs: total,
+              llmFirstTokenMs: llm,
+              ttsFirstAudioMs: tts,
+              turnDetectionMs: turnDetection,
+            };
+            setLatestMetric(m);
+          }
+          break;
+        }
+        case 'summary':
+          summaryReceivedRef.current = true;
+          endedRef.current = true;
+          if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+          if (endFallbackRef.current) clearTimeout(endFallbackRef.current);
+          setSummary(msg.summary || null);
+          setProgressMessage('Call complete');
+          releaseMedia();
+          stopAllAudio();
+          break;
+        case 'error':
+          if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+          setError(msg.message || 'An unexpected error occurred during the call.');
+          break;
+      }
+    };
+
+    ws.onclose = () => {
+      connectingRef.current = false;
+      setStatus('closed');
+      if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+      if (summaryReceivedRef.current || endedRef.current) {
+        releaseMedia();
+        stopAllAudio();
+        return;
+      }
+      // Unexpected disconnect before the summary: release devices and return to
+      // the pre-call screen so the user can retry without a dead audio graph.
+      releaseMedia();
+      stopAllAudio();
+      setStarted(false);
+      setStatus('idle');
+      setError('The call connection closed before the assistant finished. Please try again.');
+    };
+
+    ws.onerror = () => {
+      if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+      setError('Connection lost. Could not communicate with the voice server.');
+    };
   }
 
   function endCall() {
     endedRef.current = true;
+    connectingRef.current = false;
     try {
       wsRef.current?.send(JSON.stringify({ type: 'end', reason: 'user_ended' }));
     } catch {}
+    if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
 
-    // Cleanup mic stream & worklet
-    try {
-      workletNodeRef.current?.disconnect();
-      workletNodeRef.current = null;
-    } catch {}
-    try {
-      mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
-      mediaStreamRef.current = null;
-    } catch {}
-    try {
-      micCtxRef.current?.close();
-      micCtxRef.current = null;
-    } catch {}
+    releaseMedia();
+    releaseAudio();
+    setStatus('ending');
+    setProgressMessage('Ending call — generating summary...');
 
-    // Cleanup browser recognition if active
-    try {
-      recRef.current?.stop();
-    } catch {}
-
-    stopAllAudio();
-    if (audioCtxRef.current) {
-      try {
-        audioCtxRef.current.close();
-      } catch {}
-    }
+    // The server keeps the socket open long enough to stream the summary.
+    // If it never arrives (provider outage), fall back to the dashboard view.
+    if (endFallbackRef.current) clearTimeout(endFallbackRef.current);
+    endFallbackRef.current = setTimeout(() => {
+      if (summaryReceivedRef.current) return;
+      const socket = wsRef.current;
+      wsRef.current = null;
+      if (socket) {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        try { socket.close(); } catch {}
+      }
+      setStarted(false);
+      setStatus('idle');
+      setError('The call ended, but the summary is still processing. It will appear on the dashboard when ready.');
+    }, 45000);
   }
 
   function retryCall() {
-    endCall();
+    endedRef.current = true;
+    connectingRef.current = false;
+    if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+    if (endFallbackRef.current) clearTimeout(endFallbackRef.current);
+    releaseMedia();
+    releaseAudio();
+
+    // Detach and close the old socket so late events cannot mutate the retry.
+    const oldSocket = wsRef.current;
+    wsRef.current = null;
+    if (oldSocket) {
+      oldSocket.onopen = null;
+      oldSocket.onmessage = null;
+      oldSocket.onclose = null;
+      oldSocket.onerror = null;
+      try { oldSocket.close(); } catch {}
+    }
+
+    summaryReceivedRef.current = false;
     setError(null);
     setProgressMessage(null);
     setStarted(false);
@@ -439,9 +686,9 @@ export default function CallPage() {
     setTranscript([]);
     setLivePartial('');
     setSummary(null);
-    endedRef.current = false;
+    setLatestMetric(null);
     setTimeout(() => {
-      connect();
+      void connect();
     }, 250);
   }
 
@@ -450,6 +697,20 @@ export default function CallPage() {
   return (
     <main className="min-h-screen bg-background text-foreground flex flex-col justify-center items-center px-4 py-8 sm:py-12 sm:px-6 antialiased selection:bg-primary/20 selection:text-primary">
       <div className="w-full max-w-[520px] mx-auto space-y-4">
+        {/* Token Validation Error Banner */}
+        {tokenError && (
+          <div
+            role="alert"
+            className="rounded-xl border border-destructive/40 bg-destructive/10 p-4 text-xs sm:text-sm text-foreground flex items-start gap-3 shadow-xs animate-in fade-in duration-200"
+          >
+            <ShieldAlert className="h-5 w-5 text-destructive shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <p className="font-semibold text-destructive">Callback Session Unavailable</p>
+              <p className="mt-0.5 text-muted-foreground">{tokenError}</p>
+            </div>
+          </div>
+        )}
+
         {/* Error Notification Banner */}
         {error && (
           <div
@@ -488,7 +749,7 @@ export default function CallPage() {
 
               <div className="mt-2.5">
                 <Badge variant="outline" className="text-xs font-medium text-primary border-primary/30 bg-primary/5">
-                  Automated Voice Assistant
+                  Voice Callback Session
                 </Badge>
               </div>
 
@@ -500,11 +761,31 @@ export default function CallPage() {
                 <Button
                   size="lg"
                   onClick={connect}
+                  disabled={validatingToken || !!tokenError}
                   className="w-full sm:w-auto px-8 py-6 text-base font-semibold gap-2 shadow-sm"
                 >
-                  <PhoneCall className="h-5 w-5" />
-                  <span>Start call</span>
+                  {validatingToken ? (
+                    <>
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                      <span>Validating link...</span>
+                    </>
+                  ) : isReconnect ? (
+                    <>
+                      <PhoneCall className="h-5 w-5" />
+                      <span>Resume call</span>
+                    </>
+                  ) : (
+                    <>
+                      <PhoneCall className="h-5 w-5" />
+                      <span>Start call</span>
+                    </>
+                  )}
                 </Button>
+                {coldStartNotice && (
+                  <p className="mt-3 text-xs text-amber-500 font-medium animate-pulse text-center max-w-xs">
+                    {coldStartNotice}
+                  </p>
+                )}
               </div>
 
               <div className="mt-6 flex items-center gap-1.5 text-xs text-muted-foreground">

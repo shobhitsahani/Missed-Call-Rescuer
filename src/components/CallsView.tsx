@@ -19,11 +19,8 @@ import {
   ChevronRight,
   SlidersHorizontal,
   Search,
-  ChevronLeft,
   ChevronsLeft,
   ChevronsRight,
-  PhoneCall,
-  Calendar,
 } from 'lucide-react';
 import { CallDetails, SummaryDetails } from './Drawer';
 import { computeAverages } from '@/lib/useDashboardData';
@@ -174,9 +171,12 @@ export function CallsView({
     },
     {
       id: 'urgency',
-      accessorFn: (row) => row.summary?.urgency || 'none',
+      accessorFn: (row) => row.summary?.status === 'unavailable' ? 'unavailable' : row.summary?.urgency || 'none',
       header: 'Urgency',
       cell: ({ row }) => {
+        if (row.original.summary?.status === 'unavailable') {
+          return <span className="text-muted-foreground text-xs italic">Unavailable</span>;
+        }
         const urgency = row.original.summary?.urgency;
         if (!urgency) return <span className="text-muted-foreground">—</span>;
         return <StatusBadge status={urgency} />;
@@ -189,9 +189,12 @@ export function CallsView({
     },
     {
       id: 'reason',
-      accessorFn: (row) => row.summary?.reason || row.summary?.short_summary || '',
+      accessorFn: (row) => row.summary?.status === 'unavailable' ? 'Summary unavailable' : row.summary?.reason || row.summary?.short_summary || '',
       header: 'Reason',
       cell: ({ row }) => {
+        if (row.original.summary?.status === 'unavailable') {
+          return <span className="text-muted-foreground text-xs italic">Summary unavailable</span>;
+        }
         const text =
           row.original.summary?.reason ||
           row.original.summary?.short_summary ||
@@ -249,7 +252,7 @@ export function CallsView({
 
   // Multi-field global filter
   const globalFilterFn = React.useCallback(
-    (row: any, _columnId: string, filterValue: string) => {
+    (row: { original: CallDetails }, _columnId: string, filterValue: string) => {
       if (!filterValue) return true;
       const search = filterValue.toLowerCase().trim();
       const phone = (row.original.customer_phone || '').toLowerCase();

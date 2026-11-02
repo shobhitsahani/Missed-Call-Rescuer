@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { Sidebar, DashboardView } from '@/components/Sidebar';
 import { TopBar } from '@/components/layout/TopBar';
 import { OverviewView } from '@/components/OverviewView';
@@ -10,6 +11,8 @@ import { Drawer, CallDetails } from '@/components/Drawer';
 import { DemoModal } from '@/components/DemoModal';
 import { PageContainer } from '@/components/layout/PageContainer';
 import { useDashboardData } from '@/lib/useDashboardData';
+import { AlertTriangle, RefreshCw } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 
 export default function DashboardPage() {
   const [currentView, setCurrentView] = useState<DashboardView>('overview');
@@ -27,21 +30,38 @@ export default function DashboardPage() {
     turnsMap,
     loadingTurns,
     initialLoading,
+    loadError,
     simulating,
     lastCallId,
     setLastCallId,
+    lastCallToken,
+    setLastCallToken,
     sseConnected,
+    sseError,
     simulate,
     fetchTurns,
     overallLatency,
+    callsWithLatencyCount,
     completedCallsCount,
-    recoveryRate,
+    completionRate,
+    load,
   } = useDashboardData();
 
-  const handleSelectCall = (call: CallDetails) => {
+  const router = useRouter();
+
+  // Support deep links such as /?tab=calls from the settings page.
+  useEffect(() => {
+    const tab = new URLSearchParams(window.location.search).get('tab');
+    if (tab === 'overview' || tab === 'calls' || tab === 'missed') {
+      // Defer to avoid a synchronous cascading render during mount.
+      queueMicrotask(() => setCurrentView(tab));
+    }
+  }, []);
+
+  const handleSelectCall = useCallback((call: CallDetails) => {
     setSelectedCall(call);
     fetchTurns(call.id);
-  };
+  }, [fetchTurns]);
 
 
   // Open drawer if ?call=<id> query param is in URL
@@ -52,10 +72,11 @@ export default function DashboardPage() {
     if (targetCallId) {
       const match = calls.find(c => c.id === targetCallId);
       if (match) {
-        handleSelectCall(match);
+        const timer = setTimeout(() => handleSelectCall(match), 0);
+        return () => clearTimeout(timer);
       }
     }
-  }, [calls]);
+  }, [calls, handleSelectCall]);
 
   // Keep selectedCall reference synced when call data updates
   useEffect(() => {
@@ -67,7 +88,8 @@ export default function DashboardPage() {
           updated.notified_at !== selectedCall.notified_at ||
           updated.notify_error !== selectedCall.notify_error)
       ) {
-        setSelectedCall(updated);
+        const timer = setTimeout(() => setSelectedCall(updated), 0);
+        return () => clearTimeout(timer);
       }
     }
   }, [calls, selectedCall]);
@@ -76,7 +98,7 @@ export default function DashboardPage() {
 
   const handleChangeView = (view: DashboardView) => {
     if (view === 'settings') {
-      window.location.href = '/settings';
+      router.push('/settings');
       return;
     }
     setCurrentView(view);
@@ -100,7 +122,8 @@ export default function DashboardPage() {
         callsCount={calls.length}
         missedCount={missed.length}
         sseConnected={sseConnected}
-        businessName={business?.name || 'Business'}
+        sseError={sseError}
+        businessName={typeof business?.name === 'string' ? business.name : 'Business'}
         collapsed={collapsed}
         onToggleCollapse={() => setCollapsed(!collapsed)}
         mobileOpen={mobileOpen}
@@ -113,7 +136,7 @@ export default function DashboardPage() {
         {/* Top Bar with Search & Quick Actions */}
         <TopBar
           title={pageTitle}
-          businessName={business?.name}
+          businessName={typeof business?.name === 'string' ? business.name : undefined}
           searchQuery={searchQuery}
           onSearchChange={setSearchQuery}
           onSimulate={simulate}
@@ -124,6 +147,21 @@ export default function DashboardPage() {
         {/* View Content */}
         <main className="flex-1 w-full min-w-0">
           <PageContainer size="wide">
+            {loadError && (
+              <div
+                role="alert"
+                className="mb-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-xl border border-destructive/40 bg-destructive/10 p-4 text-sm"
+              >
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="h-4 w-4 mt-0.5 text-destructive shrink-0" />
+                  <span>{loadError}</span>
+                </div>
+                <Button variant="outline" size="sm" onClick={() => void load()} className="gap-1.5 self-start sm:self-auto">
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Retry
+                </Button>
+              </div>
+            )}
             {currentView === 'overview' && (
               <OverviewView
                 missed={missed}
@@ -131,10 +169,15 @@ export default function DashboardPage() {
                 summaries={summaries}
                 initialLoading={initialLoading}
                 completedCallsCount={completedCallsCount}
-                recoveryRate={recoveryRate}
+                recoveryRate={completionRate}
                 overallLatency={overallLatency}
+                callsWithLatencyCount={callsWithLatencyCount}
                 lastCallId={lastCallId}
-                onDismissBanner={() => setLastCallId(null)}
+                lastCallToken={lastCallToken}
+                onDismissBanner={() => {
+                  setLastCallId(null);
+                  setLastCallToken(null);
+                }}
                 onViewAllCalls={() => setCurrentView('calls')}
                 onSelectCall={handleSelectCall}
                 onSimulate={simulate}
@@ -150,6 +193,7 @@ export default function DashboardPage() {
                 onSelectCall={handleSelectCall}
                 onSimulate={simulate}
                 simulating={simulating}
+                externalSearch={searchQuery}
               />
             )}
 
@@ -159,6 +203,7 @@ export default function DashboardPage() {
                 initialLoading={initialLoading}
                 onSimulate={simulate}
                 simulating={simulating}
+                externalSearch={searchQuery}
               />
             )}
           </PageContainer>
@@ -170,7 +215,7 @@ export default function DashboardPage() {
         isOpen={!!selectedCall}
         onClose={() => setSelectedCall(null)}
         call={selectedCall}
-        businessName={business?.name}
+        businessName={typeof business?.name === 'string' ? business.name : undefined}
         summary={selectedCall ? summaries[selectedCall.id] || null : null}
         turns={selectedCall ? turnsMap[selectedCall.id] || null : null}
         loadingTurns={selectedCall ? !!loadingTurns[selectedCall.id] : false}
@@ -180,6 +225,7 @@ export default function DashboardPage() {
       <DemoModal
         isOpen={demoModalOpen}
         onClose={() => setDemoModalOpen(false)}
+        onDataCleared={load}
       />
     </div>
   );

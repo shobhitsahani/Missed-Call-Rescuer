@@ -1,11 +1,13 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { DEFAULT_PRESET, BUSINESS_PRESETS } from '../src/lib/presets';
 
 const dataDir = path.join(process.cwd(), 'data');
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-const dbPath = path.join(dataDir, 'app.db');
+const dbPath = process.env.DB_PATH ? path.resolve(process.env.DB_PATH) : path.join(dataDir, 'app.db');
+const dbDir = path.dirname(dbPath);
+if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 const db = new Database(dbPath);
 
 db.pragma('journal_mode = WAL');
@@ -97,6 +99,37 @@ ensureColumn('calls', 'notify_error', 'TEXT');
 
 // Business settings columns
 ensureColumn('businesses', 'timezone', 'TEXT');
+ensureColumn('businesses', 'language', 'TEXT');
+ensureColumn('businesses', 'owner_email', 'TEXT');
+
+// Call token, expiry, single-use, and source columns on missed_calls
+ensureColumn('missed_calls', 'token', 'TEXT');
+ensureColumn('missed_calls', 'token_expires_at', 'TEXT');
+ensureColumn('missed_calls', 'call_started_at', 'TEXT');
+ensureColumn('missed_calls', 'source', "TEXT NOT NULL DEFAULT 'demo'");
+ensureColumn('missed_calls', 'phone_verified', 'INTEGER DEFAULT 0');
+ensureColumn('calls', 'phone_verified', 'INTEGER DEFAULT 0');
+ensureColumn('summaries', 'status', "TEXT NOT NULL DEFAULT 'completed'");
+
+// Backfill tokens for existing rows without one
+const rowsWithoutToken = db.prepare('SELECT id FROM missed_calls WHERE token IS NULL').all() as Array<{ id: string }>;
+for (const row of rowsWithoutToken) {
+  const randomToken = crypto.randomBytes(16).toString('hex');
+  db.prepare('UPDATE missed_calls SET token = ? WHERE id = ?').run(randomToken, row.id);
+}
+
+// Legacy tokens must not live forever. Expire them 30 minutes after the
+// original missed call rather than treating NULL as "never expires".
+const rowsWithoutExpiry = db.prepare(
+  'SELECT id, time FROM missed_calls WHERE token IS NOT NULL AND token_expires_at IS NULL'
+).all() as Array<{ id: string; time: string }>;
+for (const row of rowsWithoutExpiry) {
+  const calledAt = new Date(row.time).getTime();
+  const expiresAt = new Date((Number.isFinite(calledAt) ? calledAt : Date.now()) + 30 * 60 * 1000).toISOString();
+  db.prepare('UPDATE missed_calls SET token_expires_at = ? WHERE id = ?').run(expiresAt, row.id);
+}
+
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_missed_calls_token ON missed_calls(token);`);
 
 export const DEFAULT_BIZ = {
   id: DEFAULT_PRESET.id,
@@ -113,32 +146,51 @@ export const DEFAULT_BIZ = {
 
 export { BUSINESS_PRESETS };
 
-export function parseServices(raw: any): string[] {
+export function parseServices(raw: unknown): string[] {
   if (!raw) return [];
   if (Array.isArray(raw)) return raw;
   try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed.map(s => String(s).trim()).filter(Boolean);
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (Array.isArray(parsed)) return parsed.map((s) => String(s).trim()).filter(Boolean);
   } catch {}
-  return String(raw).split(',').map(s => s.trim()).filter(Boolean);
+  return String(raw).split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-export function parseFaqs(raw: any): Array<{ question: string; answer: string }> {
+export function parseFaqs(raw: unknown): Array<{ question: string; answer: string }> {
   if (!raw) return [];
-  if (Array.isArray(raw)) return raw;
+  if (Array.isArray(raw)) return raw as Array<{ question: string; answer: string }>;
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
     if (Array.isArray(parsed)) {
-      return parsed.filter(item => item && typeof item === 'object').map(item => ({
-        question: String(item.question || '').trim(),
-        answer: String(item.answer || '').trim(),
-      }));
+      return parsed.filter((item) => item && typeof item === 'object').map((item) => {
+        const entry = item as Record<string, unknown>;
+        return {
+          question: String(entry.question || '').trim(),
+          answer: String(entry.answer || '').trim(),
+        };
+      });
     }
   } catch {}
   return [{ question: 'General inquiry', answer: String(raw).trim() }];
 }
 
-const existingBiz = db.prepare('SELECT * FROM businesses WHERE id=?').get(DEFAULT_BIZ.id) as any;
+export interface BusinessRecord {
+  id: string;
+  name: string;
+  hours: string;
+  services: string;
+  faqs: string;
+  tone: string;
+  voice: string;
+  language?: string;
+  timezone: string;
+  owner_email?: string;
+  [key: string]: unknown;
+}
+
+const existingBiz = db.prepare('SELECT * FROM businesses WHERE id=?').get(DEFAULT_BIZ.id) as
+  | { id: string; voice?: string; timezone?: string }
+  | undefined;
 if (!existingBiz) {
   db.prepare(`INSERT INTO businesses (id,name,hours,services,faqs,tone,voice,language,timezone,owner_email) VALUES (?,?,?,?,?,?,?,?,?,?)`)
     .run(

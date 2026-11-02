@@ -16,7 +16,7 @@ function sendCommand(ws: WebSocket, id: number, method: string, params: any = {}
           if (msg.error) reject(new Error(msg.error.message));
           else resolve(msg.result);
         }
-      } catch (e) {
+      } catch {
         // ignore other messages
       }
     };
@@ -100,7 +100,7 @@ async function main() {
     body: JSON.stringify({ phone: '+1 (555) 019-8877' }),
   });
   const simData = await simRes.json();
-  const callUrl = `http://localhost:3010/call/${simData.missedCallId}`;
+  const callUrl = `http://localhost:3010/call/${simData.token}`;
 
   console.log(`Capturing Call Page screenshot at ${callUrl}...`);
   const callPng = path.join(publicDir, 'call-interface.png');

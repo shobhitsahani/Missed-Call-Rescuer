@@ -29,7 +29,6 @@ import {
   ExternalLink,
   X,
   ChevronRight,
-  Sparkles,
   BarChart3,
   Calendar,
 } from 'lucide-react';
@@ -51,7 +50,9 @@ interface OverviewViewProps {
   completedCallsCount: number;
   recoveryRate: number | null;
   overallLatency: { avgTotal: number | null; avgLlm: number | null; avgTts: number | null } | null;
+  callsWithLatencyCount?: number;
   lastCallId: string | null;
+  lastCallToken?: string | null;
   onDismissBanner: () => void;
   onViewAllCalls: () => void;
   onSelectCall: (call: CallDetails) => void;
@@ -67,7 +68,9 @@ export function OverviewView({
   completedCallsCount,
   recoveryRate,
   overallLatency,
+  callsWithLatencyCount = 0,
   lastCallId,
+  lastCallToken,
   onDismissBanner,
   onViewAllCalls,
   onSelectCall,
@@ -143,8 +146,10 @@ export function OverviewView({
                 Missed call simulated &amp; queued for callback
               </p>
               <p className="text-xs text-muted-foreground mt-0.5">
-                Simulate the customer conversation:{' '}
-                <span className="font-mono text-primary font-medium">/call/{lastCallId}</span>
+                Simulate customer voice session:{' '}
+                <span className="font-mono text-primary font-medium">
+                  {lastCallToken ? `/call/${lastCallToken}` : 'callback link unavailable'}
+                </span>
               </p>
             </div>
           </div>
@@ -155,7 +160,13 @@ export function OverviewView({
               size="sm"
               className="h-8 text-xs font-semibold gap-1.5"
             >
-              <a href={`/call/${lastCallId}`} target="_blank" rel="noreferrer">
+              <a
+                href={lastCallToken ? `/call/${lastCallToken}` : undefined}
+                aria-disabled={!lastCallToken}
+                className={!lastCallToken ? 'pointer-events-none opacity-50' : undefined}
+                target="_blank"
+                rel="noreferrer"
+              >
                 <span>Open call page</span>
                 <ExternalLink className="h-3 w-3" />
               </a>
@@ -194,23 +205,23 @@ export function OverviewView({
             <StatCard
               title="Calls completed"
               value={completedCallsCount}
-              subtitle="AI callbacks finished"
+              subtitle={`Based on ${calls.length} total call${calls.length === 1 ? '' : 's'}`}
               icon={PhoneCall}
-              tooltip="Successfully answered and completed calls"
+              tooltip="Calls where customer spoke at least once and a valid summary was generated"
             />
             <StatCard
-              title="Recovery rate"
+              title="Completed / missed calls"
               value={recoveryRate !== null ? `${recoveryRate}%` : '—'}
-              subtitle="Completed / missed calls"
+              subtitle={missed.length < 5 ? 'Needs ≥ 5 missed calls' : `${completedCallsCount} of ${missed.length} calls`}
               icon={TrendingUp}
-              tooltip="Percentage of missed calls answered by AI"
+              tooltip="Strict completion rate: completed calls / missed calls logged (hidden when < 5 missed calls)"
             />
             <StatCard
               title="End of speech to first audio"
               value={overallLatency?.avgTotal ? `${overallLatency.avgTotal} ms` : '—'}
-              subtitle={latencySubtitle}
+              subtitle={callsWithLatencyCount > 0 ? `based on ${callsWithLatencyCount} call${callsWithLatencyCount === 1 ? '' : 's'}` : latencySubtitle}
               icon={Activity}
-              tooltip="Average round-trip response latency from user stop to agent audio"
+              tooltip={`Average round-trip response latency (based on ${callsWithLatencyCount} call${callsWithLatencyCount === 1 ? '' : 's'})`}
             />
           </div>
         )}
@@ -272,7 +283,7 @@ export function OverviewView({
                       color: 'var(--foreground)',
                       boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
                     }}
-                    formatter={(value: any) => [`${value} ms`, 'Avg Latency']}
+                    formatter={(value) => [`${value} ms`, 'Avg Latency']}
                     labelFormatter={(label) => `Time: ${label}`}
                   />
                   <Area
