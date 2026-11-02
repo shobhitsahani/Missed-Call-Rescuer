@@ -439,6 +439,36 @@ console.log('\nTest 15: End-to-End Dialogue Sequence Replicating Incident');
   console.log('\n  ✓ Complete dialogue sequence passed with zero duplicate prompts or regressions!');
 }
 
+// -------------------------------------------------------------------
+// 16. Unrelated conversational speech isolation
+// -------------------------------------------------------------------
+console.log('\nTest 16: Unrelated conversational speech isolation');
+{
+  // Customer previously spoke 3 digits ("987")
+  const pending = '987';
+
+  // Customer now speaks unrelated conversational sentence containing a number word
+  const unrelatedText1 = 'Actually I have two leaks in my basement';
+  const ext1 = extractPhoneFromUtterance(unrelatedText1, 'US', pending);
+  assert.strictEqual(ext1, null, 'Must reject conversational speech with number words');
+
+  const unrelatedText2 = 'I called about this 1 week ago';
+  const ext2 = extractPhoneFromUtterance(unrelatedText2, 'US', pending);
+  assert.strictEqual(ext2, null, 'Must reject "1 week ago" from stitching into pending digits');
+
+  const unrelatedText3 = 'Can someone come at 2 pm?';
+  const ext3 = extractPhoneFromUtterance(unrelatedText3, 'US', pending);
+  assert.strictEqual(ext3, null, 'Must reject "2 pm" from stitching into pending digits');
+
+  // But legitimate phone continuation with pending digits STILL works
+  const legitContinuation = 'and the last digit is zero';
+  const extLegit = extractPhoneFromUtterance(legitContinuation, 'US', '987654321');
+  assert(extLegit !== null && extLegit.isValid);
+  assert.strictEqual(extLegit.normalized, '+19876543210');
+
+  console.log('  ✓ Conversational speech with numbers strictly isolated from phone stitching');
+}
+
 console.log('\n================================================================');
-console.log('🎉 ALL 15 PHONE COLLECTION ROBUSTNESS REGRESSION TESTS PASSED!');
+console.log('🎉 ALL 16 PHONE COLLECTION ROBUSTNESS REGRESSION TESTS PASSED!');
 console.log('================================================================\n');

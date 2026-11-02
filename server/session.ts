@@ -635,6 +635,13 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
       session.pendingPhoneDigits = extracted.digits;
       console.log(`[session ${session.id}] Contact status -> collected (incomplete: ${extracted.digits.length} digits, pending: ${extracted.digits})`);
     }
+  } else if (session.pendingPhoneDigits) {
+    // If utterance contains substantive non-phone speech, clear stale pending digits
+    // so unrelated future remarks cannot be mistakenly stitched.
+    const words = text.trim().split(/\s+/).length;
+    if (words >= 2) {
+      session.pendingPhoneDigits = null;
+    }
   }
 
   // Add turn in memory immediately, defer SQLite DB write off critical path

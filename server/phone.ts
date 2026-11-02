@@ -212,23 +212,49 @@ export function validatePhoneDigits(rawDigits: string, defaultCountry: PhoneCoun
 }
 
 function isLikelyPhoneAttempt(text: string, digits: string, hasPending: boolean): boolean {
-  if (!digits) return false;
+  if (!digits || digits.length === 0) return false;
+
+  // Standalone complete phone numbers (7+ digits)
   if (digits.length >= 7) return true;
-  if (hasPending && digits.length >= 1) return true;
 
   const cleaned = text.toLowerCase().replace(/[\(\)\[\]{},.+\-_/\\:;!?"']/g, ' ');
   const tokens = cleaned.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
 
-  if (digits.length >= 3) {
-    const nonDigitTokens = tokens.filter(t =>
-      WORD_TO_DIGIT[t] === undefined &&
-      !/^\d+$/.test(t) &&
-      !['double', 'twice', 'triple', 'my', 'number', 'is', 'it', 'it\'s', 'its', 'call', 'at', 'phone'].includes(t)
-    );
-    return nonDigitTokens.length <= 1;
+  const ALLOWED_PHONE_WORDS = new Set([
+    'double', 'twice', 'triple',
+    'my', 'number', 'is', 'it', "it's", 'its',
+    'call', 'at', 'phone', 'cell', 'mobile',
+    'and', 'the', 'last', 'digit', 'digits',
+    'area', 'code', 'plus', 'one', 'callback',
+    'here', 'giving',
+  ]);
+
+  // Count tokens that are NOT digits, digit words, or recognized phone preamble
+  const nonPhoneTokens = tokens.filter(t =>
+    WORD_TO_DIGIT[t] === undefined &&
+    !/^\d+$/.test(t) &&
+    !ALLOWED_PHONE_WORDS.has(t)
+  );
+
+  // If there are substantive conversational words (more than 1 non-phone token),
+  // reject as conversational speech (e.g. "two leaks in my basement", "one question about sink").
+  if (nonPhoneTokens.length > 1) {
+    return false;
   }
 
-  return tokens.length > 0 && tokens.every(t => WORD_TO_DIGIT[t] !== undefined || /^\d+$/.test(t));
+  // If continuing pending digits with a short fragment (1 to 6 digits)
+  if (hasPending && digits.length >= 1) {
+    return true;
+  }
+
+  // If starting a new phone sequence without pending digits (e.g. "987", "nine eight seven")
+  if (digits.length >= 3) {
+    return true;
+  }
+
+  // Standalone single digit words only if the entire utterance is digit words
+  return tokens.every(t => WORD_TO_DIGIT[t] !== undefined || /^\d+$/.test(t));
 }
 
 /**
