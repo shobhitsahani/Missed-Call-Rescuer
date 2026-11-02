@@ -50,10 +50,9 @@ export function getAllowedOrigins(): string[] {
 
   const defaults = [
     'https://missed-call-rescuer.vercel.app',
+    'http://localhost:3010',
+    'http://127.0.0.1:3010',
   ];
-  if (process.env.NODE_ENV !== 'production') {
-    defaults.push('http://localhost:3010', 'http://127.0.0.1:3010');
-  }
 
   return Array.from(new Set([...defaults, ...configured]));
 }

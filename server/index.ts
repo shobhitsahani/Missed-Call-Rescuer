@@ -756,6 +756,11 @@ app.get('/api/calls/:id/transcript', (req, res) => {
   }
 });
 
+app.get('/api/summaries', (_req, res) => {
+  const rows = db.prepare('SELECT * FROM summaries').all();
+  res.json(rows);
+});
+
 app.get('/api/summaries/:callId', (req, res) => {
   const s = db.prepare('SELECT * FROM summaries WHERE call_id=?').get(req.params.callId);
   if (!s) return res.status(404).json({ error: 'not found' });

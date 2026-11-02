@@ -44,15 +44,44 @@ export async function api(path: string, init: RequestInit = {}) {
     headers.set('Content-Type', 'application/json');
   }
 
+  // 10-second default request timeout to prevent permanent loading states
+  const controller = new AbortController();
+  const timeoutMs = 10000;
+  let didTimeout = false;
+  const timeoutId = setTimeout(() => {
+    didTimeout = true;
+    controller.abort();
+  }, timeoutMs);
+
+  // If caller provided their own signal, listen to it as well
+  if (init.signal) {
+    if (init.signal.aborted) {
+      clearTimeout(timeoutId);
+      controller.abort();
+    } else {
+      init.signal.addEventListener('abort', () => {
+        clearTimeout(timeoutId);
+        controller.abort();
+      });
+    }
+  }
+
   let res: Response;
   try {
     res = await fetch(`${base}${path}`, {
       ...init,
+      signal: controller.signal,
       headers,
     });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : 'Network error';
+    clearTimeout(timeoutId);
+    let msg = err instanceof Error ? err.message : 'Network error';
+    if (didTimeout) {
+      msg = `Request timed out after ${timeoutMs / 1000}s`;
+    }
     throw new ApiError(0, `Unable to connect to server (${base}). ${msg}`);
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   if (!res.ok) {

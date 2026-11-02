@@ -61,10 +61,11 @@ export function useDashboardData() {
     if (inFlightRef.current) return inFlightRef.current;
 
     const run = (async () => {
-      const [bizResult, missedResult, callsResult] = await Promise.allSettled([
+      const [bizResult, missedResult, callsResult, summariesResult] = await Promise.allSettled([
         api('/api/business'),
         api('/api/missed-calls'),
         api('/api/calls'),
+        api('/api/summaries'),
       ]);
 
       let failures = 0;
@@ -81,25 +82,39 @@ export function useDashboardData() {
         failures++;
       }
 
+      let callsData: CallDetails[] = [];
       if (callsResult.status === 'fulfilled' && Array.isArray(callsResult.value)) {
-        const callsData = callsResult.value as CallDetails[];
+        callsData = callsResult.value as CallDetails[];
         setCalls(callsData);
-
-        const map: Record<string, SummaryDetails> = {};
-        await Promise.all(
-          callsData.map(async (call) => {
-            try {
-              const s = await api(`/api/summaries/${call.id}`);
-              if (s) map[call.id] = s;
-            } catch {}
-          })
-        );
-        setSummaries((prev) => ({ ...prev, ...map }));
       } else {
         failures++;
       }
 
-      if (failures === 3) {
+      // Populate summaries efficiently:
+      // If bulk /api/summaries endpoint succeeded, build map in O(N) with 0 extra HTTP requests
+      if (summariesResult.status === 'fulfilled' && Array.isArray(summariesResult.value)) {
+        const map: Record<string, SummaryDetails> = {};
+        for (const item of summariesResult.value) {
+          const s = item as SummaryDetails | null;
+          if (s && s.call_id) {
+            map[s.call_id] = s;
+          }
+        }
+        setSummaries((prev) => ({ ...prev, ...map }));
+      } else if (callsData.length > 0) {
+        // Fallback for older servers without bulk endpoint: fetch only recent calls (max 10) asynchronously
+        const recent = callsData.slice(0, 10);
+        void Promise.all(
+          recent.map(async (call) => {
+            try {
+              const s = await api(`/api/summaries/${call.id}`);
+              if (s) setSummaries((prev) => ({ ...prev, [call.id]: s }));
+            } catch {}
+          })
+        );
+      }
+
+      if (failures >= 3) {
         setLoadError('Cannot reach the backend. Check that the API is running and that the API base URL is correct.');
       } else if (failures > 0) {
         setLoadError('Some dashboard data could not be loaded. Live sync will retry automatically.');
@@ -130,69 +145,113 @@ export function useDashboardData() {
     };
   }, [load]);
 
-  // Open SSE event subscription directly without stream token
+  // SSE event subscription with bounded exponential backoff
   useEffect(() => {
     let es: EventSource | null = null;
-    const markConnected = () => {
-      setSseConnected(true);
-      setSseError(false);
-    };
+    let reconnectTimer: NodeJS.Timeout | null = null;
+    let isDisposed = false;
+    let backoffMs = 1000;
+    const MAX_BACKOFF_MS = 15000;
 
-    try {
-      es = new EventSource(`${getApiBase()}/api/events`);
+    const connect = () => {
+      if (isDisposed) return;
+      if (es) {
+        try { es.close(); } catch {}
+      }
 
-      es.onopen = markConnected;
-      es.onerror = () => {
+      try {
+        es = new EventSource(`${getApiBase()}/api/events`);
+
+        const markConnected = () => {
+          if (isDisposed) return;
+          backoffMs = 1000; // Reset backoff on successful connection
+          setSseConnected(true);
+          setSseError(false);
+        };
+
+        es.onopen = markConnected;
+
+        es.onerror = () => {
+          if (isDisposed) return;
+          setSseConnected(false);
+          setSseError(true);
+          try { es?.close(); } catch {}
+          es = null;
+
+          // Schedule reconnect with bounded exponential backoff and jitter
+          if (!reconnectTimer && !isDisposed) {
+            const jitter = Math.floor(Math.random() * 300);
+            const delay = Math.min(backoffMs + jitter, MAX_BACKOFF_MS);
+            backoffMs = Math.min(backoffMs * 1.5, MAX_BACKOFF_MS);
+
+            reconnectTimer = setTimeout(() => {
+              reconnectTimer = null;
+              if (!isDisposed) {
+                connect();
+                void load(); // Refresh data on reconnect
+              }
+            }, delay);
+          }
+        };
+
+        es.onmessage = () => {
+          markConnected();
+          void load();
+        };
+
+        es.addEventListener('connected', markConnected);
+
+        es.addEventListener('call_updated', () => {
+          markConnected();
+          void load();
+        });
+
+        es.addEventListener('missed_call', () => {
+          markConnected();
+          void load();
+        });
+
+        es.addEventListener('call_ended', () => {
+          markConnected();
+          void load();
+        });
+
+        es.addEventListener('data_cleared', () => {
+          markConnected();
+          void load();
+        });
+
+        es.addEventListener('summary_ready', (e: Event) => {
+          markConnected();
+          try {
+            const me = e as MessageEvent;
+            const d = JSON.parse(me.data);
+            if (d.summary) {
+              setSummaries((prev) => ({ ...prev, [d.callId]: d.summary }));
+            }
+          } catch {}
+          void load();
+        });
+      } catch (err: unknown) {
+        console.error('Failed to initialize SSE connection:', err);
         setSseConnected(false);
         setSseError(true);
-      };
+        if (!reconnectTimer && !isDisposed) {
+          reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            if (!isDisposed) connect();
+          }, 3000);
+        }
+      }
+    };
 
-      es.onmessage = () => {
-        markConnected();
-        void load();
-      };
-
-      es.addEventListener('connected', markConnected);
-
-      es.addEventListener('call_updated', () => {
-        markConnected();
-        void load();
-      });
-
-      es.addEventListener('missed_call', () => {
-        markConnected();
-        void load();
-      });
-
-      es.addEventListener('call_ended', () => {
-        markConnected();
-        void load();
-      });
-
-      es.addEventListener('data_cleared', () => {
-        markConnected();
-        void load();
-      });
-
-      es.addEventListener('summary_ready', (e: Event) => {
-        markConnected();
-        try {
-          const me = e as MessageEvent;
-          const d = JSON.parse(me.data);
-          if (d.summary) {
-            setSummaries((prev) => ({ ...prev, [d.callId]: d.summary }));
-          }
-        } catch {}
-        void load();
-      });
-    } catch (err: unknown) {
-      console.error('Failed to initialize SSE connection:', err);
-      queueMicrotask(() => setSseError(true));
-    }
+    connect();
 
     return () => {
+      isDisposed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       if (es) {
-        es.close();
+        try { es.close(); } catch {}
       }
       setSseConnected(false);
     };

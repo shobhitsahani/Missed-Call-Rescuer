@@ -168,6 +168,8 @@ export default function DashboardPage() {
                 calls={calls}
                 summaries={summaries}
                 initialLoading={initialLoading}
+                loadError={loadError}
+                onRetry={() => void load()}
                 completedCallsCount={completedCallsCount}
                 recoveryRate={completionRate}
                 overallLatency={overallLatency}

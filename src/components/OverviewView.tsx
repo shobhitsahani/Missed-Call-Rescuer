@@ -47,6 +47,8 @@ interface OverviewViewProps {
   calls: CallDetails[];
   summaries: Record<string, SummaryDetails>;
   initialLoading: boolean;
+  loadError?: string | null;
+  onRetry?: () => void;
   completedCallsCount: number;
   recoveryRate: number | null;
   overallLatency: { avgTotal: number | null; avgLlm: number | null; avgTts: number | null } | null;
@@ -65,6 +67,8 @@ export function OverviewView({
   calls,
   summaries,
   initialLoading,
+  loadError,
+  onRetry,
   completedCallsCount,
   recoveryRate,
   overallLatency,
@@ -335,13 +339,23 @@ export function OverviewView({
 
         <CardContent className="p-0">
           {recentCalls.length === 0 ? (
-            <EmptyState
-              title="No calls recorded yet"
-              description="Click 'Simulate missed call' in the top bar to test the automated callback agent."
-              actionText="Simulate missed call"
-              onAction={onSimulate}
-              loading={simulating}
-            />
+            loadError ? (
+              <EmptyState
+                title="Unable to load calls"
+                description={loadError}
+                actionText="Retry connection"
+                onAction={onRetry || onSimulate}
+                loading={initialLoading}
+              />
+            ) : (
+              <EmptyState
+                title="No calls recorded yet"
+                description="Click 'Simulate missed call' in the top bar to test the automated callback agent."
+                actionText="Simulate missed call"
+                onAction={onSimulate}
+                loading={simulating}
+              />
+            )
           ) : (
             <div className="overflow-x-auto">
               <Table>
