@@ -542,19 +542,20 @@ app.post('/api/missed-calls/simulate', (req, res) => {
     return res.status(429).json({ error: 'Rate limit exceeded: max 5 simulations per minute per IP.' });
   }
 
-  const { phone, source } = req.body || {};
+  const { phone, source, phone_verified } = req.body || {};
   const id = 'mc_' + Date.now();
   const token = crypto.randomBytes(16).toString('hex');
   const tokenExpiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
   const rowSource = source === 'test' ? 'test' : 'demo';
+  const isVerified = (phone_verified === true || phone_verified === 1) ? 1 : 0;
 
   const business = db.prepare('SELECT id FROM businesses LIMIT 1').get() as { id: string } | undefined;
   const phoneNumber = phone || '+1 (555) 010-' + Math.floor(1000 + Math.random() * 9000);
 
   db.prepare(`
-    INSERT INTO missed_calls (id, business_id, customer_phone, time, status, token, token_expires_at, source)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, business?.id || 'default', phoneNumber, new Date().toISOString(), 'new', token, tokenExpiresAt, rowSource);
+    INSERT INTO missed_calls (id, business_id, customer_phone, time, status, token, token_expires_at, source, phone_verified)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, business?.id || 'default', phoneNumber, new Date().toISOString(), 'new', token, tokenExpiresAt, rowSource, isVerified);
 
   const jobId = 'job_' + Date.now();
   db.prepare('INSERT INTO callback_jobs (id, missed_call_id, attempts, schedule, state) VALUES (?,?,?,?,?)')

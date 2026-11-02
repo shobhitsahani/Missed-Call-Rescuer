@@ -105,6 +105,8 @@ ensureColumn('missed_calls', 'token', 'TEXT');
 ensureColumn('missed_calls', 'token_expires_at', 'TEXT');
 ensureColumn('missed_calls', 'call_started_at', 'TEXT');
 ensureColumn('missed_calls', 'source', "TEXT NOT NULL DEFAULT 'demo'");
+ensureColumn('missed_calls', 'phone_verified', 'INTEGER DEFAULT 0');
+ensureColumn('calls', 'phone_verified', 'INTEGER DEFAULT 0');
 ensureColumn('summaries', 'status', "TEXT NOT NULL DEFAULT 'completed'");
 
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_missed_calls_token ON missed_calls(token);`);

@@ -8,6 +8,7 @@ import { SttClient } from './stt';
 import { notifyCallSummary } from './notify';
 import { isValidVoiceId } from '../src/lib/voices';
 import { checkCallBudget, MAX_CALL_SECONDS } from './security';
+import { PhoneStatus, isPhoneRefusal, extractPhoneFromUtterance, maskPhone } from './phone';
 
 export interface SessionTurn {
   role: string;
@@ -40,6 +41,10 @@ export interface Session {
   business: SessionBusiness;
   missedCallId: string | null;
   customerPhone: string;
+  phoneStatus: PhoneStatus;
+  verifiedCallerPhone: string | null;
+  collectedPhone: string | null;
+  lastPhonePromptTurn: number;
   state: string;
   turns: SessionTurn[];
   turnOrder: number;
@@ -290,6 +295,8 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
     customer_phone: string;
     token_expires_at?: string;
     call_started_at?: string;
+    phone_verified?: number;
+    source?: string;
   }
 
   let missed: MissedRow | undefined = undefined;
@@ -326,10 +333,19 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
 
   const business = rowToBiz(getBusinessRow());
   const callId = uuidv4();
+  const isCallerVerified = Boolean(
+    missed &&
+    missed.phone_verified === 1 &&
+    missed.customer_phone &&
+    missed.customer_phone !== 'unknown'
+  );
+
+  const initialPhoneStatus: PhoneStatus = isCallerVerified ? 'verified' : 'unknown';
+  const verifiedCallerPhone = isCallerVerified ? missed!.customer_phone : null;
   const customerPhone = missed ? missed.customer_phone : 'unknown';
   const businessId = missed ? missed.business_id : business.id;
-  db.prepare('INSERT INTO calls (id, missed_call_id, business_id, customer_phone, start_time) VALUES (?,?,?,?,?)')
-    .run(callId, missed ? missed.id : null, businessId, customerPhone, new Date().toISOString());
+  db.prepare('INSERT INTO calls (id, missed_call_id, business_id, customer_phone, start_time, phone_verified) VALUES (?,?,?,?,?,?)')
+    .run(callId, missed ? missed.id : null, businessId, customerPhone, new Date().toISOString(), isCallerVerified ? 1 : 0);
   if (missed) {
     db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run('calling', missed.id);
   }
@@ -348,6 +364,10 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
     business,
     missedCallId: missed ? missed.id : null,
     customerPhone,
+    phoneStatus: initialPhoneStatus,
+    verifiedCallerPhone,
+    collectedPhone: null,
+    lastPhonePromptTurn: 0,
     state: 'GREETING',
     turns: [],
     turnOrder: 0,
@@ -538,8 +558,46 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
     return;
   }
 
+  // 1. Phone refusal check
+  if (session.phoneStatus !== 'verified' && session.phoneStatus !== 'validated' && session.phoneStatus !== 'confirmed') {
+    if (isPhoneRefusal(text)) {
+      session.phoneStatus = 'declined';
+      console.log(`[session ${session.id}] Contact status -> declined`);
+    }
+  }
+
+  // 2. Phone extraction & validation check
+  const extracted = extractPhoneFromUtterance(text);
+  if (extracted) {
+    if (extracted.isValid && extracted.normalized) {
+      session.phoneStatus = 'validated';
+      session.collectedPhone = extracted.normalized;
+      session.customerPhone = extracted.normalized;
+      console.log(`[session ${session.id}] Contact status -> validated (${maskPhone(extracted.normalized)})`);
+      try {
+        db.prepare('UPDATE calls SET customer_phone = ?, phone_verified = 1 WHERE id = ?').run(extracted.normalized, session.id);
+        if (session.missedCallId) {
+          db.prepare('UPDATE missed_calls SET customer_phone = ?, phone_verified = 1 WHERE id = ?').run(extracted.normalized, session.missedCallId);
+        }
+      } catch (dbErr) {
+        console.error('Failed to update call customer_phone:', dbErr);
+      }
+    } else if (extracted.reason === 'incomplete') {
+      session.phoneStatus = 'collected'; // incomplete digits
+      console.log(`[session ${session.id}] Contact status -> collected (incomplete: ${extracted.digits.length} digits)`);
+    }
+  }
+
   // Add turn in memory immediately, defer SQLite DB write off critical path
   addTurn(session, 'customer', text, false, true);
+
+  const customerTurnCount = session.turns.filter((t: SessionTurn) => t.role === 'customer').length;
+  const callContext: llm.CallContext = {
+    phoneStatus: session.phoneStatus,
+    verifiedCallerPhone: session.verifiedCallerPhone,
+    collectedPhone: session.collectedPhone,
+    turnCount: customerTurnCount,
+  };
 
   setState(session, 'THINKING');
   session.generating = true;
@@ -604,7 +662,7 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
             isFirstChunk = false;
           }
         }
-      }, controller.signal);
+      }, controller.signal, callContext);
     } catch (e: unknown) {
       if (!session.cancelGeneration) {
         const errMsg = e instanceof Error ? e.message : String(e);
@@ -615,6 +673,32 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
       if (rest && !session.cancelGeneration) {
         chunkQueue.push(rest);
       }
+
+      // Deterministic Contact Policy Guard
+      if (!session.cancelGeneration && !session.ended) {
+        const askedForPhone = /phone\s*(number)?|callback\s*number|reach\s*you|best\s*number/i.test(fullReply);
+        if (askedForPhone) {
+          session.lastPhonePromptTurn = customerTurnCount;
+        }
+
+        const isWrappingUp = /goodbye|bye|have a (great|good) (day|rest)|we'?ll (be in touch|follow up|reach out)|take care|thank you for calling/i.test(fullReply) ||
+                             /that'?s (all|everything)|thank you|thanks|no that'?s it|bye/i.test(text);
+
+        if (session.phoneStatus === 'unknown' && !askedForPhone && (isWrappingUp || customerTurnCount >= 2)) {
+          const promptSentence = "Before we wrap up, what is the best phone number for our team to call you back?";
+          chunkQueue.push(promptSentence);
+          fullReply += (fullReply ? ' ' : '') + promptSentence;
+          session.lastPhonePromptTurn = customerTurnCount;
+          console.log(`[session ${session.id}] Guard enforced callback phone prompt (turn=${customerTurnCount})`);
+        } else if (session.phoneStatus === 'collected' && !askedForPhone) {
+          const repeatSentence = "Could you please repeat your full 10-digit phone number?";
+          chunkQueue.push(repeatSentence);
+          fullReply += (fullReply ? ' ' : '') + repeatSentence;
+          session.lastPhonePromptTurn = customerTurnCount;
+          console.log(`[session ${session.id}] Guard enforced repeat phone prompt for incomplete digits`);
+        }
+      }
+
       llmDone = true;
     }
   })();
@@ -627,7 +711,14 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
       await new Promise((r) => setTimeout(r, 15));
       continue;
     }
-    const chunk = chunkQueue.shift()!;
+    let chunk = chunkQueue.shift()!;
+    // Guard against redundant phone requests if phone is already verified or collected
+    if (session.phoneStatus === 'verified' || session.phoneStatus === 'validated') {
+      if (/(what(?:'s|\s+is)\s+(?:the\s+best|your)\s+phone\s+number|can\s+I\s+get\s+your\s+phone\s+number|could\s+you\s+(?:provide|give\s+me)\s+your\s+phone\s+number)/i.test(chunk)) {
+        chunk = chunk.replace(/(what(?:'s|\s+is)\s+(?:the\s+best|your)\s+phone\s+number|can\s+I\s+get\s+your\s+phone\s+number|could\s+you\s+(?:provide|give\s+me)\s+your\s+phone\s+number)[^.!?]*[.!?]?/gi, 'We have your phone number on file.');
+      }
+    }
+
     session.state = 'SPEAKING';
     send(session, { type: 'state', state: 'SPEAKING' });
 
@@ -701,7 +792,13 @@ export async function endSession(session: Session, reason: string) {
 
   setState(session, 'SUMMARIZING');
   const transcript = session.turns.map((t: SessionTurn) => `${t.role === 'agent' ? 'Agent' : 'Customer'}: ${t.text}`).join('\n');
-  const { parsed, raw, status: summaryStatus } = await llm.summarize(transcript, session.business);
+  const callContext: llm.CallContext = {
+    phoneStatus: session.phoneStatus,
+    verifiedCallerPhone: session.verifiedCallerPhone,
+    collectedPhone: session.collectedPhone,
+    turnCount: session.turns.filter((t: SessionTurn) => t.role === 'customer').length,
+  };
+  const { parsed, raw, status: summaryStatus } = await llm.summarize(transcript, session.business, callContext);
   const summaryId = uuidv4();
   const isUnavailable = summaryStatus === 'unavailable' || !parsed;
   const finalStatus = isUnavailable ? 'unavailable' : 'completed';
@@ -757,7 +854,7 @@ export async function endSession(session: Session, reason: string) {
     notifyCallSummary({
       callId: session.id,
       businessName: session.business?.name || 'Business',
-      customerPhone: session.customerPhone,
+      customerPhone: session.collectedPhone || session.verifiedCallerPhone || session.customerPhone,
       endReason: reason,
       summary,
     }).catch((err: unknown) => {
