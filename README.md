@@ -2,8 +2,9 @@
 
 Missed-Call Rescuer turns a logged missed call into a voice callback session (in the browser), finds out what the customer wanted, and gives the owner a structured summary.
 
-**Live Demo URL**: [https://missed-call-rescuer.vercel.app](https://missed-call-rescuer.vercel.app)  
-**Demo Video**: [Watch 90-second Demo Video](TODO_ADD_VIDEO_URL) *(Coming soon)*
+**Live Application**: [https://missed-call-rescuer.vercel.app](https://missed-call-rescuer.vercel.app)  
+**Source Code Repository**: [https://github.com/shobhitsahani/Missed-Call-Rescuer](https://github.com/shobhitsahani/Missed-Call-Rescuer)  
+**Backend API / Health Check**: [https://missed-call-rescuer-api.onrender.com/api/health](https://missed-call-rescuer-api.onrender.com/api/health)
 
 ---
 
@@ -17,7 +18,7 @@ Missed-Call Rescuer turns a logged missed call into a voice callback session (in
 
 ## How Judges Can Try It
 
-1. **Open the live dashboard**: Navigate to [https://missed-call-rescuer.vercel.app](https://missed-call-rescuer.vercel.app). If an access code is configured on the backend, enter your judge access code on the access screen. (If running in open demo mode, the dashboard opens immediately).
+1. **Open the live dashboard**: Navigate to [https://missed-call-rescuer.vercel.app](https://missed-call-rescuer.vercel.app). The live dashboard opens directly without requiring an access code (open hackathon demo mode).
 2. **Simulate a missed call**: Click the **"Simulate missed call"** button in the header to generate a sample inbound missed call.
 3. **Open the callback link**: Click the generated link (`/call/<token>`) to launch the browser voice callback session. Each link uses a secure 128-bit unguessable token valid for 30 minutes.
 4. **Grant microphone access**: Use Google Chrome (the app was tested in Chrome; other browsers are untested). Put on headphones to prevent speaker audio from echoing back into the microphone.
@@ -92,8 +93,6 @@ Missed-Call Rescuer is split into a frontend web dashboard (Vercel) and a real-t
 | `NEXT_PUBLIC_API_BASE` | Public URL of backend server | `https://missed-call-rescuer-api.onrender.com` | Vercel & Backend | No |
 | `PORT` | Backend HTTP & WebSocket port | `4000` | Backend | No |
 | `NODE_ENV` | Runtime environment mode | `production` | Backend & Vercel | No |
-| `ACCESS_CODE` | Shared access code for dashboard access | `hackathon-judge-2026` | Backend | **Yes** |
-| `SESSION_SECRET` | HMAC signing secret for session tokens (min 32 chars) | `your-32-char-random-secret-key-here` | Backend | **Yes** |
 | `ALLOWED_ORIGINS` | Permitted CORS & WebSocket origins (comma-separated) | `https://missed-call-rescuer.vercel.app` | Backend | No |
 | `ASSEMBLYAI_API_KEY` | AssemblyAI API key for Streaming STT & TTS | `aai_xxxxxxxxxxxxxx` | Backend | **Yes** |
 | `ASSEMBLYAI_VOICE_ID` | Default voice synthesis model ID | `aai-jane` | Backend | No |
@@ -115,7 +114,7 @@ Missed-Call Rescuer is split into a frontend web dashboard (Vercel) and a real-t
 
 - [ ] Backend `/api/health` returns `{"ok":true}`.
 - [ ] Vercel frontend loads without 404s.
-- [ ] ACCESS_CODE authentication prompts and successfully accepts code.
+- [ ] Dashboard loads immediately with full overview metrics and tables.
 - [ ] Simulate missed call produces a callback link with a 128-bit hex token.
 - [ ] Customer call page connects over WebSocket (`/ws`) and streams microphone audio.
 - [ ] Barge-in interrupts agent speech when speaking mid-sentence.
@@ -167,7 +166,7 @@ Latency measured across 3 automated verification runs (15 total conversational t
 - **In-Memory Session State**: Active voice session state is held in-memory on the active Node.js server. Horizontal scaling requires sticky sessions or an external Redis state store.
 - **Single Business Seed**: The database seeds a single business profile (`Acme Plumbing`). Multi-business tenancy is not currently merged.
 - **Free-Tier Rate Limits**: Free tier AssemblyAI and Groq credentials have concurrency limits (default `MAX_CONCURRENT_CALLS=2`).
-- **Shared Access Code**: Demo security uses a single shared access code (`ACCESS_CODE`) rather than multi-user RBAC accounts.
+- **Open Demo Mode**: The hackathon demo runs in frictionless open access mode without user logins. Rate limits, daily budget caps, unguessable call tokens, and CORS origin restrictions protect backend resources.
 
 ---
 

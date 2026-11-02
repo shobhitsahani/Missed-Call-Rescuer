@@ -61,13 +61,13 @@ flowchart TD
 
 ### 3.1. Express Server & WebSocket Routing ([`server/index.ts`](file:///c:/projects/Missed-Call-Rescuer/server/index.ts))
 - Runs on port 4000 (configurable via `PORT` environment variable).
-- **Authentication & Security**:
-  - `POST /api/auth`: Verifies `ACCESS_CODE` in constant time, rate-limited to 5/min per IP, returns a 12-hour HMAC signed JWT token.
-  - `GET /api/call-token/:token`: Public unauthenticated validation for customer callback links (validates 128-bit random token, 30-minute expiry, and single-use).
-  - `GET /api/events/token`: Generates a short-lived (60s) single-use stream token for EventSource SSE connectivity.
-  - `POST /api/admin/clear-test-data`: Authenticated test and demo data clearing action (requires `ADMIN_ENABLED=true` in production).
-  - Protected API routes require `Authorization: Bearer <token>`.
-  - Strict CORS origin validation and WebSocket upgrade origin checks.
+- **Security & Access Control**:
+  - Open demo access mode: judges access the dashboard immediately without an access code.
+  - `GET /api/call-token/:token`: Public validation for customer callback links (validates 128-bit random token, 30-minute expiry, and single-use).
+  - `POST /api/admin/clear-test-data`: Protected test and demo data clearing action (requires `ADMIN_ENABLED=true` in production).
+  - Rate limiting per IP: `POST /api/missed-calls/simulate` (5/min), WebSocket joins (10/min), voice preview (10/min), test/resend notifications (1/30s).
+  - Call budget bounds: `MAX_CONCURRENT_CALLS=2`, `MAX_CALLS_PER_DAY=100`, `MAX_CALL_SECONDS=300`.
+  - Strict CORS origin validation (`ALLOWED_ORIGINS`) and WebSocket/SSE upgrade origin checks.
 - **REST Endpoints**:
   - `GET /api/business`: Returns the configured business profile plus active `sttProvider`.
   - `GET /api/missed-calls`: Returns missed calls ordered by time descending.
