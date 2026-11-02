@@ -185,11 +185,17 @@ console.log('\nTest 9: Indian 10-digit mobile number under IN locale');
   assert.strictEqual(validInd.normalized, '+919876543210');
   assert.strictEqual(validInd.formatted, '+91 98765 43210');
 
-  // Starts with 5 (invalid Indian mobile)
-  const invalidInd = validatePhoneDigits('5876543210', 'IN');
-  assert.strictEqual(invalidInd.isValid, false);
-  assert.strictEqual(invalidInd.reason, 'invalid_pattern');
-  console.log('  ✓ Indian locale validates 6-9 prefixes to +91 and rejects 5 prefix');
+  // Same number under US locale normalizes to +1
+  const validUs = validatePhoneDigits('9876543210', 'US');
+  assert.strictEqual(validUs.isValid, true);
+  assert.strictEqual(validUs.normalized, '+19876543210');
+
+  // Ambiguous prefix under IN (e.g. 555 NANP) falls back to +1
+  const nanpFallback = validatePhoneDigits('5550108899', 'IN');
+  assert.strictEqual(nanpFallback.isValid, true);
+  assert.strictEqual(nanpFallback.normalized, '+15550108899');
+
+  console.log('  ✓ Indian locale validates 6-9 prefixes to +91 and falls back to NANP for non-Indian prefixes');
 }
 
 // -------------------------------------------------------------------
