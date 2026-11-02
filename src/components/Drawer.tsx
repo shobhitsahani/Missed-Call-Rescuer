@@ -273,7 +273,7 @@ export function Drawer({
 
               <div className="flex flex-wrap items-center gap-1.5 pt-1">
                 <StatusBadge status={call.end_reason || 'in progress'} />
-                {summary?.urgency && (
+                {summary?.urgency && (summary as any).status !== 'unavailable' && (
                   <StatusBadge status={summary.urgency} label={`Urgency: ${summary.urgency}`} />
                 )}
                 {call.outcome && (
@@ -329,7 +329,14 @@ export function Drawer({
                 </h3>
               </div>
 
-              {summary ? (
+              {summary && (summary as any).status === 'unavailable' ? (
+                <div className="rounded-lg bg-amber-500/10 border border-amber-500/30 p-4 text-xs text-amber-300 space-y-1">
+                  <p className="font-semibold text-amber-400">Summary Unavailable</p>
+                  <p className="text-muted-foreground">
+                    {summary.short_summary || 'The call ended before sufficient conversation details could be collected to generate a structured summary.'}
+                  </p>
+                </div>
+              ) : summary ? (
                 <div className="space-y-3">
                   {summary.short_summary && (
                     <div className="rounded-lg bg-primary/5 border border-primary/20 p-3.5 text-xs text-foreground leading-relaxed">

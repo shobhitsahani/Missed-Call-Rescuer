@@ -10,6 +10,7 @@ import { Drawer, CallDetails } from '@/components/Drawer';
 import { DemoModal } from '@/components/DemoModal';
 import { PageContainer } from '@/components/layout/PageContainer';
 import { useDashboardData } from '@/lib/useDashboardData';
+import { AccessScreen } from '@/components/AccessScreen';
 
 export default function DashboardPage() {
   const [currentView, setCurrentView] = useState<DashboardView>('overview');
@@ -20,6 +21,7 @@ export default function DashboardPage() {
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const {
+    isAuthorized,
     business,
     missed,
     calls,
@@ -30,12 +32,16 @@ export default function DashboardPage() {
     simulating,
     lastCallId,
     setLastCallId,
+    lastCallToken,
+    setLastCallToken,
     sseConnected,
     simulate,
     fetchTurns,
     overallLatency,
+    callsWithLatencyCount,
     completedCallsCount,
-    recoveryRate,
+    completionRate,
+    load,
   } = useDashboardData();
 
   const handleSelectCall = (call: CallDetails) => {
@@ -91,6 +97,10 @@ export default function DashboardPage() {
       ? 'Missed calls'
       : 'Settings';
 
+  if (!isAuthorized) {
+    return <AccessScreen onSuccess={load} />;
+  }
+
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col md:flex-row antialiased selection:bg-primary/20 selection:text-primary">
       {/* App Shell Left Sidebar */}
@@ -131,10 +141,15 @@ export default function DashboardPage() {
                 summaries={summaries}
                 initialLoading={initialLoading}
                 completedCallsCount={completedCallsCount}
-                recoveryRate={recoveryRate}
+                recoveryRate={completionRate}
                 overallLatency={overallLatency}
+                callsWithLatencyCount={callsWithLatencyCount}
                 lastCallId={lastCallId}
-                onDismissBanner={() => setLastCallId(null)}
+                lastCallToken={lastCallToken}
+                onDismissBanner={() => {
+                  setLastCallId(null);
+                  setLastCallToken(null);
+                }}
                 onViewAllCalls={() => setCurrentView('calls')}
                 onSelectCall={handleSelectCall}
                 onSimulate={simulate}
@@ -180,6 +195,7 @@ export default function DashboardPage() {
       <DemoModal
         isOpen={demoModalOpen}
         onClose={() => setDemoModalOpen(false)}
+        onDataCleared={load}
       />
     </div>
   );

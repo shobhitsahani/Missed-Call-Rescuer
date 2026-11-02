@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { API_BASE, api } from '@/lib/api';
+import { API_BASE, api, getStoredToken, ApiError } from '@/lib/api';
 import { CallDetails, SummaryDetails, TurnDetails, LatencyItem } from '@/components/Drawer';
 
 export type MissedCall = {
@@ -9,6 +9,9 @@ export type MissedCall = {
   customer_phone: string;
   time: string;
   status: string;
+  token?: string;
+  token_expires_at?: string;
+  source?: 'demo' | 'test';
 };
 
 export function computeAverages(rawLatency: LatencyItem[] = []) {
@@ -38,6 +41,7 @@ export function computeAverages(rawLatency: LatencyItem[] = []) {
 }
 
 export function useDashboardData() {
+  const [isAuthorized, setIsAuthorized] = useState<boolean>(true);
   const [business, setBusiness] = useState<any>(null);
   const [missed, setMissed] = useState<MissedCall[]>([]);
   const [calls, setCalls] = useState<CallDetails[]>([]);
@@ -47,21 +51,41 @@ export function useDashboardData() {
   const [initialLoading, setInitialLoading] = useState(true);
   const [simulating, setSimulating] = useState(false);
   const [lastCallId, setLastCallId] = useState<string | null>(null);
+  const [lastCallToken, setLastCallToken] = useState<string | null>(null);
   const [sseConnected, setSseConnected] = useState(false);
+
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      setIsAuthorized(false);
+    };
+    window.addEventListener('auth:unauthorized', handleUnauthorized);
+    return () => window.removeEventListener('auth:unauthorized', handleUnauthorized);
+  }, []);
 
   const load = useCallback(async () => {
     try {
       const [b, m, c] = await Promise.all([
-        api('/api/business').catch(() => null),
-        api('/api/missed-calls').catch(() => []),
-        api('/api/calls').catch(() => []),
+        api('/api/business').catch((err) => {
+          if (err instanceof ApiError && err.status === 401) setIsAuthorized(false);
+          return null;
+        }),
+        api('/api/missed-calls').catch((err) => {
+          if (err instanceof ApiError && err.status === 401) setIsAuthorized(false);
+          return [];
+        }),
+        api('/api/calls').catch((err) => {
+          if (err instanceof ApiError && err.status === 401) setIsAuthorized(false);
+          return [];
+        }),
       ]);
 
-      if (b) setBusiness(b);
+      if (b) {
+        setBusiness(b);
+        setIsAuthorized(true);
+      }
       setMissed(m || []);
       setCalls(c || []);
 
-      // Fetch summaries for calls
       if (Array.isArray(c)) {
         const map: Record<string, SummaryDetails> = {};
         await Promise.all(
@@ -72,10 +96,14 @@ export function useDashboardData() {
             } catch {}
           })
         );
-        setSummaries(prev => ({ ...prev, ...map }));
+        setSummaries((prev) => ({ ...prev, ...map }));
       }
-    } catch (e) {
-      console.error('Failed to load dashboard data:', e);
+    } catch (e: any) {
+      if (e instanceof ApiError && e.status === 401) {
+        setIsAuthorized(false);
+      } else {
+        console.error('Failed to load dashboard data:', e);
+      }
     } finally {
       setInitialLoading(false);
     }
@@ -85,49 +113,83 @@ export function useDashboardData() {
     load();
   }, [load]);
 
-  // SSE event subscription
+  // Authenticated SSE event subscription
   useEffect(() => {
-    const es = new EventSource(`${API_BASE}/api/events`);
+    if (!isAuthorized) return;
 
-    es.onopen = () => setSseConnected(true);
-    es.onerror = () => setSseConnected(false);
+    let es: EventSource | null = null;
+    let isCancelled = false;
 
-    es.onmessage = () => {
-      setSseConnected(true);
-      load();
-    };
-
-    es.addEventListener('call_updated', () => {
-      setSseConnected(true);
-      load();
-    });
-
-    es.addEventListener('missed_call', () => {
-      setSseConnected(true);
-      load();
-    });
-
-    es.addEventListener('call_ended', () => {
-      setSseConnected(true);
-      load();
-    });
-
-    es.addEventListener('summary_ready', (e: any) => {
-      setSseConnected(true);
+    async function initSSE() {
       try {
-        const d = JSON.parse(e.data);
-        if (d.summary) {
-          setSummaries(prev => ({ ...prev, [d.callId]: d.summary }));
+        const tokenRes = await api('/api/events/token').catch(() => null);
+        if (isCancelled) return;
+
+        const streamToken = tokenRes?.streamToken;
+        const sseUrl = streamToken
+          ? `${API_BASE}/api/events?stream_token=${encodeURIComponent(streamToken)}`
+          : `${API_BASE}/api/events`;
+
+        es = new EventSource(sseUrl);
+
+        es.onopen = () => setSseConnected(true);
+        es.onerror = () => {
+          setSseConnected(false);
+          // If auth expired or disconnected, close
+        };
+
+        es.onmessage = () => {
+          setSseConnected(true);
+          load();
+        };
+
+        es.addEventListener('call_updated', () => {
+          setSseConnected(true);
+          load();
+        });
+
+        es.addEventListener('missed_call', () => {
+          setSseConnected(true);
+          load();
+        });
+
+        es.addEventListener('call_ended', () => {
+          setSseConnected(true);
+          load();
+        });
+
+        es.addEventListener('data_cleared', () => {
+          setSseConnected(true);
+          load();
+        });
+
+        es.addEventListener('summary_ready', (e: any) => {
+          setSseConnected(true);
+          try {
+            const d = JSON.parse(e.data);
+            if (d.summary) {
+              setSummaries((prev) => ({ ...prev, [d.callId]: d.summary }));
+            }
+          } catch {}
+          load();
+        });
+      } catch (err: any) {
+        if (err instanceof ApiError && err.status === 401) {
+          setIsAuthorized(false);
         }
-      } catch {}
-      load();
-    });
+      }
+    }
+
+    initSSE();
 
     return () => {
-      es.close();
+      isCancelled = true;
+      if (es) {
+        es.close();
+      }
       setSseConnected(false);
     };
-  }, [load]);
+  }, [isAuthorized, load]);
 
   const simulate = useCallback(async () => {
     setSimulating(true);
@@ -135,31 +197,55 @@ export function useDashboardData() {
       const r = await api('/api/missed-calls/simulate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ source: 'demo' }),
       });
       if (r?.missedCallId) {
         setLastCallId(r.missedCallId);
       }
+      if (r?.token) {
+        setLastCallToken(r.token);
+      }
       await load();
-    } catch (e) {
+      return r;
+    } catch (e: any) {
+      if (e instanceof ApiError && e.status === 401) {
+        setIsAuthorized(false);
+      }
       console.error('Simulate missed call failed:', e);
+      throw e;
     } finally {
       setSimulating(false);
     }
   }, [load]);
 
+  const clearTestData = useCallback(async (scope: 'all' | 'test_only' = 'all') => {
+    try {
+      await api('/api/admin/clear-test-data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope }),
+      });
+      await load();
+    } catch (e: any) {
+      if (e instanceof ApiError && e.status === 401) {
+        setIsAuthorized(false);
+      }
+      throw e;
+    }
+  }, [load]);
+
   const fetchTurns = useCallback(async (callId: string) => {
     if (turnsMap[callId]) return;
-    setLoadingTurns(prev => ({ ...prev, [callId]: true }));
+    setLoadingTurns((prev) => ({ ...prev, [callId]: true }));
     try {
       const details = await api(`/api/calls/${callId}`);
       if (details?.turns) {
-        setTurnsMap(prev => ({ ...prev, [callId]: details.turns }));
+        setTurnsMap((prev) => ({ ...prev, [callId]: details.turns }));
       }
     } catch (err) {
       console.error('Failed to load call turns', err);
     } finally {
-      setLoadingTurns(prev => ({ ...prev, [callId]: false }));
+      setLoadingTurns((prev) => ({ ...prev, [callId]: false }));
     }
   }, [turnsMap]);
 
@@ -171,16 +257,24 @@ export function useDashboardData() {
     return computeAverages(allItems);
   }, [calls]);
 
-  const completedCallsCount = useMemo(() => {
-    return calls.filter(c => c.end_time || c.end_reason).length;
+  const callsWithLatencyCount = useMemo(() => {
+    return calls.filter((c) => Array.isArray(c.latency) && c.latency.length > 0).length;
   }, [calls]);
 
-  const recoveryRate = useMemo(() => {
-    if (!missed.length) return null;
+  // Strict honest completed call definition: customer spoke at least once AND valid summary generated (not failed reason)
+  const completedCallsCount = useMemo(() => {
+    return calls.filter((c) => (c as any).is_completed === true).length;
+  }, [calls]);
+
+  // Completion rate (completed calls / missed calls logged); hidden when fewer than 5 missed calls exist
+  const completionRate = useMemo(() => {
+    if (missed.length < 5) return null;
     return Math.min(100, Math.round((completedCallsCount / missed.length) * 100));
   }, [completedCallsCount, missed.length]);
 
   return {
+    isAuthorized,
+    setIsAuthorized,
     business,
     missed,
     calls,
@@ -191,11 +285,16 @@ export function useDashboardData() {
     simulating,
     lastCallId,
     setLastCallId,
+    lastCallToken,
+    setLastCallToken,
     sseConnected,
     simulate,
+    clearTestData,
     fetchTurns,
     overallLatency,
+    callsWithLatencyCount,
     completedCallsCount,
-    recoveryRate,
+    completionRate,
+    load,
   };
 }

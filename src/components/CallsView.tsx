@@ -174,9 +174,12 @@ export function CallsView({
     },
     {
       id: 'urgency',
-      accessorFn: (row) => row.summary?.urgency || 'none',
+      accessorFn: (row) => (row.summary as any)?.status === 'unavailable' ? 'unavailable' : row.summary?.urgency || 'none',
       header: 'Urgency',
       cell: ({ row }) => {
+        if ((row.original.summary as any)?.status === 'unavailable') {
+          return <span className="text-muted-foreground text-xs italic">Unavailable</span>;
+        }
         const urgency = row.original.summary?.urgency;
         if (!urgency) return <span className="text-muted-foreground">—</span>;
         return <StatusBadge status={urgency} />;
@@ -189,9 +192,12 @@ export function CallsView({
     },
     {
       id: 'reason',
-      accessorFn: (row) => row.summary?.reason || row.summary?.short_summary || '',
+      accessorFn: (row) => (row.summary as any)?.status === 'unavailable' ? 'Summary unavailable' : row.summary?.reason || row.summary?.short_summary || '',
       header: 'Reason',
       cell: ({ row }) => {
+        if ((row.original.summary as any)?.status === 'unavailable') {
+          return <span className="text-muted-foreground text-xs italic">Summary unavailable</span>;
+        }
         const text =
           row.original.summary?.reason ||
           row.original.summary?.short_summary ||
