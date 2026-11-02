@@ -31,6 +31,7 @@ import {
   ChevronRight,
   BarChart3,
   Calendar,
+  AlertCircle,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -85,25 +86,55 @@ export function OverviewView({
 
   // Compute real data for latency chart
   const chartData = useMemo(() => {
-    const points: { callId: string; label: string; total: number; llm: number; tts: number }[] = [];
-    // Process calls with latency data (up to last 10 in chronological order)
-    const validCalls = calls
-      .filter((c) => Array.isArray(c.latency) && c.latency.length > 0)
-      .slice(0, 10)
-      .reverse();
+    interface LatencyPoint {
+      callId: string;
+      label: string;
+      fullTime: string;
+      timestamp: number;
+      total: number;
+      llm: number;
+      tts: number;
+    }
+    const points: LatencyPoint[] = [];
 
-    for (const c of validCalls) {
+    // Filter calls with valid latency entries
+    for (const c of calls) {
+      if (!Array.isArray(c.latency) || c.latency.length === 0) continue;
+
       const totals: number[] = [];
       const llms: number[] = [];
       const ttss: number[] = [];
 
       for (const item of c.latency) {
         if (typeof item === 'number') {
-          totals.push(item);
+          if (Number.isFinite(item) && item > 0) totals.push(item);
+        } else if (typeof item === 'string') {
+          const num = Number(item);
+          if (Number.isFinite(num) && num > 0) totals.push(num);
         } else if (item && typeof item === 'object') {
-          if (typeof item.totalMs === 'number') totals.push(item.totalMs);
-          if (typeof item.llmFirstTokenMs === 'number') llms.push(item.llmFirstTokenMs);
-          if (typeof item.ttsFirstAudioMs === 'number') ttss.push(item.ttsFirstAudioMs);
+          const itemRecord = item as Record<string, unknown>;
+          const tot = typeof item.totalMs === 'number'
+            ? item.totalMs
+            : typeof itemRecord.totalMs === 'string'
+              ? Number(itemRecord.totalMs)
+              : null;
+          if (tot !== null && Number.isFinite(tot) && tot > 0) {
+            totals.push(tot);
+
+            const llm = typeof item.llmFirstTokenMs === 'number'
+              ? item.llmFirstTokenMs
+              : typeof itemRecord.llmFirstTokenMs === 'string'
+                ? Number(itemRecord.llmFirstTokenMs)
+                : null;
+            if (llm !== null && Number.isFinite(llm) && llm >= 0) llms.push(llm);
+
+            const tts = typeof item.ttsFirstAudioMs === 'number'
+              ? item.ttsFirstAudioMs
+              : typeof itemRecord.ttsFirstAudioMs === 'string'
+                ? Number(itemRecord.ttsFirstAudioMs)
+                : null;
+            if (tts !== null && Number.isFinite(tts) && tts >= 0) ttss.push(tts);
+          }
         }
       }
 
@@ -113,21 +144,30 @@ export function OverviewView({
         const avgT = ttss.length ? Math.round(ttss.reduce((a, b) => a + b, 0) / ttss.length) : 0;
 
         let label = 'Call';
+        let fullTime = '';
+        let timestamp = 0;
         try {
           const d = new Date(c.start_time);
+          timestamp = d.getTime();
           label = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          fullTime = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         } catch {}
 
         points.push({
           callId: c.id.slice(0, 6),
           label,
+          fullTime,
+          timestamp,
           total: avgTot,
           llm: avgL,
           tts: avgT,
         });
       }
     }
-    return points;
+
+    // Sort observations chronologically ascending and show up to the 10 most recent measurements
+    points.sort((a, b) => a.timestamp - b.timestamp);
+    return points.slice(-10);
   }, [calls]);
 
   const latencySubtitle =
@@ -243,14 +283,82 @@ export function OverviewView({
               Response time from end-of-speech to first audio output across recent calls (ms).
             </CardDescription>
           </div>
-          {chartData.length > 0 && (
+          {!initialLoading && !loadError && calls.length > 0 && (
             <Badge variant="outline" className="text-xs font-mono shrink-0">
-              {chartData.length} {chartData.length === 1 ? 'call' : 'calls'} recorded
+              {chartData.length} {chartData.length === 1 ? 'measurement' : 'measurements'} recorded
             </Badge>
           )}
         </CardHeader>
         <CardContent className="p-4 sm:p-5 pt-0">
-          {chartData.length >= 2 ? (
+          {initialLoading ? (
+            <div className="h-44 sm:h-52 w-full flex flex-col justify-center items-center gap-2 pt-4">
+              <div className="h-32 w-full rounded-lg bg-muted/30 animate-pulse" />
+              <div className="h-3.5 w-1/3 rounded bg-muted/40 animate-pulse" />
+            </div>
+          ) : loadError ? (
+            <div className="h-36 flex flex-col items-center justify-center text-center p-4 rounded-lg bg-destructive/5 border border-destructive/20 text-xs text-muted-foreground my-2">
+              <AlertCircle className="h-6 w-6 text-destructive mb-1.5" />
+              <p className="font-semibold text-foreground">Unable to load latency metrics</p>
+              <p className="mt-0.5 text-muted-foreground text-[11px] max-w-sm">{loadError}</p>
+              {onRetry && (
+                <Button variant="outline" size="sm" onClick={onRetry} className="mt-3 h-7 text-xs">
+                  Retry connection
+                </Button>
+              )}
+            </div>
+          ) : calls.length === 0 ? (
+            <div className="h-36 flex flex-col items-center justify-center text-center p-4 rounded-lg bg-muted/20 border border-border/60 text-xs text-muted-foreground my-2">
+              <PhoneMissed className="h-6 w-6 text-muted-foreground/40 mb-1.5" />
+              <p className="font-medium text-foreground">No calls recorded yet</p>
+              <p className="mt-0.5 text-muted-foreground text-[11px] max-w-sm">
+                Simulate a missed call to test the automated callback assistant and record response latency.
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onSimulate}
+                disabled={simulating}
+                className="mt-3 h-7 text-xs font-medium"
+              >
+                Simulate missed call
+              </Button>
+            </div>
+          ) : chartData.length === 0 ? (
+            <div className="h-36 flex flex-col items-center justify-center text-center p-4 rounded-lg bg-muted/20 border border-border/60 text-xs text-muted-foreground my-2">
+              <Activity className="h-6 w-6 text-muted-foreground/40 mb-1.5" />
+              <p className="font-medium text-foreground">No latency measurements recorded</p>
+              <p className="mt-0.5 text-muted-foreground text-[11px] max-w-md">
+                Latency is measured from end-of-speech to first audio output. The {calls.length} recorded call{calls.length === 1 ? '' : 's'} ended before customer speech or before an assistant response was generated.
+              </p>
+            </div>
+          ) : chartData.length === 1 ? (
+            <div className="p-4 rounded-lg bg-muted/20 border border-border/60 my-2 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-b border-border/40 pb-3">
+                <div>
+                  <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Single Observation</span>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <p className="text-xl font-bold font-mono text-primary">{chartData[0].total} ms</p>
+                    <span className="text-xs text-muted-foreground">average round-trip</span>
+                  </div>
+                </div>
+                <div className="text-left sm:text-right text-xs text-muted-foreground">
+                  <p className="font-mono font-medium text-foreground">Call {chartData[0].callId}</p>
+                  <p className="text-[11px]">{chartData[0].fullTime || chartData[0].label}</p>
+                  {(chartData[0].llm > 0 || chartData[0].tts > 0) && (
+                    <p className="text-[11px] text-muted-foreground mt-0.5 font-mono">
+                      LLM: {chartData[0].llm} ms · TTS: {chartData[0].tts} ms
+                    </p>
+                  )}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <TrendingUp className="h-4 w-4 text-primary shrink-0" />
+                <p className="text-[11px]">
+                  1 valid measurement recorded. At least 2 measurements are required to render the trend curve. Additional completed calls will populate the graph automatically.
+                </p>
+              </div>
+            </div>
+          ) : (
             <div className="h-48 sm:h-56 w-full pt-4">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
@@ -287,8 +395,16 @@ export function OverviewView({
                       color: 'var(--foreground)',
                       boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
                     }}
-                    formatter={(value) => [`${value} ms`, 'Avg Latency']}
-                    labelFormatter={(label) => `Time: ${label}`}
+                    formatter={(value, _name, item) => {
+                      const payload = item?.payload as { total?: number; llm?: number; tts?: number } | undefined;
+                      const details = payload && (payload.llm || payload.tts) ? ` (LLM: ${payload.llm ?? 0} ms, TTS: ${payload.tts ?? 0} ms)` : '';
+                      return [`${value} ms${details}`, 'Avg Latency'];
+                    }}
+                    labelFormatter={(label, payload) => {
+                      const item = payload?.[0]?.payload as { callId?: string; fullTime?: string } | undefined;
+                      const callId = item?.callId ? `Call ${item.callId} · ` : '';
+                      return `${callId}${item?.fullTime || label}`;
+                    }}
                   />
                   <Area
                     type="monotone"
@@ -300,14 +416,6 @@ export function OverviewView({
                   />
                 </AreaChart>
               </ResponsiveContainer>
-            </div>
-          ) : (
-            <div className="h-32 flex flex-col items-center justify-center text-center p-4 rounded-lg bg-muted/20 border border-border/60 text-xs text-muted-foreground my-2">
-              <Activity className="h-6 w-6 text-muted-foreground/40 mb-1.5" />
-              <p className="font-medium text-foreground">Awaiting multiple call runs</p>
-              <p className="mt-0.5 text-muted-foreground text-[11px]">
-                Simulate 2 or more calls to view the latency trend curve with real data.
-              </p>
             </div>
           )}
         </CardContent>
@@ -373,13 +481,21 @@ export function OverviewView({
                 <TableBody>
                   {recentCalls.map((call) => {
                     const summ = summaries[call.id];
-                    // Compute call latency
+                    // Compute call latency using robust numeric validation
                     let latencyDisplay = '—';
                     if (Array.isArray(call.latency) && call.latency.length > 0) {
                       const vals: number[] = [];
                       for (const l of call.latency) {
-                        if (typeof l === 'number') vals.push(l);
-                        else if (l && typeof l.totalMs === 'number') vals.push(l.totalMs);
+                        const tot = typeof l === 'number'
+                          ? l
+                          : typeof l === 'string'
+                            ? Number(l)
+                            : (l && typeof l === 'object')
+                              ? (typeof l.totalMs === 'number' ? l.totalMs : Number((l as Record<string, unknown>).totalMs))
+                              : null;
+                        if (tot !== null && Number.isFinite(tot) && tot > 0) {
+                          vals.push(tot);
+                        }
                       }
                       if (vals.length > 0) {
                         latencyDisplay = `${Math.round(vals.reduce((a, b) => a + b, 0) / vals.length)} ms`;

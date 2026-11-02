@@ -16,7 +16,7 @@ export type MissedCall = {
 };
 
 export function computeAverages(rawLatency: LatencyItem[] = []) {
-  if (!rawLatency || !rawLatency.length) return null;
+  if (!rawLatency || !Array.isArray(rawLatency) || !rawLatency.length) return null;
   const totals: number[] = [];
   const llms: number[] = [];
   const ttss: number[] = [];
@@ -24,12 +24,41 @@ export function computeAverages(rawLatency: LatencyItem[] = []) {
 
   for (const item of rawLatency) {
     if (typeof item === 'number') {
-      totals.push(item);
+      if (Number.isFinite(item) && item > 0) totals.push(item);
+    } else if (typeof item === 'string') {
+      const parsed = Number(item);
+      if (Number.isFinite(parsed) && parsed > 0) totals.push(parsed);
     } else if (item && typeof item === 'object') {
-      if (typeof item.totalMs === 'number') totals.push(item.totalMs);
-      if (typeof item.llmFirstTokenMs === 'number') llms.push(item.llmFirstTokenMs);
-      if (typeof item.ttsFirstAudioMs === 'number') ttss.push(item.ttsFirstAudioMs);
-      if (typeof item.turnDetectionMs === 'number') turnDetections.push(item.turnDetectionMs);
+      const itemRecord = item as Record<string, unknown>;
+      const rawTot = typeof item.totalMs === 'number'
+        ? item.totalMs
+        : typeof itemRecord.totalMs === 'string'
+          ? Number(itemRecord.totalMs)
+          : null;
+      if (rawTot !== null && Number.isFinite(rawTot) && rawTot > 0) {
+        totals.push(rawTot);
+
+        const rawLlm = typeof item.llmFirstTokenMs === 'number'
+          ? item.llmFirstTokenMs
+          : typeof itemRecord.llmFirstTokenMs === 'string'
+            ? Number(itemRecord.llmFirstTokenMs)
+            : null;
+        if (rawLlm !== null && Number.isFinite(rawLlm) && rawLlm >= 0) llms.push(rawLlm);
+
+        const rawTts = typeof item.ttsFirstAudioMs === 'number'
+          ? item.ttsFirstAudioMs
+          : typeof itemRecord.ttsFirstAudioMs === 'string'
+            ? Number(itemRecord.ttsFirstAudioMs)
+            : null;
+        if (rawTts !== null && Number.isFinite(rawTts) && rawTts >= 0) ttss.push(rawTts);
+
+        const rawTurn = typeof item.turnDetectionMs === 'number'
+          ? item.turnDetectionMs
+          : typeof itemRecord.turnDetectionMs === 'string'
+            ? Number(itemRecord.turnDetectionMs)
+            : null;
+        if (rawTurn !== null && Number.isFinite(rawTurn) && rawTurn >= 0) turnDetections.push(rawTurn);
+      }
     }
   }
 
@@ -332,7 +361,10 @@ export function useDashboardData() {
   }, [calls]);
 
   const callsWithLatencyCount = useMemo(() => {
-    return calls.filter((c) => Array.isArray(c.latency) && c.latency.length > 0).length;
+    return calls.filter((c) => {
+      const avg = computeAverages(c.latency);
+      return avg !== null && avg.avgTotal !== null;
+    }).length;
   }, [calls]);
 
   // Strict honest completed call definition: customer spoke at least once AND valid summary generated (not failed reason)

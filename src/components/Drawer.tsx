@@ -21,6 +21,7 @@ import {
   formatJsonTranscript,
   getTranscriptFilename,
 } from '@/lib/transcript';
+import { computeAverages } from '@/lib/useDashboardData';
 import {
   Copy,
   Check,
@@ -218,26 +219,12 @@ export function Drawer({
 
   if (!call) return null;
 
-  // Compute latency stats
-  const totals: number[] = [];
-  const llms: number[] = [];
-  const ttss: number[] = [];
-  const turnDetections: number[] = [];
-  for (const item of call.latency || []) {
-    if (typeof item === 'number') {
-      totals.push(item);
-    } else if (item && typeof item === 'object') {
-      if (typeof item.totalMs === 'number') totals.push(item.totalMs);
-      if (typeof item.llmFirstTokenMs === 'number') llms.push(item.llmFirstTokenMs);
-      if (typeof item.ttsFirstAudioMs === 'number') ttss.push(item.ttsFirstAudioMs);
-      if (typeof item.turnDetectionMs === 'number') turnDetections.push(item.turnDetectionMs);
-    }
-  }
-
-  const avgTotal = totals.length ? Math.round(totals.reduce((a, b) => a + b, 0) / totals.length) : null;
-  const avgLlm = llms.length ? Math.round(llms.reduce((a, b) => a + b, 0) / llms.length) : null;
-  const avgTts = ttss.length ? Math.round(ttss.reduce((a, b) => a + b, 0) / ttss.length) : null;
-  const avgTurn = turnDetections.length ? Math.round(turnDetections.reduce((a, b) => a + b, 0) / turnDetections.length) : null;
+  // Compute latency stats using standard helper
+  const averages = computeAverages(call.latency || []);
+  const avgTotal = averages?.avgTotal ?? null;
+  const avgLlm = averages?.avgLlm ?? null;
+  const avgTts = averages?.avgTts ?? null;
+  const avgTurn = averages?.avgTurn ?? null;
 
   return (
     <Sheet open={isOpen} onOpenChange={(open) => !open && onClose()}>

@@ -182,6 +182,11 @@ export class SttClient {
           error?: string;
           error_code?: string | number;
           text?: string;
+          transcript?: string;
+          audio_start_ms?: number;
+          turn_order?: number;
+          end_of_turn?: boolean;
+          end_of_turn_confidence?: number;
           words?: Array<{ text?: string; start?: number; end?: number; confidence?: number }>;
           [key: string]: unknown;
         };
@@ -202,12 +207,12 @@ export class SttClient {
         }
 
         if (msg.type === 'SpeechStarted') {
-          this.speechStartCallback?.(msg.audio_start_ms);
+          this.speechStartCallback?.(typeof msg.audio_start_ms === 'number' ? msg.audio_start_ms : undefined);
           return;
         }
 
         if (msg.type === 'Turn') {
-          const transcript = (msg.transcript || '').trim();
+          const transcript = typeof msg.transcript === 'string' ? msg.transcript.trim() : '';
           if (msg.end_of_turn) {
             this.clearRecentAudio();
             const totalAudioMs = Math.round(this.totalAudioBytesSent / 32);
@@ -221,8 +226,8 @@ export class SttClient {
             this.finalTurnCallback?.(
               transcript,
               msg.words || [],
-              msg.turn_order,
-              msg.end_of_turn_confidence,
+              typeof msg.turn_order === 'number' ? msg.turn_order : undefined,
+              typeof msg.end_of_turn_confidence === 'number' ? msg.end_of_turn_confidence : undefined,
               turnDetectionMs
             );
           } else {

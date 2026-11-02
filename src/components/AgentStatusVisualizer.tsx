@@ -41,8 +41,8 @@ export function AgentStatusVisualizer({ state, progressText }: AgentStatusVisual
         <span className="w-1 rounded-full bg-primary animate-wave-5" />
       </div>
     );
-  } else if (norm === 'SUMMARIZING' || norm === 'ENDING') {
-    label = 'Finalizing summary...';
+  } else if (norm === 'SUMMARIZING' || norm === 'ENDING' || norm === 'FINALIZING') {
+    label = progressText || (norm === 'FINALIZING' ? 'Wrapping up call...' : 'Finalizing summary...');
     indicator = (
       <div className="h-4 w-4 rounded-full border-2 border-primary/30 border-t-primary animate-spin" aria-hidden="true" />
     );

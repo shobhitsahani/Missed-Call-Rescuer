@@ -22,6 +22,15 @@ export interface SessionUsage {
   llmTokens: number;
 }
 
+export interface LatencyMetricItem {
+  totalMs: number;
+  llmFirstTokenMs: number | null;
+  ttsFirstAudioMs: number | null;
+  turnDetectionMs?: number | null;
+}
+
+export type SessionLatency = number | LatencyMetricItem;
+
 export interface SessionBusiness {
   id: string;
   name: string;
@@ -33,6 +42,7 @@ export interface SessionBusiness {
   language?: string;
   timezone: string;
   owner_email?: string;
+  [key: string]: unknown;
 }
 
 export interface Session {
@@ -54,7 +64,7 @@ export interface Session {
   abortController: AbortController | null;
   ended: boolean;
   startedAt: number;
-  latencies: number[];
+  latencies: SessionLatency[];
   usage: SessionUsage;
   silenceTimer: NodeJS.Timeout | null;
   maxTimer: NodeJS.Timeout | null;
@@ -67,6 +77,12 @@ export interface Session {
   sttProvider: string;
   notificationDispatched?: boolean;
   disconnectTimer?: NodeJS.Timeout | null;
+  finalizing?: boolean;
+  pendingEndReason?: string;
+  terminationTimer?: NodeJS.Timeout | null;
+  fallbackTerminationTimer?: NodeJS.Timeout | null;
+  playbackCompleted?: boolean;
+  finalAudioSent?: boolean;
 }
 
 export const sessions = new Map<string, Session>();
@@ -114,6 +130,49 @@ function detectOptOut(text: string) {
 function detectWrongNumber(text: string) {
   const t = (text || '').toLowerCase();
   return WRONG_NUMBER.some(p => t.includes(p));
+}
+
+export function isClosingSignoff(text: string): boolean {
+  const clean = (text || '').trim();
+  // Any sentence with a trailing question mark is an ongoing inquiry, not a sign-off
+  if (/[?]\s*$/.test(clean)) return false;
+
+  const lower = clean.toLowerCase();
+
+  // Direct standalone sign-offs
+  if (/^(?:goodbye|bye|bye\s+now|bye-bye|take\s+care|have\s+a\s+(?:great|good|wonderful|nice)\s+(?:day|rest\s+of\s+your\s+day|afternoon|evening|weekend))[.!]?$/i.test(lower)) {
+    return true;
+  }
+
+  // Compound sign-off statements (must not end in a question and must conclude with closing sentiment)
+  const hasClosingPhrase = /(?:thank\s+you\s+for\s+calling|thanks\s+for\s+calling|have\s+a\s+(?:great|good|wonderful|nice)\s+(?:day|rest\s+of\s+your\s+day|afternoon|evening|weekend)|goodbye|bye|take\s+care|we'?ll\s+be\s+in\s+touch|talk\s+to\s+you\s+soon)/i.test(lower);
+  const hasSignoffEnding = /(?:goodbye|bye|take\s+care|have\s+a\s+(?:great|good|wonderful|nice)\s+(?:day|rest\s+of\s+your\s+day|afternoon|evening|weekend)|in\s+touch)[.!]?$/i.test(lower);
+
+  return hasClosingPhrase && hasSignoffEnding;
+}
+
+export function isCustomerWrapUp(text: string): boolean {
+  const lower = (text || '').trim().toLowerCase();
+  return /(?:that'?s\s+(?:all|everything)|thank\s+you|thanks|no,?\s+that'?s\s+it|no\s+more|you\s+too|all\s+good|all\s+set|bye|goodbye|have\s+a\s+(?:good|great)\s+day)/i.test(lower);
+}
+
+export function isFinalClosingTurn(agentText: string, customerText: string, hasExplicitSignal = false): boolean {
+  const cleanAgent = (agentText || '').trim();
+  // Never terminate if the agent asked a question
+  if (/[?]\s*$/.test(cleanAgent)) return false;
+
+  // 1. Explicit internal signal from LLM ([CALL_COMPLETE])
+  if (hasExplicitSignal) return true;
+
+  // 2. Structured conversation closing:
+  // If agent delivered a conclusive sign-off AND either customer signaled wrap-up or agent gave complete parting statement
+  if (isClosingSignoff(cleanAgent)) {
+    if (isCustomerWrapUp(customerText) || /thank\s+you\s+for\s+calling/i.test(cleanAgent) || /^(?:goodbye|bye|take\s+care)/i.test(cleanAgent)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function sanitizeErrorMsg(msg?: string): string {
@@ -242,13 +301,14 @@ async function speakSentence(
   sentence: string,
   onFirstAudio?: () => void,
   onGenerateSent?: () => void
-): Promise<boolean> {
-  if (session.ended || session.cancelGeneration) return false;
+): Promise<{ ok: boolean; pcmBytes: number }> {
+  if (session.ended || session.cancelGeneration) return { ok: false, pcmBytes: 0 };
   session.currentAgentText = sentence;
   session.agentSpeakingStartTime = Date.now();
   send(session, { type: 'agent_text', text: sentence });
   session.usage.ttsChars += sentence.length;
 
+  let totalBytes = 0;
   const trySpeak = async (): Promise<boolean> => {
     let firstChunk = true;
     for await (const chunk of session.tts.speak(sentence, onGenerateSent)) {
@@ -260,27 +320,30 @@ async function speakSentence(
         firstChunk = false;
         if (onFirstAudio) onFirstAudio();
       }
+      totalBytes += chunk.byteLength || chunk.length || 0;
       sendBinary(session, chunk);
     }
     return true;
   };
 
   try {
-    return await trySpeak();
+    const ok = await trySpeak();
+    return { ok, pcmBytes: totalBytes };
   } catch (err: unknown) {
-    if (session.cancelGeneration || session.ended) return true;
+    if (session.cancelGeneration || session.ended) return { ok: true, pcmBytes: totalBytes };
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error('TTS error:', errMsg);
     // retry once
     try {
       await session.tts.connectWithRetry();
-      return await trySpeak();
+      const ok = await trySpeak();
+      return { ok, pcmBytes: totalBytes };
     } catch (err2: unknown) {
       const err2Msg = err2 instanceof Error ? err2.message : String(err2);
       console.error('TTS retry failed:', err2Msg);
       send(session, { type: 'error', message: 'Voice synthesis failed. Ending call.' });
       await endSession(session, 'error');
-      return false;
+      return { ok: false, pcmBytes: totalBytes };
     }
   }
 }
@@ -329,6 +392,9 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
       (s) => s.missedCallId === missed?.id && !s.ended
     );
     if (existingSession) {
+      if (existingSession.finalizing || existingSession.state === 'FINALIZING' || existingSession.state === 'ENDING' || existingSession.state === 'DONE') {
+        throw new Error('This callback link has already been used');
+      }
       if (existingSession.disconnectTimer) {
         clearTimeout(existingSession.disconnectTimer);
         existingSession.disconnectTimer = null;
@@ -448,7 +514,7 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
     });
 
     stt.onPartial((text) => {
-      if (session.ended) return;
+      if (session.ended || session.finalizing) return;
       send(session, { type: 'partial', text });
 
       // Server-side barge-in decision
@@ -462,7 +528,7 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
     });
 
     stt.onFinalTurn((text, _words, _turnOrder, _confidence, turnDetectionMs) => {
-      if (session.ended) return;
+      if (session.ended || session.finalizing) return;
       session.stt?.clearRecentAudio();
       const cleaned = (text || '').trim();
       if (!cleaned) return;
@@ -532,8 +598,8 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
   session.agentSpeakingStartTime = Date.now();
   send(session, { type: 'state', state: 'SPEAKING' });
   try {
-    const ok = await withStageTimeout(speakSentence(session, greeting, () => {}), 10000, 'Greeting audio playback');
-    if (!ok || session.ended) return session;
+    const speakRes = await withStageTimeout(speakSentence(session, greeting, () => {}), 10000, 'Greeting audio playback');
+    if (!speakRes.ok || session.ended) return session;
   } catch (err: unknown) {
     const errorMsg = sanitizeErrorMsg(err instanceof Error ? err.message : String(err));
     console.error(`[session ${session.id}] stage=greeting error=${errorMsg}`);
@@ -554,7 +620,7 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
 }
 
 export async function handleCustomerUtterance(session: Session, text: string, turnDetectionMs?: number | null) {
-  if (session.ended) return;
+  if (session.ended || session.finalizing) return;
   text = (text || '').trim();
   if (!text) return;
   if (session.generating) {
@@ -565,27 +631,33 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
   const t_turn_end = Date.now();
 
   if (detectOptOut(text)) {
+    session.finalizing = true;
+    session.pendingEndReason = 'opted_out';
     addTurn(session, 'customer', text, false);
     const reply = "I understand. I'll make sure we stop calling. Sorry for the inconvenience. Goodbye.";
     session.state = 'SPEAKING';
     session.currentAgentText = reply;
     session.agentSpeakingStartTime = Date.now();
     send(session, { type: 'state', state: 'SPEAKING' });
-    await speakSentence(session, reply, () => {});
+    const speakRes = await speakSentence(session, reply, () => {});
     addTurn(session, 'agent', reply, false);
-    setTimeout(() => endSession(session, 'opted_out'), 1500);
+    const durationMs = Math.round((speakRes.pcmBytes || 0) / 48);
+    scheduleFinalization(session, 'opted_out', durationMs);
     return;
   }
   if (detectWrongNumber(text)) {
+    session.finalizing = true;
+    session.pendingEndReason = 'wrong_number';
     addTurn(session, 'customer', text, false);
     const reply = "I'm sorry about that. I'll update our records. Have a good day. Goodbye.";
     session.state = 'SPEAKING';
     session.currentAgentText = reply;
     session.agentSpeakingStartTime = Date.now();
     send(session, { type: 'state', state: 'SPEAKING' });
-    await speakSentence(session, reply, () => {});
+    const speakRes = await speakSentence(session, reply, () => {});
     addTurn(session, 'agent', reply, false);
-    setTimeout(() => endSession(session, 'wrong_number'), 1500);
+    const durationMs = Math.round((speakRes.pcmBytes || 0) / 48);
+    scheduleFinalization(session, 'wrong_number', durationMs);
     return;
   }
 
@@ -670,25 +742,47 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
     if (firstAudioSent || session.cancelGeneration) return;
     firstAudioSent = true;
     t_tts_first_audio = Date.now();
-    const llmFirstTokenMs = t_llm_first_token !== null ? t_llm_first_token - t_turn_end : null;
-    const ttsFirstAudioMs = (t_tts_generate_sent !== null && t_tts_first_audio !== null) ? t_tts_first_audio - t_tts_generate_sent : null;
+    const llmFirstTokenMs = (t_llm_first_token !== null && t_llm_first_token >= t_turn_end)
+      ? t_llm_first_token - t_turn_end
+      : null;
+    const ttsFirstAudioMs = (t_tts_generate_sent !== null && t_tts_first_audio !== null && t_tts_first_audio >= t_tts_generate_sent)
+      ? t_tts_first_audio - t_tts_generate_sent
+      : null;
     const totalMs = t_tts_first_audio - t_turn_end;
 
-    session.latencies.push({
+    // Validate that totalMs is a positive finite number representing elapsed ms
+    if (typeof totalMs !== 'number' || !Number.isFinite(totalMs) || totalMs <= 0) {
+      console.warn(`[turn] Rejected invalid latency measurement: totalMs=${totalMs}`);
+      return;
+    }
+
+    const metricItem: LatencyMetricItem = {
       totalMs,
-      llmFirstTokenMs,
-      ttsFirstAudioMs,
-      turnDetectionMs: turnDetectionMs ?? null,
-    });
+      llmFirstTokenMs: (llmFirstTokenMs !== null && Number.isFinite(llmFirstTokenMs) && llmFirstTokenMs >= 0) ? llmFirstTokenMs : null,
+      ttsFirstAudioMs: (ttsFirstAudioMs !== null && Number.isFinite(ttsFirstAudioMs) && ttsFirstAudioMs >= 0) ? ttsFirstAudioMs : null,
+      turnDetectionMs: (typeof turnDetectionMs === 'number' && Number.isFinite(turnDetectionMs) && turnDetectionMs >= 0) ? turnDetectionMs : null,
+    };
+
+    session.latencies.push(metricItem);
+
+    // Persist immediately to SQLite so live dashboard reads updated latency even mid-call
+    try {
+      db.prepare('UPDATE calls SET latency_json=? WHERE id=?')
+        .run(JSON.stringify(session.latencies), session.id);
+      events.broadcast('call_updated', { callId: session.id });
+    } catch (err) {
+      console.error(`[session ${session.id}] Error saving turn latency:`, err);
+    }
+
     send(session, {
       type: 'metrics',
       totalMs,
-      llmFirstTokenMs,
-      ttsFirstAudioMs,
-      turnDetectionMs: turnDetectionMs ?? null,
+      llmFirstTokenMs: metricItem.llmFirstTokenMs,
+      ttsFirstAudioMs: metricItem.ttsFirstAudioMs,
+      turnDetectionMs: metricItem.turnDetectionMs,
       timeToFirstAudio: totalMs,
     });
-    console.log(`[turn] turn_detection=${turnDetectionMs ?? '-'}ms llm_first_token=${llmFirstTokenMs ?? '-'}ms tts_first_audio=${ttsFirstAudioMs ?? '-'}ms total=${totalMs}ms`);
+    console.log(`[turn] turn_detection=${turnDetectionMs ?? '-'}ms llm_first_token=${metricItem.llmFirstTokenMs ?? '-'}ms tts_first_audio=${metricItem.ttsFirstAudioMs ?? '-'}ms total=${totalMs}ms`);
   };
 
   const messages: llm.ChatMessage[] = session.turns
@@ -765,7 +859,7 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
             chunkQueue.push(repeatSentence);
           } else {
             // Strip any trailing incomplete clause without end punctuation to avoid run-on sentences
-            const completeSentences = fullReply.match(/^.*[.!](\s+|$)/s);
+            const completeSentences = fullReply.match(/^[\s\S]*[.!](\s+|$)/);
             const prefix = completeSentences ? completeSentences[0].trim() : '';
             fullReply = (prefix ? prefix + ' ' : '') + repeatSentence;
             chunkQueue.length = 0;
@@ -782,6 +876,7 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
 
   // consumer
   let isFirstConsumerChunk = true;
+  let totalAudioPcmBytes = 0;
   while (!session.ended && !session.cancelGeneration) {
     if (chunkQueue.length === 0) {
       if (llmDone) break;
@@ -789,6 +884,10 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
       continue;
     }
     let chunk = chunkQueue.shift()!;
+    // Strip [CALL_COMPLETE] token from chunks so TTS never synthesizes it
+    chunk = chunk.replace(/\[CALL_COMPLETE\]/gi, '').trim();
+    if (!chunk) continue;
+
     // Guard against redundant phone requests if phone is already verified or collected
     if (session.phoneStatus === 'verified' || session.phoneStatus === 'validated' || session.phoneStatus === 'confirmed') {
       const phonePromptPattern = /(what(?:'s|\s+is)\s+(?:the\s+best|your)\s+phone\s+number|can\s+I\s+get\s+your\s+phone\s+number|could\s+you\s+(?:provide|give\s+me|repeat)\s+(?:your\s+)?(?:full\s+)?(?:10-digit\s+)?phone\s+number|please\s+repeat\s+(?:your\s+)?(?:full\s+)?(?:10-digit\s+)?phone\s+number)/i;
@@ -809,9 +908,10 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
       if (t_tts_generate_sent === null) t_tts_generate_sent = Date.now();
     } : undefined;
 
-    const ok = await speakSentence(session, chunk, markFirstAudio, onGenSent);
+    const speakRes = await speakSentence(session, chunk, markFirstAudio, onGenSent);
+    if (speakRes.pcmBytes) totalAudioPcmBytes += speakRes.pcmBytes;
     isFirstConsumerChunk = false;
-    if (!ok || session.ended || session.cancelGeneration) break;
+    if (!speakRes.ok || session.ended || session.cancelGeneration) break;
   }
 
   // wait for llm to finish (if not cancelled)
@@ -827,21 +927,79 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
   if (session.cancelGeneration) {
     // Persist the partial agent reply as interrupted so the transcript and
     // summary reflect what the customer actually heard.
-    const partialReply = fullReply.trim();
+    const partialReply = fullReply.replace(/\[CALL_COMPLETE\]/gi, '').trim();
     if (partialReply) addTurn(session, 'agent', partialReply, true);
     return;
   }
 
   if (!session.ended) {
-    // record agent turn
-    const finalText = fullReply.trim();
-    if (finalText) addTurn(session, 'agent', finalText, false);
-    setState(session, 'LISTENING');
+    const hasCallCompleteTag = /\[CALL_COMPLETE\]/i.test(fullReply);
+    const cleanedText = fullReply.replace(/\[CALL_COMPLETE\]/gi, '').trim();
+    const isFinal = isFinalClosingTurn(cleanedText, text, hasCallCompleteTag);
+
+    if (cleanedText) addTurn(session, 'agent', cleanedText, false);
+
+    if (isFinal) {
+      const audioDurationMs = Math.round(totalAudioPcmBytes / 48);
+      console.log(`[session ${session.id}] Final closing sign-off detected ("${cleanedText.slice(0, 60)}..."). Initiating call finalization.`);
+      scheduleFinalization(session, 'assistant_ended', audioDurationMs);
+    } else {
+      setState(session, 'LISTENING');
+    }
   }
 }
 
-export function bargeIn(session: Session) {
+export function scheduleFinalization(session: Session, reason: string, audioDurationMs = 0) {
   if (session.ended) return;
+  session.finalizing = true;
+  session.pendingEndReason = reason;
+  setState(session, 'FINALIZING');
+
+  // Signal client that the audio stream for the final turn has concluded
+  send(session, { type: 'agent_audio_end', isFinal: true });
+
+  // Bounded fallback: ensures call does not remain open forever if client playback_complete is lost
+  // Audio playback is 100% protected: fallback timeout is generously after expected audio completion + 1s.
+  const fallbackMs = Math.max(5000, audioDurationMs + 4000);
+  if (session.fallbackTerminationTimer) clearTimeout(session.fallbackTerminationTimer);
+  session.fallbackTerminationTimer = setTimeout(() => {
+    session.fallbackTerminationTimer = null;
+    if (!session.ended) {
+      console.log(`[session ${session.id}] Playback completion acknowledgement not received within ${fallbackMs}ms; concluding call.`);
+      void endSession(session, session.pendingEndReason || reason);
+    }
+  }, fallbackMs);
+}
+
+export function handlePlaybackComplete(session: Session) {
+  if (session.ended || !session.finalizing) return;
+  if (session.playbackCompleted) return;
+  session.playbackCompleted = true;
+  console.log(`[session ${session.id}] Client confirmed final playback complete. Waiting 1 second before terminating.`);
+
+  // Cancel fallback timer since client confirmed playback completion
+  if (session.fallbackTerminationTimer) {
+    clearTimeout(session.fallbackTerminationTimer);
+    session.fallbackTerminationTimer = null;
+  }
+
+  // Cancel any existing termination timer to prevent duplicates
+  if (session.terminationTimer) {
+    clearTimeout(session.terminationTimer);
+    session.terminationTimer = null;
+  }
+
+  // Exactly 1 second after playback completes:
+  session.terminationTimer = setTimeout(() => {
+    session.terminationTimer = null;
+    if (!session.ended) {
+      void endSession(session, session.pendingEndReason || 'assistant_ended');
+    }
+  }, 1000);
+}
+
+export function bargeIn(session: Session) {
+  if (session.ended || session.finalizing) return;
   session.cancelGeneration = true;
   session.generating = false;
   if (session.abortController) {
@@ -855,6 +1013,19 @@ export function bargeIn(session: Session) {
 export function handleSocketDisconnect(session: Session) {
   if (session.ended) return;
   session.ws = null;
+  if (session.finalizing) {
+    console.log(`[session ${session.id}] Socket disconnected during finalization. Completing call immediately.`);
+    if (session.terminationTimer) {
+      clearTimeout(session.terminationTimer);
+      session.terminationTimer = null;
+    }
+    if (session.fallbackTerminationTimer) {
+      clearTimeout(session.fallbackTerminationTimer);
+      session.fallbackTerminationTimer = null;
+    }
+    endSession(session, session.pendingEndReason || 'assistant_ended').catch(() => {});
+    return;
+  }
   if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
   // Give mid-call page reloads or transient network disconnects a 12-second grace period
   // to reconnect without terminating the ongoing call session.
@@ -870,6 +1041,15 @@ export function handleSocketDisconnect(session: Session) {
 export async function endSession(session: Session, reason: string) {
   if (session.ended) return;
   session.ended = true;
+  session.finalizing = true;
+  if (session.terminationTimer) {
+    clearTimeout(session.terminationTimer);
+    session.terminationTimer = null;
+  }
+  if (session.fallbackTerminationTimer) {
+    clearTimeout(session.fallbackTerminationTimer);
+    session.fallbackTerminationTimer = null;
+  }
   if (session.disconnectTimer) {
     clearTimeout(session.disconnectTimer);
     session.disconnectTimer = null;

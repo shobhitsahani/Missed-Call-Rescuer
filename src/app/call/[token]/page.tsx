@@ -64,6 +64,9 @@ export default function CallPage() {
 
   const endedRef = useRef(false);
   const summaryReceivedRef = useRef(false);
+  const finalAudioSentRef = useRef(false);
+  const playbackCompleteSentRef = useRef(false);
+  const finalTimerRef = useRef<NodeJS.Timeout | null>(null);
   const stateRef = useRef(state);
   const transcriptBottomRef = useRef<HTMLDivElement | null>(null);
 
@@ -210,6 +213,21 @@ export default function CallPage() {
     return audioCtxRef.current;
   }
 
+  const notifyPlaybackComplete = useCallback(() => {
+    if (playbackCompleteSentRef.current) return;
+    playbackCompleteSentRef.current = true;
+    if (finalTimerRef.current) {
+      clearTimeout(finalTimerRef.current);
+      finalTimerRef.current = null;
+    }
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: 'playback_complete' }));
+      } catch {}
+    }
+  }, []);
+
   function playPcmChunk(arrayBuffer: ArrayBuffer) {
     const ctx = initAudio();
     if (ctx.state === 'closed') return;
@@ -228,6 +246,9 @@ export default function CallPage() {
     sourcesRef.current.push(src);
     src.onended = () => {
       sourcesRef.current = sourcesRef.current.filter((s) => s !== src);
+      if (finalAudioSentRef.current && sourcesRef.current.length === 0) {
+        notifyPlaybackComplete();
+      }
     };
   }
 
@@ -277,6 +298,10 @@ export default function CallPage() {
 
   function releaseAudio() {
     stopAllAudio();
+    if (finalTimerRef.current) {
+      clearTimeout(finalTimerRef.current);
+      finalTimerRef.current = null;
+    }
     if (audioCtxRef.current) {
       try {
         audioCtxRef.current.close();
@@ -292,6 +317,7 @@ export default function CallPage() {
       endedRef.current = true;
       if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
       if (endFallbackRef.current) clearTimeout(endFallbackRef.current);
+      if (finalTimerRef.current) clearTimeout(finalTimerRef.current);
       releaseMedia();
       releaseAudio();
       const ws = wsRef.current;
@@ -324,6 +350,12 @@ export default function CallPage() {
     connectingRef.current = true;
     endedRef.current = false;
     summaryReceivedRef.current = false;
+    finalAudioSentRef.current = false;
+    playbackCompleteSentRef.current = false;
+    if (finalTimerRef.current) {
+      clearTimeout(finalTimerRef.current);
+      finalTimerRef.current = null;
+    }
     setStarted(true);
     setStatus('connecting');
     setError(null);
@@ -515,6 +547,7 @@ export default function CallPage() {
         message?: string;
         state?: string;
         text?: string;
+        isFinal?: boolean;
         totalMs?: number;
         timeToFirstAudio?: number;
         llmFirstTokenMs?: number | null;
@@ -549,6 +582,36 @@ export default function CallPage() {
             setState(msg.state);
             if (msg.state === 'SPEAKING' || msg.state === 'LISTENING') {
               if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+            }
+            if (msg.state === 'FINALIZING') {
+              setProgressMessage('Wrapping up call...');
+              if (workletNodeRef.current) {
+                try { workletNodeRef.current.disconnect(); } catch {}
+                workletNodeRef.current = null;
+              }
+              try { recRef.current?.stop?.(); } catch {}
+            }
+          }
+          break;
+        case 'agent_audio_end':
+          if (msg.isFinal) {
+            finalAudioSentRef.current = true;
+            if (workletNodeRef.current) {
+              try { workletNodeRef.current.disconnect(); } catch {}
+              workletNodeRef.current = null;
+            }
+            try { recRef.current?.stop?.(); } catch {}
+
+            const ctx = audioCtxRef.current;
+            const isPlaying = sourcesRef.current.length > 0 && ctx && ctx.state !== 'closed' && nextStartRef.current > ctx.currentTime;
+            if (!isPlaying) {
+              notifyPlaybackComplete();
+            } else if (ctx) {
+              const remainingMs = Math.max(0, (nextStartRef.current - ctx.currentTime) * 1000);
+              if (finalTimerRef.current) clearTimeout(finalTimerRef.current);
+              finalTimerRef.current = setTimeout(() => {
+                notifyPlaybackComplete();
+              }, remainingMs + 50);
             }
           }
           break;
@@ -678,6 +741,12 @@ export default function CallPage() {
     }
 
     summaryReceivedRef.current = false;
+    finalAudioSentRef.current = false;
+    playbackCompleteSentRef.current = false;
+    if (finalTimerRef.current) {
+      clearTimeout(finalTimerRef.current);
+      finalTimerRef.current = null;
+    }
     setError(null);
     setProgressMessage(null);
     setStarted(false);

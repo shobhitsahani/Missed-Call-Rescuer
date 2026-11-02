@@ -25,6 +25,8 @@ export interface CallContext {
   turnCount?: number;
 }
 
+export const CALL_COMPLETE_TOKEN = '[CALL_COMPLETE]';
+
 let clientInstance: OpenAI | null = null;
 let currentBaseURL: string | undefined;
 let currentApiKey: string | undefined;
@@ -167,6 +169,11 @@ ${phonePolicy}
 
 6. OPT-OUT & PRIVACY:
 - If the customer says stop calling, do not call, remove me, or asks to opt out: acknowledge politely and end the call immediately.
+
+7. CONVERSATION CLOSING & SIGN-OFF:
+- When the customer indicates they are finished (e.g. "that's all", "nothing else", "thank you", "bye", "you too") or when you have confirmed follow-up and delivered your final polite sign-off:
+- Deliver a concise polite goodbye (e.g. "Thank you for calling Acme Plumbing. Have a great day!" or "Goodbye.") and append the token [CALL_COMPLETE] at the very end.
+- DO NOT append [CALL_COMPLETE] if you are asking a question, requesting callback details, or if the conversation is ongoing.
 
 CURRENT BUSINESS CONFIGURATION:
 Business Name: ${name}

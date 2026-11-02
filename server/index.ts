@@ -147,7 +147,7 @@ app.get('/api/call-token/:token', (req, res) => {
   let isReconnect = false;
   if (missed.call_started_at) {
     for (const s of sessionModule.getAllSessions()) {
-      if (s.missedCallId === missed.id && !s.ended) {
+      if (s.missedCallId === missed.id && !s.ended && !s.finalizing) {
         isReconnect = true;
         break;
       }
@@ -1009,7 +1009,7 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
 
   ws.on('message', async (data, isBinary) => {
     if (isBinary) {
-      if (session && session.stt && !session.ended) {
+      if (session && session.stt && !session.ended && !session.finalizing) {
         session.stt.sendAudio(data as Buffer);
         if (!session.usage.sttSeconds) session.usage.sttSeconds = 0;
         session.usage.sttSeconds += (data as Buffer).length / 32000;
@@ -1042,6 +1042,7 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
     }
     if (!session) return;
     if (msg.type === 'transcript' && msg.final) {
+      if (session.ended || session.finalizing) return;
       try {
         await sessionModule.handleCustomerUtterance(session, msg.text || '');
       } catch (err) {
@@ -1049,6 +1050,8 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
       }
     } else if (msg.type === 'barge_in') {
       sessionModule.bargeIn(session);
+    } else if (msg.type === 'playback_complete') {
+      sessionModule.handlePlaybackComplete(session);
     } else if (msg.type === 'end') {
       try {
         await sessionModule.endSession(session, msg.reason || 'user_ended');
