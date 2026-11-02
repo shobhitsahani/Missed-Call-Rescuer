@@ -50,6 +50,8 @@ export default function CallPage() {
   const [latestMetric, setLatestMetric] = useState<TurnMetric | null>(null);
   const [_metricsHistory, setMetricsHistory] = useState<TurnMetric[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [tokenError, setTokenError] = useState<string | null>(null);
+  const [validatingToken, setValidatingToken] = useState(true);
   const [progressMessage, setProgressMessage] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -67,17 +69,45 @@ export default function CallPage() {
     stateRef.current = state;
   }, [state]);
 
-  // Load business details for caller banner and STT provider flag
+  // Validate callback token and fetch session metadata via public endpoint
   useEffect(() => {
-    api('/api/business')
-      .then((b) => {
-        setBusiness(b);
-        if (b?.sttProvider) {
-          setSttProvider(b.sttProvider);
+    let isCancelled = false;
+    async function validateToken() {
+      try {
+        const res = await fetch(`${API_BASE}/api/call-token/${encodeURIComponent(token)}`);
+        const data = await res.json().catch(() => null);
+        if (isCancelled) return;
+
+        if (!res.ok) {
+          if (res.status === 429 || res.status === 503) {
+            setTokenError(data?.error || 'Demo is busy, try again in a minute.');
+          } else if (res.status === 410) {
+            setTokenError(data?.error || 'This callback link has expired (links are valid for 30 minutes).');
+          } else if (res.status === 409) {
+            setTokenError(data?.error || 'This callback link has already been used.');
+          } else {
+            setTokenError(data?.error || 'Invalid or expired callback link.');
+          }
+          return;
         }
-      })
-      .catch(() => {});
-  }, []);
+
+        if (data?.valid) {
+          setBusiness({ name: data.businessName, voice: data.voice });
+        }
+      } catch (err: any) {
+        if (!isCancelled) {
+          setTokenError('Unable to connect to the callback server.');
+        }
+      } finally {
+        if (!isCancelled) setValidatingToken(false);
+      }
+    }
+
+    validateToken();
+    return () => {
+      isCancelled = true;
+    };
+  }, [token]);
 
   // Auto-scroll transcript container to latest message or partial
   useEffect(() => {
@@ -238,7 +268,7 @@ export default function CallPage() {
 
     ws.onopen = () => {
       setStatus('connected');
-      ws.send(JSON.stringify({ type: 'join', missedCallId: token }));
+      ws.send(JSON.stringify({ type: 'join', token, missedCallId: token }));
     };
 
     ws.onmessage = (ev) => {
@@ -450,6 +480,20 @@ export default function CallPage() {
   return (
     <main className="min-h-screen bg-background text-foreground flex flex-col justify-center items-center px-4 py-8 sm:py-12 sm:px-6 antialiased selection:bg-primary/20 selection:text-primary">
       <div className="w-full max-w-[520px] mx-auto space-y-4">
+        {/* Token Validation Error Banner */}
+        {tokenError && (
+          <div
+            role="alert"
+            className="rounded-xl border border-destructive/40 bg-destructive/10 p-4 text-xs sm:text-sm text-foreground flex items-start gap-3 shadow-xs animate-in fade-in duration-200"
+          >
+            <ShieldAlert className="h-5 w-5 text-destructive shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <p className="font-semibold text-destructive">Callback Session Unavailable</p>
+              <p className="mt-0.5 text-muted-foreground">{tokenError}</p>
+            </div>
+          </div>
+        )}
+
         {/* Error Notification Banner */}
         {error && (
           <div
@@ -488,7 +532,7 @@ export default function CallPage() {
 
               <div className="mt-2.5">
                 <Badge variant="outline" className="text-xs font-medium text-primary border-primary/30 bg-primary/5">
-                  Automated Voice Assistant
+                  Voice Callback Session
                 </Badge>
               </div>
 
@@ -500,10 +544,20 @@ export default function CallPage() {
                 <Button
                   size="lg"
                   onClick={connect}
+                  disabled={validatingToken || !!tokenError}
                   className="w-full sm:w-auto px-8 py-6 text-base font-semibold gap-2 shadow-sm"
                 >
-                  <PhoneCall className="h-5 w-5" />
-                  <span>Start call</span>
+                  {validatingToken ? (
+                    <>
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                      <span>Validating link...</span>
+                    </>
+                  ) : (
+                    <>
+                      <PhoneCall className="h-5 w-5" />
+                      <span>Start call</span>
+                    </>
+                  )}
                 </Button>
               </div>
 

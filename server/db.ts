@@ -1,11 +1,13 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { DEFAULT_PRESET, BUSINESS_PRESETS } from '../src/lib/presets';
 
 const dataDir = path.join(process.cwd(), 'data');
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-const dbPath = path.join(dataDir, 'app.db');
+const dbPath = process.env.DB_PATH ? path.resolve(process.env.DB_PATH) : path.join(dataDir, 'app.db');
+const dbDir = path.dirname(dbPath);
+if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 const db = new Database(dbPath);
 
 db.pragma('journal_mode = WAL');
@@ -97,6 +99,22 @@ ensureColumn('calls', 'notify_error', 'TEXT');
 
 // Business settings columns
 ensureColumn('businesses', 'timezone', 'TEXT');
+
+// Call token, expiry, single-use, and source columns on missed_calls
+ensureColumn('missed_calls', 'token', 'TEXT');
+ensureColumn('missed_calls', 'token_expires_at', 'TEXT');
+ensureColumn('missed_calls', 'call_started_at', 'TEXT');
+ensureColumn('missed_calls', 'source', "TEXT NOT NULL DEFAULT 'demo'");
+ensureColumn('summaries', 'status', "TEXT NOT NULL DEFAULT 'completed'");
+
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_missed_calls_token ON missed_calls(token);`);
+
+// Backfill tokens for existing rows without one
+const rowsWithoutToken = db.prepare('SELECT id FROM missed_calls WHERE token IS NULL').all() as Array<{ id: string }>;
+for (const row of rowsWithoutToken) {
+  const randomToken = crypto.randomBytes(16).toString('hex');
+  db.prepare('UPDATE missed_calls SET token = ? WHERE id = ?').run(randomToken, row.id);
+}
 
 export const DEFAULT_BIZ = {
   id: DEFAULT_PRESET.id,

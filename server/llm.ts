@@ -127,7 +127,46 @@ export async function streamChat(messages: any[], business: any, onDelta?: (d: s
   return full;
 }
 
-export async function summarize(transcript: string, business: any) {
+export interface StructuredSummary {
+  reason: string;
+  urgency: 'low' | 'medium' | 'high';
+  preferred_time: string;
+  contact_details: string;
+  suggested_action: string;
+  short_summary: string;
+  sentiment: 'positive' | 'neutral' | 'negative';
+  status?: 'completed' | 'unavailable';
+}
+
+export function validateSummary(parsed: any): { valid: boolean; summary?: StructuredSummary } {
+  if (!parsed || typeof parsed !== 'object') return { valid: false };
+
+  const validUrgencies = ['low', 'medium', 'high'];
+  const validSentiments = ['positive', 'neutral', 'negative'];
+
+  const urgency = typeof parsed.urgency === 'string' ? parsed.urgency.toLowerCase().trim() : '';
+  const sentiment = typeof parsed.sentiment === 'string' ? parsed.sentiment.toLowerCase().trim() : '';
+
+  if (!validUrgencies.includes(urgency) || !validSentiments.includes(sentiment)) {
+    return { valid: false };
+  }
+
+  return {
+    valid: true,
+    summary: {
+      reason: String(parsed.reason || 'not specified').trim(),
+      urgency: urgency as 'low' | 'medium' | 'high',
+      preferred_time: String(parsed.preferred_time || 'not specified').trim(),
+      contact_details: String(parsed.contact_details || 'not provided').trim(),
+      suggested_action: String(parsed.suggested_action || 'Follow up with customer').trim(),
+      short_summary: String(parsed.short_summary || '').trim(),
+      sentiment: sentiment as 'positive' | 'neutral' | 'negative',
+      status: 'completed',
+    },
+  };
+}
+
+export async function summarize(transcript: string, business: any): Promise<{ parsed: StructuredSummary | null; raw: string; status: 'completed' | 'unavailable' }> {
   const client = getClient();
   const m = model();
   const prompt = `You are extracting a structured summary from a phone callback conversation on behalf of ${business?.name || 'the business'}. Return ONLY valid JSON with these fields:
@@ -148,18 +187,46 @@ Rules:
 Business: ${business?.name || 'Business'}
 Transcript:
 ${transcript}`;
-  try {
+
+  const executeExtraction = async (systemInstruction?: string) => {
+    const messages: any[] = [{ role: 'user', content: prompt }];
+    if (systemInstruction) {
+      messages.unshift({ role: 'system', content: systemInstruction });
+    }
     const resp = await client.chat.completions.create({
       model: m,
-      messages: [{ role: 'user', content: prompt }] as any,
-      temperature: 0.2,
+      messages,
+      temperature: 0.1,
     });
     const raw = (resp as any).choices?.[0]?.message?.content || '';
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
-    return { parsed, raw };
+    if (!jsonMatch) return { parsed: null, raw };
+    try {
+      const json = JSON.parse(jsonMatch[0]);
+      return { parsed: json, raw };
+    } catch {
+      return { parsed: null, raw };
+    }
+  };
+
+  try {
+    // Attempt 1
+    const firstAttempt = await executeExtraction();
+    const validation1 = validateSummary(firstAttempt.parsed);
+    if (validation1.valid && validation1.summary) {
+      return { parsed: validation1.summary, raw: firstAttempt.raw, status: 'completed' };
+    }
+
+    // Attempt 2 (Retry with strict JSON instruction)
+    const retryAttempt = await executeExtraction('Your previous output was invalid JSON or missed required fields. Return ONLY valid JSON conforming strictly to the requested schema.');
+    const validation2 = validateSummary(retryAttempt.parsed);
+    if (validation2.valid && validation2.summary) {
+      return { parsed: validation2.summary, raw: retryAttempt.raw, status: 'completed' };
+    }
+
+    return { parsed: null, raw: retryAttempt.raw || firstAttempt.raw, status: 'unavailable' };
   } catch (err: any) {
-    console.error('Summary error:', err?.message);
-    return { parsed: null, raw: String(err?.message) };
+    console.error('Summary extraction error:', err?.message);
+    return { parsed: null, raw: String(err?.message), status: 'unavailable' };
   }
 }

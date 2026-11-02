@@ -6,8 +6,9 @@ import { TtsClient } from './tts';
 import { SttClient } from './stt';
 import { notifyCallSummary } from './notify';
 import { isValidVoiceId } from '../src/lib/voices';
+import { checkCallBudget, MAX_CALL_SECONDS } from './security';
 
-const sessions = new Map<string, any>();
+export const sessions = new Map<string, any>();
 
 export const STT_PROVIDER = process.env.STT_PROVIDER || 'assemblyai';
 
@@ -197,8 +198,44 @@ async function speakSentence(
   }
 }
 
-export async function startSession(ws: any, missedCallId?: string) {
-  const missed: any = missedCallId ? db.prepare('SELECT * FROM missed_calls WHERE id=?').get(missedCallId) : null;
+export async function startSession(ws: any, missedCallTokenOrId?: string) {
+  const budget = checkCallBudget();
+  if (!budget.allowed) {
+    throw new Error(budget.reason || 'Demo is busy, try again in a minute');
+  }
+
+  let missed: any = null;
+  if (missedCallTokenOrId) {
+    missed = db.prepare('SELECT * FROM missed_calls WHERE token = ? OR id = ?').get(missedCallTokenOrId, missedCallTokenOrId);
+  }
+  if (!missed) {
+    throw new Error('Callback session not found');
+  }
+
+  // Token expiration check (30 minutes)
+  if (missed.token_expires_at) {
+    const expiresAt = new Date(missed.token_expires_at).getTime();
+    if (Date.now() > expiresAt) {
+      throw new Error('Callback link has expired (valid for 30 minutes)');
+    }
+  }
+
+  // Single-use check: if call has already started
+  if (missed.call_started_at) {
+    let isReconnect = false;
+    for (const s of sessions.values()) {
+      if (s.missedCallId === missed.id && !s.ended) {
+        isReconnect = true;
+        break;
+      }
+    }
+    if (!isReconnect) {
+      throw new Error('This callback link has already been used');
+    }
+  } else {
+    db.prepare('UPDATE missed_calls SET call_started_at = ? WHERE id = ?').run(new Date().toISOString(), missed.id);
+  }
+
   const business = rowToBiz(getBusinessRow());
   const callId = uuidv4();
   const customerPhone = missed ? missed.customer_phone : 'unknown';
@@ -341,7 +378,7 @@ export async function startSession(ws: any, missedCallId?: string) {
     }
   }
 
-  session.maxTimer = setTimeout(() => endSession(session, 'timeout'), 5 * 60 * 1000);
+  session.maxTimer = setTimeout(() => endSession(session, 'timeout'), MAX_CALL_SECONDS * 1000);
   session.keepAliveTimer = setInterval(() => {
     if (!session.ended) {
       try { session.tts.keepAlive(); } catch {}
@@ -575,30 +612,35 @@ export async function endSession(session: any, reason: string) {
 
   setState(session, 'SUMMARIZING');
   const transcript = session.turns.map((t: any) => `${t.role === 'agent' ? 'Agent' : 'Customer'}: ${t.text}`).join('\n');
-  const { parsed, raw } = await llm.summarize(transcript, session.business);
+  const { parsed, raw, status: summaryStatus } = await llm.summarize(transcript, session.business);
   const summaryId = uuidv4();
-  const s = parsed || {};
-  db.prepare(`INSERT INTO summaries (id, call_id, reason, urgency, preferred_time, contact_details, suggested_action, short_summary, sentiment, raw) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-    .run(summaryId, session.id,
-      s.reason || 'not specified',
-      s.urgency || 'medium',
-      s.preferred_time || 'not specified',
-      s.contact_details || 'not provided',
-      s.suggested_action || 'Follow up with customer',
-      s.short_summary || transcript.slice(0, 120),
-      s.sentiment || 'neutral',
-      raw);
+  const isUnavailable = summaryStatus === 'unavailable' || !parsed;
+  const finalStatus = isUnavailable ? 'unavailable' : 'completed';
+
   const summary = {
     id: summaryId,
     callId: session.id,
-    reason: s.reason || 'not specified',
-    urgency: s.urgency || 'medium',
-    preferred_time: s.preferred_time || 'not specified',
-    contact_details: s.contact_details || 'not provided',
-    suggested_action: s.suggested_action || 'Follow up with customer',
-    short_summary: s.short_summary || '',
-    sentiment: s.sentiment || 'neutral',
+    reason: isUnavailable ? 'Summary unavailable' : parsed.reason,
+    urgency: isUnavailable ? '' : parsed.urgency,
+    preferred_time: isUnavailable ? 'not specified' : parsed.preferred_time,
+    contact_details: isUnavailable ? 'not provided' : parsed.contact_details,
+    suggested_action: isUnavailable ? 'Manual follow-up needed' : parsed.suggested_action,
+    short_summary: isUnavailable ? 'Structured summary could not be extracted.' : parsed.short_summary,
+    sentiment: isUnavailable ? '' : parsed.sentiment,
+    status: finalStatus,
   };
+
+  db.prepare(`INSERT INTO summaries (id, call_id, reason, urgency, preferred_time, contact_details, suggested_action, short_summary, sentiment, raw, status) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(summaryId, session.id,
+      summary.reason,
+      summary.urgency,
+      summary.preferred_time,
+      summary.contact_details,
+      summary.suggested_action,
+      summary.short_summary,
+      summary.sentiment,
+      raw,
+      finalStatus);
 
   // close STT and TTS
   if (session.stt) {

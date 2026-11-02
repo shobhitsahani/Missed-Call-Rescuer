@@ -1,6 +1,7 @@
 import https from 'https';
+import crypto from 'crypto';
 import dotenv from 'dotenv';
-dotenv.config({ override: true });
+dotenv.config();
 import express from 'express';
 import http from 'http';
 import { WebSocketServer } from 'ws';
@@ -22,10 +23,39 @@ import {
   formatJsonTranscript,
   getTranscriptFilename,
 } from '../src/lib/transcript';
+import {
+  validateStartupAuth,
+  verifyAccessCode,
+  signAuthToken,
+  signStreamToken,
+  requireAuth,
+  isOpenAccess,
+} from './auth';
+import {
+  securityHeadersMiddleware,
+  createRateLimiter,
+  checkRateLimit,
+  isOriginAllowed,
+  checkCallBudget,
+} from './security';
+
+validateStartupAuth();
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.set('trust proxy', 1);
+app.use(securityHeadersMiddleware);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || isOriginAllowed(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+}));
+app.use(express.json({ limit: '100kb' }));
 
 const PORT = process.env.PORT || 4000;
 
@@ -39,7 +69,88 @@ function isValidTimezone(tz: string): boolean {
   }
 }
 
-app.get('/api/business', (_req, res) => {
+// Access code auth
+app.post('/api/auth', (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || 'global';
+  const limit = checkRateLimit(`auth:${ip}`, 5, 60000);
+  if (!limit.allowed) {
+    return res.status(429).json({ error: 'Too many authentication attempts. Please wait 1 minute.' });
+  }
+
+  const { code } = req.body || {};
+  if (!code || typeof code !== 'string') {
+    return res.status(400).json({ error: 'Access code is required.' });
+  }
+
+  if (!verifyAccessCode(code)) {
+    return res.status(401).json({ error: 'Invalid access code.' });
+  }
+
+  const token = signAuthToken();
+  res.json({ token, expiresIn: 43200 });
+});
+
+// Single-purpose short-lived stream token for SSE
+app.get('/api/events/token', requireAuth, (_req, res) => {
+  const streamToken = signStreamToken();
+  res.json({ streamToken });
+});
+
+// Tokenized customer callback session metadata (public link, unguessable token)
+app.get('/api/call-token/:token', (req, res) => {
+  const { token } = req.params;
+  if (!token) {
+    return res.status(400).json({ error: 'Callback token is required.' });
+  }
+
+  // Reject guessable old IDs
+  if (token.startsWith('mc_')) {
+    return res.status(400).json({ error: 'Legacy or guessable IDs are not permitted. Please use a valid callback token.' });
+  }
+
+  const budget = checkCallBudget();
+  if (!budget.allowed) {
+    return res.status(429).json({ error: budget.reason || 'Demo is busy, try again in a minute.' });
+  }
+
+  const missed: any = db.prepare('SELECT * FROM missed_calls WHERE token = ?').get(token);
+  if (!missed) {
+    return res.status(404).json({ error: 'Callback session not found or link is invalid.' });
+  }
+
+  if (missed.token_expires_at) {
+    const expiresAt = new Date(missed.token_expires_at).getTime();
+    if (Date.now() > expiresAt) {
+      return res.status(410).json({ error: 'This callback link has expired (links are valid for 30 minutes).' });
+    }
+  }
+
+  if (missed.call_started_at) {
+    let isReconnect = false;
+    for (const s of sessionModule.getAllSessions()) {
+      if (s.missedCallId === missed.id && !s.ended) {
+        isReconnect = true;
+        break;
+      }
+    }
+    if (!isReconnect) {
+      return res.status(409).json({ error: 'This callback link has already been used.' });
+    }
+  }
+
+  const biz: any = db.prepare('SELECT name, voice FROM businesses LIMIT 1').get();
+  res.json({
+    valid: true,
+    missedCallId: missed.id,
+    token: missed.token,
+    customerPhone: missed.customer_phone ? missed.customer_phone.replace(/\d(?=\d{4})/g, '*') : 'Unknown',
+    businessName: biz?.name || 'Local Business',
+    voice: biz?.voice || 'aai-jane',
+    status: missed.status,
+  });
+});
+
+app.get('/api/business', requireAuth, (_req, res) => {
   const b = db.prepare('SELECT * FROM businesses LIMIT 1').get() as any;
   if (!b) return res.status(404).json({ error: 'Business config not found' });
   res.json({
@@ -52,7 +163,7 @@ app.get('/api/business', (_req, res) => {
   });
 });
 
-app.get('/api/business/voices', (_req, res) => {
+app.get('/api/business/voices', requireAuth, (_req, res) => {
   res.json({ voices: ASSEMBLYAI_VOICES });
 });
 
@@ -77,7 +188,7 @@ const PREVIEW_TEXT = 'Thanks for calling. How can we help you today?';
 const PER_VOICE_COOLDOWN_MS = 3000;
 const GLOBAL_MAX_PER_MINUTE = 20;
 
-app.post('/api/business/voice-preview', async (req, res) => {
+app.post('/api/business/voice-preview', requireAuth, async (req, res) => {
   const ip = req.ip || req.socket.remoteAddress || 'global';
   const now = Date.now();
   const startTime = Date.now();
@@ -275,7 +386,7 @@ app.post('/api/business/voice-preview', async (req, res) => {
   }
 });
 
-app.put('/api/business', (req, res) => {
+app.put('/api/business', requireAuth, (req, res) => {
   const body = req.body;
   if (!body || typeof body !== 'object') {
     return res.status(400).json({ error: 'Request body must be a JSON object.' });
@@ -405,11 +516,11 @@ app.put('/api/business', (req, res) => {
   });
 });
 
-app.get('/api/business/presets', (_req, res) => {
+app.get('/api/business/presets', requireAuth, (_req, res) => {
   res.json({ presets: BUSINESS_PRESETS });
 });
 
-app.post('/api/business/reset', (req, res) => {
+app.post('/api/business/reset', requireAuth, (req, res) => {
   const existingBiz = db.prepare('SELECT id FROM businesses LIMIT 1').get() as any;
   const bizId = existingBiz?.id || DEFAULT_BIZ.id;
 
@@ -439,27 +550,53 @@ app.post('/api/business/reset', (req, res) => {
   });
 });
 
-app.get('/api/missed-calls', (_req, res) => {
+app.get('/api/missed-calls', requireAuth, (_req, res) => {
   const rows = db.prepare('SELECT * FROM missed_calls ORDER BY time DESC').all();
   res.json(rows);
 });
 
-app.post('/api/missed-calls/simulate', (req, res) => {
-  const { phone } = req.body || {};
+app.post('/api/missed-calls/simulate', requireAuth, (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || 'global';
+  const limit = checkRateLimit(`sim:${ip}`, 5, 60000);
+  if (!limit.allowed) {
+    return res.status(429).json({ error: 'Rate limit exceeded: max 5 simulations per minute per IP.' });
+  }
+
+  const { phone, source } = req.body || {};
   const id = 'mc_' + Date.now();
+  const token = crypto.randomBytes(16).toString('hex');
+  const tokenExpiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  const rowSource = source === 'test' ? 'test' : 'demo';
+
   const business: any = db.prepare('SELECT id FROM businesses LIMIT 1').get();
   const phoneNumber = phone || '+1 (555) 010-' + Math.floor(1000 + Math.random() * 9000);
-  db.prepare('INSERT INTO missed_calls (id, business_id, customer_phone, time, status) VALUES (?,?,?,?,?)')
-    .run(id, business.id, phoneNumber, new Date().toISOString(), 'new');
+
+  db.prepare(`
+    INSERT INTO missed_calls (id, business_id, customer_phone, time, status, token, token_expires_at, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, business.id, phoneNumber, new Date().toISOString(), 'new', token, tokenExpiresAt, rowSource);
+
   const jobId = 'job_' + Date.now();
   db.prepare('INSERT INTO callback_jobs (id, missed_call_id, attempts, schedule, state) VALUES (?,?,?,?,?)')
     .run(jobId, id, 0, new Date().toISOString(), 'queued');
   db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run('queued', id);
-  events.broadcast('missed_call', { id, customer_phone: phoneNumber });
-  res.json({ missedCallId: id, jobId });
+
+  events.broadcast('missed_call', {
+    id,
+    customer_phone: phoneNumber,
+    token,
+    source: rowSource,
+  });
+
+  res.json({
+    missedCallId: id,
+    jobId,
+    token,
+    callUrl: `/call/${token}`,
+  });
 });
 
-app.post('/api/test/force-stt-disconnect', (req, res) => {
+app.post('/api/test/force-stt-disconnect', requireAuth, (req, res) => {
   const { callId, missedCallId } = req.body || {};
   let targetSession: any = null;
   if (callId) {
@@ -480,12 +617,36 @@ app.post('/api/test/force-stt-disconnect', (req, res) => {
   return res.status(404).json({ ok: false, error: 'No active session with STT found' });
 });
 
-app.get('/api/calls', (_req, res) => {
-  const rows = db.prepare('SELECT * FROM calls ORDER BY start_time DESC').all();
-  res.json(rows.map((r: any) => ({ ...r, latency: r.latency_json ? JSON.parse(r.latency_json) : [], usage: r.usage_json ? JSON.parse(r.usage_json) : {} })));
+app.get('/api/calls', requireAuth, (_req, res) => {
+  const rows = db.prepare(`
+    SELECT c.*,
+      (SELECT COUNT(*) FROM turns t WHERE t.call_id = c.id AND t.role = 'customer') as customer_turns_count,
+      s.status as summary_status,
+      s.urgency as summary_urgency,
+      s.sentiment as summary_sentiment
+    FROM calls c
+    LEFT JOIN summaries s ON s.call_id = c.id
+    ORDER BY c.start_time DESC
+  `).all() as any[];
+
+  const callsWithDetails = rows.map((r: any) => {
+    const customerSpoke = (r.customer_turns_count || 0) > 0;
+    const validSummary = r.summary_status === 'completed' || (!r.summary_status && r.summary_urgency && r.summary_sentiment && r.summary_status !== 'unavailable');
+    const notFailedReason = !['error', 'no_answer', 'opt_out'].includes(r.end_reason);
+    const is_completed = Boolean(customerSpoke && validSummary && notFailedReason);
+
+    const { customer_turns_count, summary_status, summary_urgency, summary_sentiment, ...rest } = r;
+    return {
+      ...rest,
+      is_completed,
+      latency: r.latency_json ? JSON.parse(r.latency_json) : [],
+      usage: r.usage_json ? JSON.parse(r.usage_json) : {},
+    };
+  });
+  res.json(callsWithDetails);
 });
 
-app.get('/api/calls/:id', (req, res) => {
+app.get('/api/calls/:id', requireAuth, (req, res) => {
   const call = db.prepare('SELECT * FROM calls WHERE id=?').get(req.params.id);
   if (!call) return res.status(404).json({ error: 'not found' });
   const turns = db.prepare('SELECT * FROM turns WHERE call_id=? ORDER BY order_idx').all(req.params.id);
@@ -493,7 +654,7 @@ app.get('/api/calls/:id', (req, res) => {
   res.json({ call: { ...call, latency: (call as any).latency_json ? JSON.parse((call as any).latency_json) : [], usage: (call as any).usage_json ? JSON.parse((call as any).usage_json) : {} }, turns, summary });
 });
 
-app.get('/api/calls/:id/transcript', (req, res) => {
+app.get('/api/calls/:id/transcript', requireAuth, (req, res) => {
   const format = String(req.query.format || 'txt').toLowerCase();
   if (format !== 'txt' && format !== 'json') {
     return res.status(400).json({ error: 'Invalid format. Use "txt" or "json".' });
@@ -536,13 +697,54 @@ app.get('/api/calls/:id/transcript', (req, res) => {
   }
 });
 
-app.get('/api/summaries/:callId', (req, res) => {
+app.get('/api/summaries/:callId', requireAuth, (req, res) => {
   const s = db.prepare('SELECT * FROM summaries WHERE call_id=?').get(req.params.callId);
   if (!s) return res.status(404).json({ error: 'not found' });
   res.json(s);
 });
 
-app.get('/api/events', (req, res) => {
+// Admin endpoint to clean dashboard data (preserves business configuration)
+app.post('/api/admin/clear-test-data', requireAuth, (req, res) => {
+  const adminEnabled = process.env.ADMIN_ENABLED === 'true' || process.env.NODE_ENV !== 'production';
+  if (!adminEnabled) {
+    return res.status(403).json({ error: 'Admin actions are disabled in production (ADMIN_ENABLED != true)' });
+  }
+
+  const { scope } = req.body || {};
+  if (scope === 'test_only') {
+    const testMissed = db.prepare('SELECT id FROM missed_calls WHERE source = ?').all('test') as { id: string }[];
+    const testIds = testMissed.map((m) => m.id);
+    if (testIds.length > 0) {
+      const placeholders = testIds.map(() => '?').join(',');
+      const calls = db.prepare(`SELECT id FROM calls WHERE missed_call_id IN (${placeholders})`).all(...testIds) as { id: string }[];
+      const callIds = calls.map((c) => c.id);
+      if (callIds.length > 0) {
+        const callPlaceholders = callIds.map(() => '?').join(',');
+        db.prepare(`DELETE FROM summaries WHERE call_id IN (${callPlaceholders})`).run(...callIds);
+        db.prepare(`DELETE FROM turns WHERE call_id IN (${callPlaceholders})`).run(...callIds);
+        db.prepare(`DELETE FROM calls WHERE id IN (${callPlaceholders})`).run(...callIds);
+      }
+      db.prepare(`DELETE FROM callback_jobs WHERE missed_call_id IN (${placeholders})`).run(...testIds);
+      db.prepare(`DELETE FROM missed_calls WHERE id IN (${placeholders})`).run(...testIds);
+    }
+    return res.json({ ok: true, clearedCount: testIds.length });
+  }
+
+  // Clear all call sessions, turns, summaries, callback_jobs, missed_calls — never touch businesses table
+  db.prepare('DELETE FROM summaries').run();
+  db.prepare('DELETE FROM turns').run();
+  db.prepare('DELETE FROM calls').run();
+  db.prepare('DELETE FROM callback_jobs').run();
+  db.prepare('DELETE FROM missed_calls').run();
+  events.broadcast('data_cleared', {});
+  return res.json({ ok: true, message: 'All test and demo calls cleared. Business configuration preserved.' });
+});
+
+app.get('/api/events', requireAuth, (req, res) => {
+  if (req.headers.origin && !isOriginAllowed(req.headers.origin)) {
+    return res.status(403).json({ error: 'Origin not allowed' });
+  }
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -553,7 +755,13 @@ app.get('/api/events', (req, res) => {
 
 const resendTimestamps = new Map<string, number>();
 
-app.post('/api/notify/test', async (_req, res) => {
+app.post('/api/notify/test', requireAuth, async (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || 'global';
+  const limit = checkRateLimit(`notify_test:${ip}`, 5, 60000);
+  if (!limit.allowed) {
+    return res.status(429).json({ error: 'Too many test notifications. Please wait 1 minute.' });
+  }
+
   const provider = getActiveProvider();
   if (provider === 'none') {
     return res.status(400).json({
@@ -579,7 +787,7 @@ app.post('/api/notify/test', async (_req, res) => {
   });
 });
 
-app.post('/api/calls/:id/notify', async (req, res) => {
+app.post('/api/calls/:id/notify', requireAuth, async (req, res) => {
   const callId = req.params.id;
   const call = db.prepare('SELECT id FROM calls WHERE id=?').get(callId);
   if (!call) {
@@ -617,6 +825,17 @@ app.post('/api/calls/:id/notify', async (req, res) => {
     ok: true,
     provider: result.provider,
     notified_at: result.notified_at,
+  });
+});
+
+// Sanitized production error handler (no stack traces or secrets leaked)
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const isProd = process.env.NODE_ENV === 'production';
+  const status = typeof err.status === 'number' ? err.status : typeof err.statusCode === 'number' ? err.statusCode : 500;
+  const message = isProd ? (status === 500 ? 'Internal Server Error' : err.message) : err.message;
+  res.status(status).json({
+    error: message,
+    ...(isProd ? {} : { stack: err.stack }),
   });
 });
 
@@ -687,6 +906,13 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
+  const origin = req.headers.origin;
+  if (!isOriginAllowed(origin)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
   if (req.url && req.url.startsWith('/ws')) {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
@@ -696,8 +922,12 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req: http.IncomingMessage) => {
   let session: any = null;
+  const ip = req.headers['x-forwarded-for']
+    ? String(req.headers['x-forwarded-for']).split(',')[0].trim()
+    : req.socket.remoteAddress || 'global';
+
   ws.on('message', async (data, isBinary) => {
     if (isBinary) {
       if (session && session.stt && !session.ended) {
@@ -710,8 +940,15 @@ wss.on('connection', (ws) => {
     let msg: any;
     try { msg = JSON.parse(data.toString()); } catch (e) { return; }
     if (msg.type === 'join') {
+      const joinLimit = checkRateLimit(`wsjoin:${ip}`, 10, 60000);
+      if (!joinLimit.allowed) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Too many call join requests. Please wait a moment.' }));
+        ws.close();
+        return;
+      }
+
       try {
-        session = await sessionModule.startSession(ws, msg.missedCallId);
+        session = await sessionModule.startSession(ws, msg.token || msg.missedCallId);
       } catch (e: any) {
         ws.send(JSON.stringify({ type: 'error', message: e?.message }));
       }
