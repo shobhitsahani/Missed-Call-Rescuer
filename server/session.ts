@@ -65,6 +65,7 @@ export interface Session {
   agentSpeakingStartTime: number;
   sttProvider: string;
   notificationDispatched?: boolean;
+  disconnectTimer?: NodeJS.Timeout | null;
 }
 
 export const sessions = new Map<string, Session>();
@@ -323,16 +324,28 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
   // Single-use check: atomically claim the link. If another socket already
   // started it, only an active reconnect for the same missed call is allowed.
   if (missed.call_started_at) {
-    let isReconnect = false;
-    for (const s of sessions.values()) {
-      if (s.missedCallId === missed.id && !s.ended) {
-        isReconnect = true;
-        break;
+    const existingSession = Array.from(sessions.values()).find(
+      (s) => s.missedCallId === missed?.id && !s.ended
+    );
+    if (existingSession) {
+      if (existingSession.disconnectTimer) {
+        clearTimeout(existingSession.disconnectTimer);
+        existingSession.disconnectTimer = null;
       }
+      existingSession.ws = ws;
+      console.log(`[session ${existingSession.id}] Client reconnected WebSocket to active session`);
+      send(existingSession, { type: 'config', sttProvider: STT_PROVIDER });
+      send(existingSession, { type: 'state', state: existingSession.state });
+      for (const turn of existingSession.turns) {
+        if (turn.role === 'agent') {
+          send(existingSession, { type: 'agent_text', text: turn.text });
+        } else {
+          send(existingSession, { type: 'customer_transcript', text: turn.text });
+        }
+      }
+      return existingSession;
     }
-    if (!isReconnect) {
-      throw new Error('This callback link has already been used');
-    }
+    throw new Error('This callback link has already been used');
   } else {
     const claim = db.prepare('UPDATE missed_calls SET call_started_at = ? WHERE id = ? AND call_started_at IS NULL')
       .run(new Date().toISOString(), missed.id);
@@ -800,9 +813,28 @@ export function bargeIn(session: Session) {
   setState(session, 'LISTENING');
 }
 
+export function handleSocketDisconnect(session: Session) {
+  if (session.ended) return;
+  session.ws = null;
+  if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
+  // Give mid-call page reloads or transient network disconnects a 12-second grace period
+  // to reconnect without terminating the ongoing call session.
+  session.disconnectTimer = setTimeout(() => {
+    session.disconnectTimer = null;
+    if (!session.ended && !session.ws) {
+      console.log(`[session ${session.id}] Disconnect grace period elapsed without reconnect. Ending call.`);
+      endSession(session, 'disconnect').catch(() => {});
+    }
+  }, 12000);
+}
+
 export async function endSession(session: Session, reason: string) {
   if (session.ended) return;
   session.ended = true;
+  if (session.disconnectTimer) {
+    clearTimeout(session.disconnectTimer);
+    session.disconnectTimer = null;
+  }
   if (session.silenceTimer) clearTimeout(session.silenceTimer);
   if (session.maxTimer) clearTimeout(session.maxTimer);
   if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);

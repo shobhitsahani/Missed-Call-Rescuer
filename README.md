@@ -40,7 +40,7 @@ Missed-Call Rescuer turns a logged missed call into a voice callback session (in
 - **AssemblyAI Streaming STT & TTS**: High-speed real-time speech recognition using `universal-3-6-pro` and expressive neural speech synthesis via `assemblyai-tts-1`.
 - **Server-Side Barge-In Interruption Detection**: Real-time interruption guard evaluating interim word counts and timing with a self-speech similarity filter to prevent echo loops.
 - **Strict Structured Summaries**: Automatic post-call extraction validating urgency (`low`, `medium`, `high`), sentiment (`positive`, `neutral`, `negative`), caller intent, contact info, and suggested actions, with automated 1-retry fallback to unavailable state.
-- **Real-Time Owner Dashboard**: Instant updates via authenticated Server-Sent Events (SSE), honest completion metrics, and latency measurement cards.
+- **Real-Time Owner Dashboard**: Instant updates via Server-Sent Events (SSE). Public SSE payloads carry only a call id and a masked phone number — never callback tokens or full customer numbers. Includes honest completion metrics and latency measurement cards.
 - **Searchable Call History & TanStack Table**: Sortable, filterable, paginated call logs with detailed turn inspection.
 - **Call Drawer & Audio Transcript Playback**: Dialogue turns display speaker roles, interruption indicators, and timestamps.
 - **One-Click Transcript Exports**: Download call records and full conversational transcripts in formatted TXT or structured JSON.
@@ -55,6 +55,32 @@ Missed-Call Rescuer turns a logged missed call into a voice callback session (in
 - **Tested Browser**: Google Chrome. Other browsers (Firefox, Safari, Edge) are untested and may exhibit audio worklet or speech recognition differences.
 - **Hardware**: Working microphone. Headphones are strongly recommended to prevent microphone feedback from speaker audio triggering accidental barge-in.
 - **Runtime** (for local development): Node.js 20 or higher, npm.
+
+---
+
+## Local Development & Verification
+
+```bash
+npm install --include=dev       # install (tsx is a dev dependency)
+npm run dev                     # backend on http://localhost:4000 + frontend on http://localhost:3010
+npm test                        # unit + settings-validation tests (settings tests need a live backend on :4000)
+npm run test:security           # 15 security regression checks (origins, tokens, SSE privacy, budgets, admin gating)
+npm run typecheck               # TypeScript, no emit
+npm run lint                    # ESLint
+npm run build                   # production build (frontend + backend)
+```
+
+Live-provider verification scripts (require real `ASSEMBLYAI_API_KEY` / `OPENAI_API_KEY` in `.env`; they make real provider calls):
+
+```bash
+npx tsx scripts/verify-live-voice-workflow.ts   # scripted browser voice calls: greeting, phone collection, refusal, barge-in
+npx tsx scripts/verify-settings-voice.ts        # settings save/reload + AAI voice preview audio
+npx tsx scripts/verify-ui-call.ts               # headless Chrome full call E2E
+npx tsx scripts/capture-screenshots.ts          # dashboard screenshots for documentation
+```
+
+> [!NOTE]
+> `npm test` includes the settings-validation suite which calls the HTTP API on `http://localhost:4000` — start `npm run dev` first, or set `API_BASE` to a running backend.
 
 ---
 
@@ -76,14 +102,10 @@ Missed-Call Rescuer is split into a frontend web dashboard (Vercel) and a real-t
   - `NEXT_PUBLIC_API_BASE`: Public HTTPS URL of the backend (e.g. `https://missed-call-rescuer-api.onrender.com`).
 
 ### 2. Backend on Render (`render.yaml`)
-- **Service Type**: Web Service (Node or Docker).
-- **Build Command**: `npm install --include=dev`
+- **Service Type**: Web Service (Node).
+- **Build Command**: `npm install --include=dev` (`tsx` is a dev dependency used by the start command).
 - **Start Command**: `npx tsx server/index.ts`
-- **Persistent Disk**:
-  - Mount Path: `/var/data`
-  - Size: 1 GB
-  - Environment Variable: `DB_PATH=/var/data/app.db`
-  > **Persistent Disk Note**: SQLite data (`data/app.db`) will be wiped on free-tier Render deploys unless a persistent disk is attached. Set `DB_PATH=/var/data/app.db` to retain call records, business settings, and summaries across container restarts.
+- **Persistent Storage (optional, paid plan)**: On the Render free tier the filesystem is ephemeral — SQLite data survives in-place restarts but is **lost on every redeploy or instance replacement**. To retain call history permanently, attach a Render persistent disk (paid tier) with mount path `/var/data` and set `DB_PATH=/var/data/app.db`. The included `render.yaml` targets the free tier and does not attach a disk.
 - **Free Tier Cold-Starts**: Render free instances spin down after 15 minutes of inactivity. The initial wake-up request can take ~50 seconds before the health endpoint returns 200 OK.
 
 ### Complete Environment Variables Reference
@@ -121,7 +143,7 @@ Missed-Call Rescuer is split into a frontend web dashboard (Vercel) and a real-t
 - [ ] Customer call page connects over WebSocket (`/ws`) and streams microphone audio.
 - [ ] Barge-in interrupts agent speech when speaking mid-sentence.
 - [ ] Call completion persists dialogue turns, structured summary, and notifies configured channel.
-- [ ] Persistent disk retains records across server restart.
+- [ ] (Optional, paid disk only) Persistent disk retains records across server restart — free tier keeps data until the next redeploy.
 
 ---
 
@@ -158,6 +180,18 @@ Latency measured across 3 automated verification runs (15 total conversational t
 > **Measurement Environment**: Measured on a local test client communicating over broadband Internet to upstream AssemblyAI and Groq endpoints.
 >
 > The **Dashboard Latency Card** displays cumulative rolling averages across all calls stored in the database, including earlier tests and manual runs.
+
+---
+
+## Privacy & Data Handling Notice (Demo)
+
+> [!IMPORTANT]
+> **Use Synthetic Test Data Only**:
+> - **Do NOT enter real personal phone numbers** or confidential customer records during the live public demonstration. Always use synthetic numbers (e.g. `+1 (555) 010-XXXX` or Indian standard dummy ranges).
+> - **What is Stored**: The demonstration logs simulated call timestamps, caller identifiers, audio turn transcripts, and AI-extracted summaries in SQLite (`data/app.db`).
+> - **Privacy Protections**: Public Server-Sent Events (SSE) and dashboard list APIs mask phone numbers (`+1 ******9999`) and omit callback tokens from broadcast payloads.
+> - **Clearing Test Data**: Evaluators can purge test and demo records via the dashboard ("Demo options" -> "Clear test data") or via `POST /api/admin/clear-test-data` (gated by `ADMIN_TOKEN` when set in production).
+> - **Production Note**: Open demo mode is designed specifically for frictionless judge evaluation. Masking alone does not constitute HIPAA or GDPR compliance; real production deployments require tenant isolation and strict customer access control.
 
 ---
 

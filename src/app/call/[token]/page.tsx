@@ -49,6 +49,8 @@ export default function CallPage() {
   const [error, setError] = useState<string | null>(null);
   const [tokenError, setTokenError] = useState<string | null>(null);
   const [validatingToken, setValidatingToken] = useState(true);
+  const [coldStartNotice, setColdStartNotice] = useState<string | null>(null);
+  const [isReconnect, setIsReconnect] = useState(false);
   const [progressMessage, setProgressMessage] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -70,50 +72,107 @@ export default function CallPage() {
   }, [state]);
 
   // Validate callback token and fetch session metadata via public endpoint
+  // Accommodates Render free-tier cold starts with bounded retry and user feedback
   useEffect(() => {
     let isCancelled = false;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-    async function validateToken() {
-      try {
-        const res = await fetch(`${getApiBase()}/api/call-token/${encodeURIComponent(token)}`, {
-          signal: controller.signal,
-        });
-        const data = await res.json().catch(() => null);
-        if (isCancelled) return;
+    let abortController: AbortController | null = null;
+    let coldStartTimer: NodeJS.Timeout | null = null;
 
-        if (!res.ok) {
-          if (res.status === 429 || res.status === 503) {
-            setTokenError(data?.error || 'Demo is busy, try again in a minute.');
-          } else if (res.status === 410) {
-            setTokenError(data?.error || 'This callback link has expired (links are valid for 30 minutes).');
-          } else if (res.status === 409) {
-            setTokenError(data?.error || 'This callback link has already been used.');
-          } else {
-            setTokenError(data?.error || 'Invalid or expired callback link.');
-          }
-          return;
-        }
+    async function validateTokenWithRetry() {
+      const startTime = Date.now();
+      const MAX_VALIDATE_DURATION_MS = 60000;
+      let attempt = 0;
 
-        if (data?.valid) {
-          setBusiness({ name: data.businessName, voice: data.voice });
-        }
-      } catch (err) {
+      coldStartTimer = setTimeout(() => {
         if (!isCancelled) {
-          const aborted = err instanceof DOMException && err.name === 'AbortError';
-          setTokenError(aborted ? 'Timed out connecting to the callback server.' : 'Unable to connect to the callback server.');
+          setColdStartNotice('Waking up the server. This may take up to a minute on Render free tier...');
         }
-      } finally {
-        clearTimeout(timeout);
-        if (!isCancelled) setValidatingToken(false);
+      }, 3500);
+
+      while (!isCancelled) {
+        attempt++;
+        abortController = new AbortController();
+        const attemptTimeout = setTimeout(() => abortController?.abort(), 20000);
+
+        try {
+          const res = await fetch(`${getApiBase()}/api/call-token/${encodeURIComponent(token)}`, {
+            signal: abortController.signal,
+          });
+          clearTimeout(attemptTimeout);
+          const data = await res.json().catch(() => null);
+          if (isCancelled) return;
+
+          if (!res.ok) {
+            // Permanent errors: stop retrying immediately
+            if (res.status === 400) {
+              setTokenError(data?.error || 'Invalid or malformed callback link.');
+              return;
+            }
+            if (res.status === 404) {
+              setTokenError(data?.error || 'Callback session not found or link is invalid.');
+              return;
+            }
+            if (res.status === 410) {
+              setTokenError(data?.error || 'This callback link has expired (links are valid for 30 minutes).');
+              return;
+            }
+            if (res.status === 409) {
+              setTokenError(data?.error || 'This call has already concluded.');
+              return;
+            }
+            if (res.status === 429) {
+              setTokenError(data?.error || 'Demo is busy, try again in a minute.');
+              return;
+            }
+
+            // Transient server errors (502, 503, 504): retry if within budget
+            const elapsed = Date.now() - startTime;
+            if (elapsed + 3000 < MAX_VALIDATE_DURATION_MS) {
+              setColdStartNotice(`Connecting to server (attempt ${attempt})...`);
+              await new Promise((r) => setTimeout(r, 2000));
+              continue;
+            } else {
+              setTokenError('The callback server is temporarily unavailable. Please try again in a moment.');
+              return;
+            }
+          }
+
+          if (data?.valid) {
+            setBusiness({ name: data.businessName, voice: data.voice });
+            if (data.isReconnect) {
+              setIsReconnect(true);
+            }
+            setColdStartNotice(null);
+            return;
+          }
+        } catch (err: unknown) {
+          clearTimeout(attemptTimeout);
+          if (isCancelled) return;
+          const elapsed = Date.now() - startTime;
+          if (elapsed + 3000 < MAX_VALIDATE_DURATION_MS) {
+            setColdStartNotice('Waking up the server. This may take up to a minute on Render free tier...');
+            await new Promise((r) => setTimeout(r, 2500));
+            continue;
+          } else {
+            const isAborted = err instanceof DOMException && err.name === 'AbortError';
+            setTokenError(isAborted ? 'Connection timed out waiting for the server to wake up.' : 'Unable to connect to the callback server.');
+            return;
+          }
+        }
       }
     }
 
-    validateToken();
+    validateTokenWithRetry().finally(() => {
+      if (coldStartTimer) clearTimeout(coldStartTimer);
+      if (!isCancelled) {
+        setValidatingToken(false);
+      }
+    });
+
     return () => {
       isCancelled = true;
-      clearTimeout(timeout);
-      controller.abort();
+      if (coldStartTimer) clearTimeout(coldStartTimer);
+      if (abortController) abortController.abort();
     };
   }, [token]);
 
@@ -268,7 +327,7 @@ export default function CallPage() {
     setStarted(true);
     setStatus('connecting');
     setError(null);
-    setProgressMessage('Connecting audio...');
+    setProgressMessage(isReconnect ? 'Resuming active call...' : 'Connecting audio...');
     initAudio();
 
     if (connectionTimeoutRef.current) {
@@ -278,7 +337,7 @@ export default function CallPage() {
       if (stateRef.current === 'GREETING' && !endedRef.current) {
         setError('Connection timed out waiting for the assistant to start. Please check your connection and try again.');
       }
-    }, 10000);
+    }, 25000);
 
     const wsUrl = getApiBase().replace(/^http/, 'ws') + '/ws';
     const ws = new WebSocket(wsUrl);
@@ -710,6 +769,11 @@ export default function CallPage() {
                       <Loader2 className="h-5 w-5 animate-spin" />
                       <span>Validating link...</span>
                     </>
+                  ) : isReconnect ? (
+                    <>
+                      <PhoneCall className="h-5 w-5" />
+                      <span>Resume call</span>
+                    </>
                   ) : (
                     <>
                       <PhoneCall className="h-5 w-5" />
@@ -717,6 +781,11 @@ export default function CallPage() {
                     </>
                   )}
                 </Button>
+                {coldStartNotice && (
+                  <p className="mt-3 text-xs text-amber-500 font-medium animate-pulse text-center max-w-xs">
+                    {coldStartNotice}
+                  </p>
+                )}
               </div>
 
               <div className="mt-6 flex items-center gap-1.5 text-xs text-muted-foreground">

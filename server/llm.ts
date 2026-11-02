@@ -97,6 +97,8 @@ export function buildPhonePolicy(context?: CallContext | null): string {
 - No verified callback number is on file.
 - You MUST ask the customer for the best phone number to reach them at before ending the call.
 - Ask directly and concisely: "What is the best phone number for our team to call you back?"
+- Ask once, ideally in your first reply together with answering the customer's question.
+- If the customer does not provide it, keep helping them and ask again at most one more time when the call is wrapping up. Do not end every reply by asking for the number.
 - If the customer provided an incomplete or invalid number, ask them to repeat the full 10-digit number.`;
 }
 

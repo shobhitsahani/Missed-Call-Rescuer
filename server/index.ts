@@ -144,8 +144,8 @@ app.get('/api/call-token/:token', (req, res) => {
     }
   }
 
+  let isReconnect = false;
   if (missed.call_started_at) {
-    let isReconnect = false;
     for (const s of sessionModule.getAllSessions()) {
       if (s.missedCallId === missed.id && !s.ended) {
         isReconnect = true;
@@ -153,14 +153,19 @@ app.get('/api/call-token/:token', (req, res) => {
       }
     }
     if (!isReconnect) {
-      return res.status(409).json({ error: 'This callback link has already been used.' });
+      return res.status(409).json({
+        error: 'This callback link has already been used.',
+        code: 'call_concluded',
+      });
     }
   }
 
-  // Only gate valid, unused links on live capacity.
-  const budget = checkCallBudget();
-  if (!budget.allowed) {
-    return res.status(429).json({ error: budget.reason || 'Demo is busy, try again in a minute.' });
+  // Only gate valid, unused links on live capacity. Reconnects to existing sessions bypass the budget check.
+  if (!isReconnect) {
+    const budget = checkCallBudget();
+    if (!budget.allowed) {
+      return res.status(429).json({ error: budget.reason || 'Demo is busy, try again in a minute.' });
+    }
   }
 
   const biz = db.prepare('SELECT name, voice FROM businesses LIMIT 1').get() as { name?: string; voice?: string } | undefined;
@@ -172,6 +177,7 @@ app.get('/api/call-token/:token', (req, res) => {
     businessName: biz?.name || 'Local Business',
     voice: biz?.voice || 'aai-jane',
     status: missed.status,
+    isReconnect,
   });
 });
 
@@ -1052,7 +1058,7 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
   ws.on('close', () => {
     closed = true;
     if (session && !session.ended) {
-      sessionModule.endSession(session, 'disconnect').catch(() => {});
+      sessionModule.handleSocketDisconnect(session);
     }
   });
 });
