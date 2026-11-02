@@ -138,16 +138,13 @@ export function validatePhoneDigits(rawDigits: string, defaultCountry: PhoneCoun
   if (digits.length === 10) {
     const firstDigit = digits[0];
     // Indian 10-digit mobile starts with 6, 7, 8, or 9
-    if (defaultCountry === 'IN') {
-      if (firstDigit >= '6' && firstDigit <= '9') {
-        return {
-          isValid: true,
-          digits,
-          normalized: `+91${digits}`,
-          formatted: `+91 ${digits.slice(0, 5)} ${digits.slice(5)}`,
-        };
-      }
-      return { isValid: false, digits, reason: 'invalid_pattern' };
+    if (defaultCountry === 'IN' && firstDigit >= '6' && firstDigit <= '9') {
+      return {
+        isValid: true,
+        digits,
+        normalized: `+91${digits}`,
+        formatted: `+91 ${digits.slice(0, 5)} ${digits.slice(5)}`,
+      };
     }
     // US Area code cannot start with 0 or 1
     if (firstDigit >= '2' && firstDigit <= '9') {

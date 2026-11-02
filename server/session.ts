@@ -764,8 +764,12 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
             chunkQueue.length = 0;
             chunkQueue.push(repeatSentence);
           } else {
+            // Strip any trailing incomplete clause without end punctuation to avoid run-on sentences
+            const completeSentences = fullReply.match(/^.*[.!](\s+|$)/s);
+            const prefix = completeSentences ? completeSentences[0].trim() : '';
+            fullReply = (prefix ? prefix + ' ' : '') + repeatSentence;
+            chunkQueue.length = 0;
             chunkQueue.push(repeatSentence);
-            fullReply += (fullReply ? ' ' : '') + repeatSentence;
           }
           session.lastPhonePromptTurn = customerTurnCount;
           console.log(`[session ${session.id}] Guard enforced repeat phone prompt for incomplete digits`);
