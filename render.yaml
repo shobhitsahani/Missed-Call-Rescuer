@@ -35,10 +35,6 @@ services:
         sync: false
       - key: ASSEMBLYAI_VOICE_ID
         value: aai-jane
-      - key: ACCESS_CODE
-        sync: false
-      - key: SESSION_SECRET
-        generateValue: true
       - key: NOTIFY_PROVIDER
         value: none
       - key: TELEGRAM_BOT_TOKEN
