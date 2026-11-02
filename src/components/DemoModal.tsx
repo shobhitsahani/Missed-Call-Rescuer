@@ -66,7 +66,7 @@ export function DemoModal({ isOpen, onClose, onDataCleared }: DemoModalProps) {
     } catch (err: unknown) {
       setClearResult({
         ok: false,
-        message: err instanceof Error ? err.message : 'Failed to clear test data. Ensure ADMIN_ENABLED=true if in production.',
+        message: err instanceof Error ? err.message : 'Failed to clear test data. In production this requires the x-admin-token header.',
       });
     } finally {
       setClearing(false);

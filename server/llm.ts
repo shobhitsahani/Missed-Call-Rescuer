@@ -31,7 +31,8 @@ let currentApiKey: string | undefined;
 
 export function getClient() {
   const apiKey = process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || 'ollama';
-  const baseURL = process.env.OPENAI_BASE_URL || process.env.OPENAI_API_BASE;
+  const baseURL = process.env.OPENAI_BASE_URL || process.env.OPENAI_API_BASE ||
+    (process.env.GROQ_API_KEY ? 'https://api.groq.com/openai/v1' : undefined);
   if (!clientInstance || currentBaseURL !== baseURL || currentApiKey !== apiKey) {
     currentBaseURL = baseURL;
     currentApiKey = apiKey;
@@ -43,8 +44,27 @@ export function getClient() {
   return clientInstance;
 }
 
+function requestTimeout(ms: number, parent?: AbortSignal) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`LLM request timed out after ${ms}ms`));
+  }, ms);
+  const onAbort = () => controller.abort(parent?.reason);
+  if (parent) {
+    if (parent.aborted) controller.abort(parent.reason);
+    else parent.addEventListener('abort', onAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    clear: () => {
+      clearTimeout(timer);
+      parent?.removeEventListener('abort', onAbort);
+    },
+  };
+}
+
 export function model() {
-  return process.env.OPENAI_MODEL || process.env.ANTHROPIC_MODEL || 'qwen/qwen3.8-27b';
+  return process.env.OPENAI_MODEL || 'qwen/qwen3.8-27b';
 }
 
 export function buildPhonePolicy(context?: CallContext | null): string {
@@ -162,13 +182,14 @@ export async function streamChat(
   const sys = buildSystem(business, context);
   const fullMessages: ChatMessage[] = [{ role: 'system', content: sys }, ...messages];
   let full = '';
+  const timeout = requestTimeout(20000, signal);
   try {
     const stream = await client.chat.completions.create({
       model: m,
       messages: fullMessages,
       stream: true,
       temperature: 0.3,
-    }, { signal });
+    }, { signal: timeout.signal });
     for await (const chunk of stream) {
       const delta = chunk.choices?.[0]?.delta?.content || '';
       if (delta) {
@@ -185,6 +206,8 @@ export async function streamChat(
     const fallback = "I'm sorry, I'm having trouble right now. Could you leave a brief message and the team will get back to you?";
     full = fallback;
     if (onDelta) onDelta(fallback);
+  } finally {
+    timeout.clear();
   }
   return full;
 }
@@ -275,19 +298,24 @@ ${transcript}`;
     if (systemInstruction) {
       messages.unshift({ role: 'system', content: systemInstruction });
     }
-    const resp = await client.chat.completions.create({
-      model: m,
-      messages,
-      temperature: 0.1,
-    });
-    const raw = resp.choices?.[0]?.message?.content || '';
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return { parsed: null, raw };
+    const timeout = requestTimeout(12000);
     try {
-      const json = JSON.parse(jsonMatch[0]) as unknown;
-      return { parsed: json, raw };
-    } catch {
-      return { parsed: null, raw };
+      const resp = await client.chat.completions.create({
+        model: m,
+        messages,
+        temperature: 0.1,
+      }, { signal: timeout.signal });
+      const raw = resp.choices?.[0]?.message?.content || '';
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return { parsed: null, raw };
+      try {
+        const json = JSON.parse(jsonMatch[0]) as unknown;
+        return { parsed: json, raw };
+      } catch {
+        return { parsed: null, raw };
+      }
+    } finally {
+      timeout.clear();
     }
   };
 

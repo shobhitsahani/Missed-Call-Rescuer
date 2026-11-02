@@ -31,6 +31,7 @@ interface SidebarProps {
   callsCount: number;
   missedCount: number;
   sseConnected: boolean;
+  sseError?: boolean;
   businessName?: string;
   collapsed: boolean;
   onToggleCollapse: () => void;
@@ -45,6 +46,7 @@ export function Sidebar({
   callsCount,
   missedCount,
   sseConnected,
+  sseError = false,
   businessName = 'Business',
   collapsed,
   onToggleCollapse,
@@ -186,13 +188,13 @@ export function Sidebar({
             <div className="flex items-center gap-2">
               <span
                 className={`h-2 w-2 rounded-full shrink-0 ${
-                  sseConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
+                  sseConnected ? 'bg-emerald-500 animate-pulse' : sseError ? 'bg-destructive' : 'bg-amber-500'
                 }`}
                 aria-hidden="true"
               />
               {!isIconOnly && (
                 <span className="text-[11px] font-medium text-foreground">
-                  {sseConnected ? 'Live sync' : 'Syncing...'}
+                  {sseConnected ? 'Live sync' : sseError ? 'Sync offline' : 'Connecting...'}
                 </span>
               )}
             </div>

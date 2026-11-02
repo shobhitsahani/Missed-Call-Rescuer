@@ -100,7 +100,7 @@ async function main() {
     body: JSON.stringify({ phone: '+1 (555) 019-8877' }),
   });
   const simData = await simRes.json();
-  const callUrl = `http://localhost:3010/call/${simData.missedCallId}`;
+  const callUrl = `http://localhost:3010/call/${simData.token}`;
 
   console.log(`Capturing Call Page screenshot at ${callUrl}...`);
   const callPng = path.join(publicDir, 'call-interface.png');

@@ -4,25 +4,28 @@ services:
     runtime: node
     plan: free
     region: oregon
-    buildCommand: npm install
+    # tsx is a devDependency, so dev packages must be installed for the start command.
+    buildCommand: npm install --include=dev
     startCommand: npx tsx server/index.ts
+    healthCheckPath: /api/health
     envVars:
-      - key: PORT
-        value: 4000
       - key: NODE_ENV
         value: production
       - key: ALLOWED_ORIGINS
-        value: https://missed-call-rescuer.vercel.app,http://localhost:3010
+        value: https://missed-call-rescuer.vercel.app
       - key: MAX_CONCURRENT_CALLS
         value: 2
       - key: MAX_CALLS_PER_DAY
         value: 100
       - key: MAX_CALL_SECONDS
         value: 300
-      - key: ADMIN_ENABLED
-        value: true
+      # Optional. When unset, admin/test routes are disabled in production.
+      - key: ADMIN_TOKEN
+        sync: false
       - key: STT_PROVIDER
         value: assemblyai
+      - key: ASSEMBLYAI_SPEECH_MODEL
+        value: universal-3-6-pro
       - key: FIRST_CHUNK_MIN_WORDS
         value: 6
       - key: OPENAI_BASE_URL
@@ -45,3 +48,7 @@ services:
         sync: false
       - key: DASHBOARD_URL
         value: https://missed-call-rescuer.vercel.app
+      # NOTE: Render free web services have an ephemeral filesystem. SQLite data
+      # survives process restarts in place but is lost on redeploy/instance
+      # replacement. Attach a persistent disk (paid plan) and set DB_PATH to the
+      # mount path if durable demo data is required.

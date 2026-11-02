@@ -39,7 +39,6 @@ export default function CallPage() {
   const params = useParams();
   const token = params?.token as string;
   const [business, setBusiness] = useState<{ name: string; voice: string } | null>(null);
-  const [sttProvider, setSttProvider] = useState<string>('assemblyai');
   const [status, setStatus] = useState('idle');
   const [started, setStarted] = useState(false);
   const [state, setState] = useState('GREETING');
@@ -58,8 +57,11 @@ export default function CallPage() {
   const micCtxRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const connectionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const endFallbackRef = useRef<NodeJS.Timeout | null>(null);
+  const connectingRef = useRef(false);
 
   const endedRef = useRef(false);
+  const summaryReceivedRef = useRef(false);
   const stateRef = useRef(state);
   const transcriptBottomRef = useRef<HTMLDivElement | null>(null);
 
@@ -70,9 +72,13 @@ export default function CallPage() {
   // Validate callback token and fetch session metadata via public endpoint
   useEffect(() => {
     let isCancelled = false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
     async function validateToken() {
       try {
-        const res = await fetch(`${getApiBase()}/api/call-token/${encodeURIComponent(token)}`);
+        const res = await fetch(`${getApiBase()}/api/call-token/${encodeURIComponent(token)}`, {
+          signal: controller.signal,
+        });
         const data = await res.json().catch(() => null);
         if (isCancelled) return;
 
@@ -92,11 +98,13 @@ export default function CallPage() {
         if (data?.valid) {
           setBusiness({ name: data.businessName, voice: data.voice });
         }
-      } catch {
+      } catch (err) {
         if (!isCancelled) {
-          setTokenError('Unable to connect to the callback server.');
+          const aborted = err instanceof DOMException && err.name === 'AbortError';
+          setTokenError(aborted ? 'Timed out connecting to the callback server.' : 'Unable to connect to the callback server.');
         }
       } finally {
+        clearTimeout(timeout);
         if (!isCancelled) setValidatingToken(false);
       }
     }
@@ -104,6 +112,8 @@ export default function CallPage() {
     validateToken();
     return () => {
       isCancelled = true;
+      clearTimeout(timeout);
+      controller.abort();
     };
   }, [token]);
 
@@ -127,6 +137,9 @@ export default function CallPage() {
   }, [state]);
 
   function initAudio() {
+    if (audioCtxRef.current?.state === 'closed') {
+      audioCtxRef.current = null;
+    }
     if (!audioCtxRef.current) {
       const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       audioCtxRef.current = new Ctx({ sampleRate: 24000 });
@@ -140,6 +153,7 @@ export default function CallPage() {
 
   function playPcmChunk(arrayBuffer: ArrayBuffer) {
     const ctx = initAudio();
+    if (ctx.state === 'closed') return;
     const int16 = new Int16Array(arrayBuffer);
     const float32 = new Float32Array(int16.length);
     for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
@@ -181,6 +195,58 @@ export default function CallPage() {
     if (audioCtxRef.current) nextStartRef.current = audioCtxRef.current.currentTime;
   }
 
+  function releaseMedia() {
+    // Prevent SpeechRecognition.onend from restarting during teardown.
+    endedRef.current = true;
+    try {
+      recRef.current?.stop?.();
+    } catch {}
+    recRef.current = null;
+    try {
+      workletNodeRef.current?.disconnect();
+    } catch {}
+    workletNodeRef.current = null;
+    try {
+      mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    } catch {}
+    mediaStreamRef.current = null;
+    try {
+      micCtxRef.current?.close();
+    } catch {}
+    micCtxRef.current = null;
+  }
+
+  function releaseAudio() {
+    stopAllAudio();
+    if (audioCtxRef.current) {
+      try {
+        audioCtxRef.current.close();
+      } catch {}
+      audioCtxRef.current = null;
+    }
+    nextStartRef.current = 0;
+  }
+
+  // Release mic, audio context and socket if the page is unmounted mid-call.
+  useEffect(() => {
+    return () => {
+      endedRef.current = true;
+      if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+      if (endFallbackRef.current) clearTimeout(endFallbackRef.current);
+      releaseMedia();
+      releaseAudio();
+      const ws = wsRef.current;
+      wsRef.current = null;
+      if (ws && ws.readyState !== WebSocket.CLOSED) {
+        try {
+          ws.close();
+        } catch {}
+      }
+    };
+    // Cleanup helpers only touch refs; run once on unmount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function similar(a: string, b: string) {
     const na = a.toLowerCase().replace(/[^\w\s]/g, '').trim();
     const nb = b.toLowerCase().replace(/[^\w\s]/g, '').trim();
@@ -195,7 +261,10 @@ export default function CallPage() {
   }
 
   async function connect() {
-    if (started) return;
+    if (connectingRef.current) return;
+    connectingRef.current = true;
+    endedRef.current = false;
+    summaryReceivedRef.current = false;
     setStarted(true);
     setStatus('connecting');
     setError(null);
@@ -211,10 +280,14 @@ export default function CallPage() {
       }
     }, 10000);
 
-    const provider = sttProvider;
+    const wsUrl = getApiBase().replace(/^http/, 'ws') + '/ws';
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    wsRef.current = ws;
 
-    // In AssemblyAI mode, acquire mic before connecting WS
-    if (provider === 'assemblyai') {
+    // Capture microphone PCM and stream it to the server (server-side STT).
+    async function setupMic(target: WebSocket) {
+      if (mediaStreamRef.current) return;
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -223,6 +296,10 @@ export default function CallPage() {
             autoGainControl: true,
           },
         });
+        if (endedRef.current || target !== wsRef.current) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
         mediaStreamRef.current = stream;
 
         const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -240,14 +317,20 @@ export default function CallPage() {
         workletNodeRef.current = workletNode;
 
         workletNode.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(event.data);
+          if (target === wsRef.current && target.readyState === WebSocket.OPEN) {
+            target.send(event.data);
           }
         };
 
         micSource.connect(workletNode);
+        setProgressMessage('Listening...');
       } catch (err: unknown) {
         if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+        try { target.close(); } catch {}
+        if (target === wsRef.current) wsRef.current = null;
+        connectingRef.current = false;
+        endedRef.current = true;
+        releaseMedia();
         setStarted(false);
         setStatus('idle');
         const errObj = err as Error;
@@ -256,18 +339,110 @@ export default function CallPage() {
         } else {
           setError(`Microphone error: ${errObj.message || 'Unable to access audio device.'}`);
         }
-        return;
       }
     }
 
-    const wsUrl = getApiBase().replace(/^http/, 'ws') + '/ws';
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = 'arraybuffer';
-    wsRef.current = ws;
+    // Browser SpeechRecognition fallback (no server-side STT).
+    function startBrowserStt(target: WebSocket) {
+      if (recRef.current) return;
+      type SpeechRecognitionCtor = new () => {
+        continuous: boolean;
+        interimResults: boolean;
+        lang: string;
+        start: () => void;
+        stop: () => void;
+        onresult: (e: {
+          resultIndex: number;
+          results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }>;
+        }) => void;
+        onerror: (e: { error: string }) => void;
+        onend: () => void;
+      };
+      const win = window as unknown as {
+        SpeechRecognition?: SpeechRecognitionCtor;
+        webkitSpeechRecognition?: SpeechRecognitionCtor;
+      };
+      const SR = win.SpeechRecognition || win.webkitSpeechRecognition;
+      if (!SR) {
+        setError('Browser speech recognition is not supported in this browser. Please use Chrome or Edge.');
+        try { target.close(); } catch {}
+        if (target === wsRef.current) wsRef.current = null;
+        connectingRef.current = false;
+        setStarted(false);
+        setStatus('idle');
+        return;
+      }
+
+      const rec = new SR();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.lang = 'en-US';
+
+      rec.onresult = (e) => {
+        let interim = '';
+        let final = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const t = e.results[i][0].transcript;
+          if (e.results[i].isFinal) final += t;
+          else interim += t;
+        }
+
+        if (interim) {
+          setLivePartial(interim);
+        }
+
+        // Barge-in guard evaluation in browser mode
+        if (interim && (stateRef.current === 'SPEAKING' || stateRef.current === 'THINKING')) {
+          const words = interim.trim().split(/\s+/).filter(Boolean).length;
+          const speakingFor = Date.now() - agentSpeakingStartRef.current;
+          if (words >= 2 && speakingFor >= 400 && !similar(interim, currentAgentTextRef.current)) {
+            try {
+              target.send(JSON.stringify({ type: 'barge_in' }));
+            } catch {}
+            stopAllAudio();
+            markLastAgentTurnInterrupted();
+          }
+        }
+
+        if (final.trim()) {
+          setLivePartial('');
+          setTranscript((t) => [...t, { role: 'customer', text: final.trim() }]);
+          try {
+            target.send(JSON.stringify({ type: 'transcript', final: true, text: final.trim() }));
+          } catch {}
+        }
+      };
+
+      rec.onerror = (e: { error: string }) => {
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          setError('Microphone access blocked. Please enable microphone permissions in your browser.');
+        } else if (e.error === 'network') {
+          setError('Speech recognition network error. Please verify your connection.');
+        } else {
+          console.warn('STT error', e.error);
+        }
+      };
+
+      rec.onend = () => {
+        if (!endedRef.current && !summaryReceivedRef.current && target.readyState === WebSocket.OPEN) {
+          try {
+            rec.start();
+          } catch {}
+        }
+      };
+
+      recRef.current = rec;
+      try {
+        rec.start();
+        setProgressMessage('Listening...');
+      } catch (e) {
+        console.error(e);
+      }
+    }
 
     ws.onopen = () => {
       setStatus('connected');
-      ws.send(JSON.stringify({ type: 'join', token, missedCallId: token }));
+      ws.send(JSON.stringify({ type: 'join', token }));
     };
 
     ws.onmessage = (ev) => {
@@ -296,7 +471,13 @@ export default function CallPage() {
       switch (msg.type) {
         case 'config':
           if (msg.sttProvider) {
-            setSttProvider(msg.sttProvider);
+            // The provider is known only after the server replies, so wire the
+            // microphone path here instead of guessing at connect time.
+            if (msg.sttProvider === 'browser') {
+              startBrowserStt(ws);
+            } else {
+              void setupMic(ws);
+            }
           }
           break;
         case 'progress':
@@ -345,7 +526,14 @@ export default function CallPage() {
           break;
         }
         case 'summary':
+          summaryReceivedRef.current = true;
+          endedRef.current = true;
+          if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+          if (endFallbackRef.current) clearTimeout(endFallbackRef.current);
           setSummary(msg.summary || null);
+          setProgressMessage('Call complete');
+          releaseMedia();
+          stopAllAudio();
           break;
         case 'error':
           if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
@@ -355,144 +543,82 @@ export default function CallPage() {
     };
 
     ws.onclose = () => {
+      connectingRef.current = false;
       setStatus('closed');
+      if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+      if (summaryReceivedRef.current || endedRef.current) {
+        releaseMedia();
+        stopAllAudio();
+        return;
+      }
+      // Unexpected disconnect before the summary: release devices and return to
+      // the pre-call screen so the user can retry without a dead audio graph.
+      releaseMedia();
+      stopAllAudio();
+      setStarted(false);
+      setStatus('idle');
+      setError('The call connection closed before the assistant finished. Please try again.');
     };
 
     ws.onerror = () => {
       if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
       setError('Connection lost. Could not communicate with the voice server.');
     };
-
-    // If STT provider is browser fallback, setup SpeechRecognition
-    if (provider === 'browser') {
-      type SpeechRecognitionCtor = new () => {
-        continuous: boolean;
-        interimResults: boolean;
-        lang: string;
-        start: () => void;
-        stop: () => void;
-        onresult: (e: {
-          resultIndex: number;
-          results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }>;
-        }) => void;
-        onerror: (e: { error: string }) => void;
-        onend: () => void;
-      };
-      const win = window as unknown as {
-        SpeechRecognition?: SpeechRecognitionCtor;
-        webkitSpeechRecognition?: SpeechRecognitionCtor;
-      };
-      const SR = win.SpeechRecognition || win.webkitSpeechRecognition;
-      if (!SR) {
-        setError('Browser speech recognition is not supported in this browser. Please use Chrome or Edge.');
-        return;
-      }
-
-      const rec = new SR();
-      rec.continuous = true;
-      rec.interimResults = true;
-      rec.lang = 'en-US';
-
-      rec.onresult = (e: {
-        resultIndex: number;
-        results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }>;
-      }) => {
-        let interim = '';
-        let final = '';
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          const t = e.results[i][0].transcript;
-          if (e.results[i].isFinal) final += t;
-          else interim += t;
-        }
-
-        if (interim) {
-          setLivePartial(interim);
-        }
-
-        // Barge-in guard evaluation in browser mode
-        if (interim && (stateRef.current === 'SPEAKING' || stateRef.current === 'THINKING')) {
-          const words = interim.trim().split(/\s+/).filter(Boolean).length;
-          const speakingFor = Date.now() - agentSpeakingStartRef.current;
-          if (words >= 2 && speakingFor >= 400 && !similar(interim, currentAgentTextRef.current)) {
-            try {
-              ws.send(JSON.stringify({ type: 'barge_in' }));
-            } catch {}
-            stopAllAudio();
-            markLastAgentTurnInterrupted();
-          }
-        }
-
-        if (final.trim()) {
-          setLivePartial('');
-          setTranscript((t) => [...t, { role: 'customer', text: final.trim() }]);
-          try {
-            ws.send(JSON.stringify({ type: 'transcript', final: true, text: final.trim() }));
-          } catch {}
-        }
-      };
-
-      rec.onerror = (e: { error: string }) => {
-        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-          setError('Microphone access blocked. Please enable microphone permissions in your browser.');
-        } else if (e.error === 'network') {
-          setError('Speech recognition network error. Please verify your connection.');
-        } else {
-          console.warn('STT error', e.error);
-        }
-      };
-
-      rec.onend = () => {
-        if (!endedRef.current) {
-          try {
-            rec.start();
-          } catch {}
-        }
-      };
-
-      recRef.current = rec;
-      try {
-        rec.start();
-      } catch (e) {
-        console.error(e);
-      }
-    }
   }
 
   function endCall() {
     endedRef.current = true;
+    connectingRef.current = false;
     try {
       wsRef.current?.send(JSON.stringify({ type: 'end', reason: 'user_ended' }));
     } catch {}
+    if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
 
-    // Cleanup mic stream & worklet
-    try {
-      workletNodeRef.current?.disconnect();
-      workletNodeRef.current = null;
-    } catch {}
-    try {
-      mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
-      mediaStreamRef.current = null;
-    } catch {}
-    try {
-      micCtxRef.current?.close();
-      micCtxRef.current = null;
-    } catch {}
+    releaseMedia();
+    releaseAudio();
+    setStatus('ending');
+    setProgressMessage('Ending call — generating summary...');
 
-    // Cleanup browser recognition if active
-    try {
-      recRef.current?.stop?.();
-    } catch {}
-
-    stopAllAudio();
-    if (audioCtxRef.current) {
-      try {
-        audioCtxRef.current.close();
-      } catch {}
-    }
+    // The server keeps the socket open long enough to stream the summary.
+    // If it never arrives (provider outage), fall back to the dashboard view.
+    if (endFallbackRef.current) clearTimeout(endFallbackRef.current);
+    endFallbackRef.current = setTimeout(() => {
+      if (summaryReceivedRef.current) return;
+      const socket = wsRef.current;
+      wsRef.current = null;
+      if (socket) {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        try { socket.close(); } catch {}
+      }
+      setStarted(false);
+      setStatus('idle');
+      setError('The call ended, but the summary is still processing. It will appear on the dashboard when ready.');
+    }, 45000);
   }
 
   function retryCall() {
-    endCall();
+    endedRef.current = true;
+    connectingRef.current = false;
+    if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+    if (endFallbackRef.current) clearTimeout(endFallbackRef.current);
+    releaseMedia();
+    releaseAudio();
+
+    // Detach and close the old socket so late events cannot mutate the retry.
+    const oldSocket = wsRef.current;
+    wsRef.current = null;
+    if (oldSocket) {
+      oldSocket.onopen = null;
+      oldSocket.onmessage = null;
+      oldSocket.onclose = null;
+      oldSocket.onerror = null;
+      try { oldSocket.close(); } catch {}
+    }
+
+    summaryReceivedRef.current = false;
     setError(null);
     setProgressMessage(null);
     setStarted(false);
@@ -501,9 +627,9 @@ export default function CallPage() {
     setTranscript([]);
     setLivePartial('');
     setSummary(null);
-    endedRef.current = false;
+    setLatestMetric(null);
     setTimeout(() => {
-      connect();
+      void connect();
     }, 250);
   }
 

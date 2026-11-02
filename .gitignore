@@ -52,6 +52,7 @@ scripts/fixtures/
 
 # vercel
 .vercel
+.opencode/
 
 # typescript
 *.tsbuildinfo

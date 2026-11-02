@@ -20,6 +20,12 @@ export function checkRateLimit(
     return { allowed: false, remaining: 0 };
   }
   timestamps.push(now);
+  // Bound memory for long-running processes; stale buckets are pruned lazily.
+  if (rateLimitBuckets.size > 10000) {
+    for (const [k, v] of rateLimitBuckets) {
+      if (!v.some((t) => now - t < windowMs)) rateLimitBuckets.delete(k);
+    }
+  }
   rateLimitBuckets.set(key, timestamps);
   return { allowed: true, remaining: limit - timestamps.length };
 }
@@ -44,9 +50,10 @@ export function getAllowedOrigins(): string[] {
 
   const defaults = [
     'https://missed-call-rescuer.vercel.app',
-    'http://localhost:3010',
-    'http://127.0.0.1:3010',
   ];
+  if (process.env.NODE_ENV !== 'production') {
+    defaults.push('http://localhost:3010', 'http://127.0.0.1:3010');
+  }
 
   return Array.from(new Set([...defaults, ...configured]));
 }
@@ -89,7 +96,7 @@ export function checkCallBudget(): { allowed: boolean; reason?: string } {
 
   // Check 24-hour call cap
   try {
-    const row = db.prepare(`SELECT COUNT(*) as cnt FROM calls WHERE start_time >= datetime('now', '-24 hours')`).get() as { cnt: number } | undefined;
+    const row = db.prepare(`SELECT COUNT(*) as cnt FROM calls WHERE julianday(start_time) >= julianday('now', '-24 hours')`).get() as { cnt: number } | undefined;
     if (row && row.cnt >= MAX_CALLS_PER_DAY) {
       return { allowed: false, reason: 'Daily demo limit reached. Please try again tomorrow.' };
     }

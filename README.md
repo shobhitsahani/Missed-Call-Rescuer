@@ -77,7 +77,7 @@ Missed-Call Rescuer is split into a frontend web dashboard (Vercel) and a real-t
 
 ### 2. Backend on Render (`render.yaml`)
 - **Service Type**: Web Service (Node or Docker).
-- **Build Command**: `npm install`
+- **Build Command**: `npm install --include=dev`
 - **Start Command**: `npx tsx server/index.ts`
 - **Persistent Disk**:
   - Mount Path: `/var/data`
@@ -104,7 +104,9 @@ Missed-Call Rescuer is split into a frontend web dashboard (Vercel) and a real-t
 | `MAX_CONCURRENT_CALLS`| Maximum simultaneous active calls | `2` | Backend | No |
 | `MAX_CALLS_PER_DAY` | Daily budget cap for voice calls | `100` | Backend | No |
 | `MAX_CALL_SECONDS` | Maximum allowed duration per call in seconds | `300` | Backend | No |
-| `ADMIN_ENABLED` | Allows authenticated test data clearing in production | `false` | Backend | No |
+| `ADMIN_TOKEN` | When set in production, required as `x-admin-token` for admin/test routes. Leave empty to disable those routes. | _(empty)_ | Backend | **Yes** |
+| `GROQ_API_KEY` | Optional Groq key; takes precedence over `OPENAI_API_KEY` when set | `gsk_xxxxxxxxxxxxxx` | Backend | **Yes** |
+| `ASSEMBLYAI_SPEECH_MODEL` | AssemblyAI streaming STT model | `universal-3-6-pro` | Backend | No |
 | `NOTIFY_PROVIDER` | Owner alert provider (`telegram`, `discord`, `none`) | `none` | Backend | No |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot API token | `123456789:ABCdef...` | Backend | **Yes** |
 | `TELEGRAM_CHAT_ID` | Telegram chat ID for owner alerts | `123456789` | Backend | **Yes** |
@@ -166,7 +168,9 @@ Latency measured across 3 automated verification runs (15 total conversational t
 - **In-Memory Session State**: Active voice session state is held in-memory on the active Node.js server. Horizontal scaling requires sticky sessions or an external Redis state store.
 - **Single Business Seed**: The database seeds a single business profile (`Acme Plumbing`). Multi-business tenancy is not currently merged.
 - **Free-Tier Rate Limits**: Free tier AssemblyAI and Groq credentials have concurrency limits (default `MAX_CONCURRENT_CALLS=2`).
-- **Open Demo Mode**: The hackathon demo runs in frictionless open access mode without user logins. Rate limits, daily budget caps, unguessable call tokens, and CORS origin restrictions protect backend resources.
+- **Open Demo Mode**: The hackathon demo runs in frictionless open access mode without user logins. Rate limits, daily budget caps, unguessable call tokens, and CORS origin restrictions protect backend resources. Public dashboard APIs still return missed-call callback tokens (so judges can open a call) and masked phone numbers. Do not treat this as a multi-tenant production lock-down.
+- **Render Free-Tier Cold Start**: The backend on the Render free plan can sleep after idle time. The first dashboard or call request after sleep may take 30–60 seconds. Retry if the dashboard shows a backend connection error.
+- **Hackathon demo video**: The AssemblyAI Voice Hackathon submission form requires a demo video link. The live site is not a substitute unless organizers approve an exception. Record and upload the video separately using the shot list in [`docs/SUBMISSION.md`](docs/SUBMISSION.md).
 
 ---
 

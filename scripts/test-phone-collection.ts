@@ -46,6 +46,13 @@ console.log('Test Group 0: Spoken Digits & Normalization');
   assert.strictEqual(ind.isValid, true);
   assert.strictEqual(ind.normalized, '+919876543210');
 
+  // Ambiguous 10-digit numbers follow the business locale.
+  const ind10 = validatePhoneDigits('9876543210', 'IN');
+  assert.strictEqual(ind10.isValid, true);
+  assert.strictEqual(ind10.normalized, '+919876543210');
+  const us10 = validatePhoneDigits('9876543210');
+  assert.strictEqual(us10.normalized, '+19876543210');
+
   // Incomplete
   const inc = validatePhoneDigits('55501');
   assert.strictEqual(inc.isValid, false);

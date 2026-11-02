@@ -1,15 +1,23 @@
+function normaliseBase(value: string): string {
+  return value.trim().replace(/\/+$/, '');
+}
+
 export function getApiBase(): string {
+  // Explicit configuration always wins, in every environment. This is what
+  // Vercel/Render deployments use to point at a non-default backend.
+  const explicit = process.env.NEXT_PUBLIC_API_BASE;
+  if (explicit && explicit.trim()) {
+    return normaliseBase(explicit);
+  }
+
   if (typeof window !== 'undefined') {
     const { hostname, protocol } = window.location;
-    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]') {
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') {
       return 'http://localhost:4000';
     }
     if (hostname.includes('vercel.app') || protocol === 'https:') {
       return 'https://missed-call-rescuer-api.onrender.com';
     }
-  }
-  if (process.env.NEXT_PUBLIC_API_BASE) {
-    return process.env.NEXT_PUBLIC_API_BASE.replace(/\/+$/, '');
   }
   if (process.env.NODE_ENV === 'production') {
     return 'https://missed-call-rescuer-api.onrender.com';

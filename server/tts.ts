@@ -122,6 +122,9 @@ export class TtsClient {
           if (!settled) { settled = true; reject(new Error(`TTS ${msg.error_code}: ${msg.error} (voice_id=${this.voiceId})`)); }
           return;
         }
+        // Tag every frame with the generation active when it arrived. Frames
+        // from a cancelled utterance must never be consumed by the next one.
+        (msg as TtsFrame & { __gen?: number }).__gen = this.generation;
         this.pushFrame(msg);
       });
 
@@ -135,17 +138,19 @@ export class TtsClient {
           settled = true;
           reject(err);
         }
-        this.connected = false;
+        if (this.ws === ws) this.connected = false;
       });
 
       ws.on('close', () => {
         cleanupTimeout();
+        // Ignore close events from a socket that has already been replaced by a retry.
+        if (this.ws !== ws) return;
         this.connected = false;
         this.ws = null;
         // unblock any waiters
         while (this.frameWaiters.length) {
           const w = this.frameWaiters.shift()!;
-          w({ type: 'Error', error_code: 1006, error: 'connection closed' });
+          w({ type: 'Error', error_code: 1006, error: 'connection closed', __gen: this.generation });
         }
       });
     });
@@ -194,6 +199,11 @@ export class TtsClient {
       }
       if (!frame) break;
       if (this.generation !== myGen) break;
+      // Ignore frames that were emitted for a previous/cancelled utterance.
+      if (typeof (frame as TtsFrame & { __gen?: number }).__gen === 'number' &&
+          (frame as TtsFrame & { __gen?: number }).__gen !== myGen) {
+        continue;
+      }
       switch (frame.type) {
         case 'Audio':
           if (this.cancelled || this.generation !== myGen) {
@@ -244,6 +254,13 @@ export class TtsClient {
   }
 
   async close() {
+    this.closed = true;
+    this.cancelled = true;
+    this.frameQueue = [];
+    while (this.frameWaiters.length) {
+      const w = this.frameWaiters.shift()!;
+      w({ type: 'Cancelled' });
+    }
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try { this.ws.send(JSON.stringify({ type: 'Terminate' })); } catch {}
     }

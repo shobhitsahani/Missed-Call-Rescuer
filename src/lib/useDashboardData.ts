@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { toast } from 'sonner';
 import { api, getApiBase } from '@/lib/api';
 import { CallDetails, SummaryDetails, TurnDetails, LatencyItem } from '@/components/Drawer';
@@ -49,29 +49,45 @@ export function useDashboardData() {
   const [turnsMap, setTurnsMap] = useState<Record<string, TurnDetails[]>>({});
   const [loadingTurns, setLoadingTurns] = useState<Record<string, boolean>>({});
   const [initialLoading, setInitialLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [simulating, setSimulating] = useState(false);
   const [lastCallId, setLastCallId] = useState<string | null>(null);
   const [lastCallToken, setLastCallToken] = useState<string | null>(null);
   const [sseConnected, setSseConnected] = useState(false);
+  const [sseError, setSseError] = useState(false);
+  const inFlightRef = useRef<Promise<void> | null>(null);
 
   const load = useCallback(async () => {
-    try {
-      const [b, m, c] = await Promise.all([
-        api('/api/business').catch(() => null),
-        api('/api/missed-calls').catch(() => []),
-        api('/api/calls').catch(() => []),
+    if (inFlightRef.current) return inFlightRef.current;
+
+    const run = (async () => {
+      const [bizResult, missedResult, callsResult] = await Promise.allSettled([
+        api('/api/business'),
+        api('/api/missed-calls'),
+        api('/api/calls'),
       ]);
 
-      if (b) {
-        setBusiness(b);
-      }
-      setMissed(m || []);
-      setCalls(c || []);
+      let failures = 0;
 
-      if (Array.isArray(c)) {
+      if (bizResult.status === 'fulfilled' && bizResult.value) {
+        setBusiness(bizResult.value);
+      } else {
+        failures++;
+      }
+
+      if (missedResult.status === 'fulfilled' && Array.isArray(missedResult.value)) {
+        setMissed(missedResult.value);
+      } else {
+        failures++;
+      }
+
+      if (callsResult.status === 'fulfilled' && Array.isArray(callsResult.value)) {
+        const callsData = callsResult.value as CallDetails[];
+        setCalls(callsData);
+
         const map: Record<string, SummaryDetails> = {};
         await Promise.all(
-          c.map(async (call: CallDetails) => {
+          callsData.map(async (call) => {
             try {
               const s = await api(`/api/summaries/${call.id}`);
               if (s) map[call.id] = s;
@@ -79,10 +95,24 @@ export function useDashboardData() {
           })
         );
         setSummaries((prev) => ({ ...prev, ...map }));
+      } else {
+        failures++;
       }
-    } catch (e: unknown) {
-      console.error('Failed to load dashboard data:', e);
+
+      if (failures === 3) {
+        setLoadError('Cannot reach the backend. Check that the API is running and that the API base URL is correct.');
+      } else if (failures > 0) {
+        setLoadError('Some dashboard data could not be loaded. Live sync will retry automatically.');
+      } else {
+        setLoadError(null);
+      }
+    })();
+
+    inFlightRef.current = run;
+    try {
+      await run;
     } finally {
+      inFlightRef.current = null;
       setInitialLoading(false);
     }
   }, []);
@@ -103,42 +133,49 @@ export function useDashboardData() {
   // Open SSE event subscription directly without stream token
   useEffect(() => {
     let es: EventSource | null = null;
+    const markConnected = () => {
+      setSseConnected(true);
+      setSseError(false);
+    };
 
     try {
       es = new EventSource(`${getApiBase()}/api/events`);
 
-      es.onopen = () => setSseConnected(true);
+      es.onopen = markConnected;
       es.onerror = () => {
         setSseConnected(false);
+        setSseError(true);
       };
 
       es.onmessage = () => {
-        setSseConnected(true);
-        load();
+        markConnected();
+        void load();
       };
 
+      es.addEventListener('connected', markConnected);
+
       es.addEventListener('call_updated', () => {
-        setSseConnected(true);
-        load();
+        markConnected();
+        void load();
       });
 
       es.addEventListener('missed_call', () => {
-        setSseConnected(true);
-        load();
+        markConnected();
+        void load();
       });
 
       es.addEventListener('call_ended', () => {
-        setSseConnected(true);
-        load();
+        markConnected();
+        void load();
       });
 
       es.addEventListener('data_cleared', () => {
-        setSseConnected(true);
-        load();
+        markConnected();
+        void load();
       });
 
       es.addEventListener('summary_ready', (e: Event) => {
-        setSseConnected(true);
+        markConnected();
         try {
           const me = e as MessageEvent;
           const d = JSON.parse(me.data);
@@ -146,10 +183,11 @@ export function useDashboardData() {
             setSummaries((prev) => ({ ...prev, [d.callId]: d.summary }));
           }
         } catch {}
-        load();
+        void load();
       });
     } catch (err: unknown) {
       console.error('Failed to initialize SSE connection:', err);
+      queueMicrotask(() => setSseError(true));
     }
 
     return () => {
@@ -257,12 +295,14 @@ export function useDashboardData() {
     turnsMap,
     loadingTurns,
     initialLoading,
+    loadError,
     simulating,
     lastCallId,
     setLastCallId,
     lastCallToken,
     setLastCallToken,
     sseConnected,
+    sseError,
     simulate,
     clearTestData,
     fetchTurns,

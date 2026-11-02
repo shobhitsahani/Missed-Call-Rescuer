@@ -25,6 +25,8 @@ export interface ParsedPhone {
   reason?: 'incomplete' | 'too_long' | 'invalid_pattern' | 'no_digits';
 }
 
+export type PhoneCountry = 'US' | 'IN';
+
 const WORD_TO_DIGIT: Record<string, string> = {
   zero: '0',
   oh: '0',
@@ -109,7 +111,7 @@ export function wordsToDigits(text: string): string {
 /**
  * Validates a string of digits and formats into standard E.164 and display representation.
  */
-export function validatePhoneDigits(rawDigits: string): ParsedPhone {
+export function validatePhoneDigits(rawDigits: string, defaultCountry: PhoneCountry = 'US'): ParsedPhone {
   const digits = rawDigits.replace(/\D/g, '');
 
   if (!digits || digits.length === 0) {
@@ -121,10 +123,19 @@ export function validatePhoneDigits(rawDigits: string): ParsedPhone {
     return { isValid: false, digits, reason: 'invalid_pattern' };
   }
 
-  // 10 digits: Standard US/NANP or Indian mobile
+  // 10 digits: Indian mobile (when the business locale is India) or US/NANP.
   if (digits.length === 10) {
-    // US Area code cannot start with 0 or 1
     const firstDigit = digits[0];
+    // Indian 10-digit mobile starts with 6, 7, 8, or 9
+    if (defaultCountry === 'IN' && firstDigit >= '6' && firstDigit <= '9') {
+      return {
+        isValid: true,
+        digits,
+        normalized: `+91${digits}`,
+        formatted: `+91 ${digits.slice(0, 5)} ${digits.slice(5)}`,
+      };
+    }
+    // US Area code cannot start with 0 or 1
     if (firstDigit >= '2' && firstDigit <= '9') {
       const area = digits.slice(0, 3);
       const prefix = digits.slice(3, 6);
@@ -134,15 +145,6 @@ export function validatePhoneDigits(rawDigits: string): ParsedPhone {
         digits,
         normalized: `+1${digits}`,
         formatted: `+1 (${area}) ${prefix}-${line}`,
-      };
-    }
-    // Indian 10-digit mobile starts with 6, 7, 8, or 9
-    if (firstDigit >= '6' && firstDigit <= '9') {
-      return {
-        isValid: true,
-        digits,
-        normalized: `+91${digits}`,
-        formatted: `+91 ${digits.slice(0, 5)} ${digits.slice(5)}`,
       };
     }
     return { isValid: false, digits, reason: 'invalid_pattern' };
@@ -197,7 +199,7 @@ export function validatePhoneDigits(rawDigits: string): ParsedPhone {
  * Extracts potential phone number from customer speech or text.
  * Checks both literal digit sequences and spoken number phrases.
  */
-export function extractPhoneFromUtterance(text: string): ParsedPhone | null {
+export function extractPhoneFromUtterance(text: string, defaultCountry: PhoneCountry = 'US'): ParsedPhone | null {
   if (!text) return null;
 
   // 1. First look for formatted or clustered digit sequences (e.g. "(555) 012-3456", "555.012.3456", "555-012-3456", "+1 555 010 1234")
@@ -206,7 +208,7 @@ export function extractPhoneFromUtterance(text: string): ParsedPhone | null {
   if (clusterMatches && clusterMatches.length > 0) {
     // Take the last matched number (latest specified)
     const candidate = clusterMatches[clusterMatches.length - 1];
-    const parsed = validatePhoneDigits(candidate);
+    const parsed = validatePhoneDigits(candidate, defaultCountry);
     if (parsed.isValid) return parsed;
   }
 
@@ -214,7 +216,7 @@ export function extractPhoneFromUtterance(text: string): ParsedPhone | null {
   const rawDigitsMatch = text.match(/(?:\+?\d[\d\s\-().]{3,20}\d)/g);
   if (rawDigitsMatch) {
     for (let i = rawDigitsMatch.length - 1; i >= 0; i--) {
-      const parsed = validatePhoneDigits(rawDigitsMatch[i]);
+      const parsed = validatePhoneDigits(rawDigitsMatch[i], defaultCountry);
       if (parsed.isValid) return parsed;
       // If incomplete (e.g. 4-9 digits), keep as candidate if nothing better
       if (parsed.reason === 'incomplete' && parsed.digits.length >= 4) {
@@ -226,7 +228,7 @@ export function extractPhoneFromUtterance(text: string): ParsedPhone | null {
   // 3. Check for spoken number words
   const spokenDigits = wordsToDigits(text);
   if (spokenDigits.length >= 4) {
-    return validatePhoneDigits(spokenDigits);
+    return validatePhoneDigits(spokenDigits, defaultCountry);
   }
 
   return null;

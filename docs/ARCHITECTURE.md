@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary
 
-Missed-Call Rescuer is an automated voice callback agent for small service businesses. When a call is missed, the system records the missed call and provides a callback URL (`/call/{id}`). The voice assistant greets the caller, confirms caller intent, handles barge-in interruptions, and records a structured summary for the business owner dashboard.
+Missed-Call Rescuer is an automated voice callback agent for small service businesses. When a call is missed, the system records the missed call and provides a callback URL (`/call/{token}`). The voice assistant greets the caller, confirms caller intent, handles barge-in interruptions, and records a structured summary for the business owner dashboard.
 
 For measured latency benchmarks (Turn Detection, Time-to-First-Token, Time-to-First-Audio, and total time to first audio byte), see the [Latency section of README.md](file:///c:/projects/Missed-Call-Rescuer/README.md#latency).
 
@@ -64,7 +64,7 @@ flowchart TD
 - **Security & Access Control**:
   - Open demo access mode: judges access the dashboard immediately without an access code.
   - `GET /api/call-token/:token`: Public validation for customer callback links (validates 128-bit random token, 30-minute expiry, and single-use).
-  - `POST /api/admin/clear-test-data`: Protected test and demo data clearing action (requires `ADMIN_ENABLED=true` in production).
+  - `POST /api/admin/clear-test-data`: Protected test and demo data clearing action (open in local development; in production requires `ADMIN_TOKEN` via the `x-admin-token` header, or is disabled if that variable is unset).
   - Rate limiting per IP: `POST /api/missed-calls/simulate` (5/min), WebSocket joins (10/min), voice preview (10/min), test/resend notifications (1/30s).
   - Call budget bounds: `MAX_CONCURRENT_CALLS=2`, `MAX_CALLS_PER_DAY=100`, `MAX_CALL_SECONDS=300`.
   - Strict CORS origin validation (`ALLOWED_ORIGINS`) and WebSocket/SSE upgrade origin checks.
@@ -83,7 +83,7 @@ flowchart TD
 - **WebSocket Upgrade (`/ws`)**:
   - Attached to the HTTP server for `/ws` connections, with strict Origin validation in production and join rate limiting (10/min/IP).
   - Incoming client messages:
-    - `{ type: "join", token: string, missedCallId: string }`
+    - `{ type: "join", token: string }`
     - `{ type: "transcript", final: true, text: string }` (browser fallback)
     - `{ type: "barge_in" }`
     - `{ type: "end", reason?: string }`

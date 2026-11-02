@@ -147,7 +147,9 @@ export function OverviewView({
               </p>
               <p className="text-xs text-muted-foreground mt-0.5">
                 Simulate customer voice session:{' '}
-                <span className="font-mono text-primary font-medium">/call/{lastCallToken || lastCallId}</span>
+                <span className="font-mono text-primary font-medium">
+                  {lastCallToken ? `/call/${lastCallToken}` : 'callback link unavailable'}
+                </span>
               </p>
             </div>
           </div>
@@ -158,7 +160,13 @@ export function OverviewView({
               size="sm"
               className="h-8 text-xs font-semibold gap-1.5"
             >
-              <a href={`/call/${lastCallToken || lastCallId}`} target="_blank" rel="noreferrer">
+              <a
+                href={lastCallToken ? `/call/${lastCallToken}` : undefined}
+                aria-disabled={!lastCallToken}
+                className={!lastCallToken ? 'pointer-events-none opacity-50' : undefined}
+                target="_blank"
+                rel="noreferrer"
+              >
                 <span>Open call page</span>
                 <ExternalLink className="h-3 w-3" />
               </a>

@@ -301,7 +301,12 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
 
   let missed: MissedRow | undefined = undefined;
   if (missedCallTokenOrId) {
-    missed = db.prepare('SELECT * FROM missed_calls WHERE token = ? OR id = ?').get(missedCallTokenOrId, missedCallTokenOrId) as MissedRow | undefined;
+    // Only opaque callback tokens are accepted. Guessable database IDs
+    // (mc_<timestamp>) must never be usable to join someone else's call.
+    if (missedCallTokenOrId.startsWith('mc_') || !/^[a-f0-9]{32}$/i.test(missedCallTokenOrId)) {
+      throw new Error('Invalid callback token');
+    }
+    missed = db.prepare('SELECT * FROM missed_calls WHERE token = ?').get(missedCallTokenOrId) as MissedRow | undefined;
   }
   if (!missed) {
     throw new Error('Callback session not found');
@@ -315,7 +320,8 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
     }
   }
 
-  // Single-use check: if call has already started
+  // Single-use check: atomically claim the link. If another socket already
+  // started it, only an active reconnect for the same missed call is allowed.
   if (missed.call_started_at) {
     let isReconnect = false;
     for (const s of sessions.values()) {
@@ -328,7 +334,11 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
       throw new Error('This callback link has already been used');
     }
   } else {
-    db.prepare('UPDATE missed_calls SET call_started_at = ? WHERE id = ?').run(new Date().toISOString(), missed.id);
+    const claim = db.prepare('UPDATE missed_calls SET call_started_at = ? WHERE id = ? AND call_started_at IS NULL')
+      .run(new Date().toISOString(), missed.id);
+    if (claim.changes === 0) {
+      throw new Error('This callback link has already been used');
+    }
   }
 
   const business = rowToBiz(getBusinessRow());
@@ -412,7 +422,10 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
   // connect AssemblyAI STT if enabled
   if (STT_PROVIDER === 'assemblyai') {
     send(session, { type: 'progress', stage: 'stt_connect', message: 'Connecting speech recognition...' });
-    const stt = new SttClient({ apiKey });
+    const stt = new SttClient({
+      apiKey,
+      speechModel: process.env.ASSEMBLYAI_SPEECH_MODEL || undefined,
+    });
     session.stt = stt;
 
     stt.onSpeechStart(() => {
@@ -441,10 +454,13 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
       send(session, { type: 'partial', text: '' });
       send(session, { type: 'customer_transcript', text: cleaned });
       if (session.generating) {
-        // drop overlapping utterances while reply is generating
-        return;
+        // Customer spoke over the agent: cancel the current reply, then
+        // process this final utterance instead of silently dropping it.
+        bargeIn(session);
       }
-      handleCustomerUtterance(session, cleaned, turnDetectionMs);
+      void handleCustomerUtterance(session, cleaned, turnDetectionMs).catch((err: unknown) => {
+        console.error(`[session ${session.id}] handleCustomerUtterance error:`, err instanceof Error ? err.message : String(err));
+      });
     });
 
     stt.onReconnecting((attempt) => {
@@ -567,22 +583,37 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
   }
 
   // 2. Phone extraction & validation check
-  const extracted = extractPhoneFromUtterance(text);
+  // Ambiguous 10-digit numbers follow the business locale: Indian businesses
+  // treat 6-9 prefixes as +91, everyone else as NANP +1.
+  const phoneCountry: 'US' | 'IN' = /india|kolkata|calcutta/i.test(session.business.timezone || '') ? 'IN' : 'US';
+  const extracted = extractPhoneFromUtterance(text, phoneCountry);
   if (extracted) {
     if (extracted.isValid && extracted.normalized) {
-      session.phoneStatus = 'validated';
-      session.collectedPhone = extracted.normalized;
-      session.customerPhone = extracted.normalized;
-      console.log(`[session ${session.id}] Contact status -> validated (${maskPhone(extracted.normalized)})`);
-      try {
-        db.prepare('UPDATE calls SET customer_phone = ?, phone_verified = 1 WHERE id = ?').run(extracted.normalized, session.id);
-        if (session.missedCallId) {
-          db.prepare('UPDATE missed_calls SET customer_phone = ?, phone_verified = 1 WHERE id = ?').run(extracted.normalized, session.missedCallId);
+      const sameAsVerified = session.phoneStatus === 'verified'
+        && session.verifiedCallerPhone === extracted.normalized;
+      if (!sameAsVerified) {
+        session.phoneStatus = session.phoneStatus === 'verified' ? 'confirmed' : 'validated';
+        session.collectedPhone = extracted.normalized;
+        session.customerPhone = extracted.normalized;
+        console.log(`[session ${session.id}] Contact status -> ${session.phoneStatus} (${maskPhone(extracted.normalized)})`);
+        try {
+          // Spoken numbers are not carrier caller-ID, so they are stored as
+          // collected/confirmed rather than verified.
+          db.prepare('UPDATE calls SET customer_phone = ?, phone_verified = 0 WHERE id = ?').run(extracted.normalized, session.id);
+          if (session.missedCallId) {
+            db.prepare('UPDATE missed_calls SET customer_phone = ?, phone_verified = 0 WHERE id = ?').run(extracted.normalized, session.missedCallId);
+          }
+        } catch (dbErr) {
+          console.error('Failed to update call customer_phone:', dbErr);
         }
-      } catch (dbErr) {
-        console.error('Failed to update call customer_phone:', dbErr);
       }
-    } else if (extracted.reason === 'incomplete') {
+    } else if (
+      extracted.reason === 'incomplete'
+      && session.phoneStatus !== 'declined'
+      && session.phoneStatus !== 'verified'
+      && session.phoneStatus !== 'validated'
+      && session.phoneStatus !== 'confirmed'
+    ) {
       session.phoneStatus = 'collected'; // incomplete digits
       console.log(`[session ${session.id}] Contact status -> collected (incomplete: ${extracted.digits.length} digits)`);
     }
@@ -742,7 +773,10 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
   session.abortController = null;
 
   if (session.cancelGeneration) {
-    // barge-in: discard
+    // Persist the partial agent reply as interrupted so the transcript and
+    // summary reflect what the customer actually heard.
+    const partialReply = fullReply.trim();
+    if (partialReply) addTurn(session, 'agent', partialReply, true);
     return;
   }
 
@@ -762,10 +796,6 @@ export function bargeIn(session: Session) {
     try { session.abortController.abort(); } catch {}
   }
   try { session.tts.cancel(); } catch {}
-  const row = db.prepare('SELECT id FROM turns WHERE call_id=? AND role=? ORDER BY order_idx DESC LIMIT 1').get(session.id, 'agent') as { id: string } | undefined;
-  if (row) db.prepare('UPDATE turns SET interrupted=1 WHERE id=?').run(row.id);
-  const last = session.turns.slice().reverse().find((t: SessionTurn) => t.role === 'agent');
-  if (last) last.interrupted = true;
   send(session, { type: 'stop_audio' });
   setState(session, 'LISTENING');
 }
@@ -783,14 +813,28 @@ export async function endSession(session: Session, reason: string) {
   }
 
   setState(session, 'ENDING');
-  db.prepare('UPDATE calls SET end_time=?, end_reason=?, latency_json=?, usage_json=? WHERE id=?')
-    .run(new Date().toISOString(), reason, JSON.stringify(session.latencies), JSON.stringify(session.usage), session.id);
-  if (session.missedCallId) {
-    const status = reason === 'opted_out' ? 'opted_out' : 'done';
-    db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run(status, session.missedCallId);
+  try {
+    db.prepare('UPDATE calls SET end_time=?, end_reason=?, latency_json=?, usage_json=? WHERE id=?')
+      .run(new Date().toISOString(), reason, JSON.stringify(session.latencies), JSON.stringify(session.usage), session.id);
+    if (session.missedCallId) {
+      const status = reason === 'opted_out' ? 'opted_out' : 'done';
+      db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run(status, session.missedCallId);
+    }
+  } catch (dbErr) {
+    console.error(`[session ${session.id}] Failed to persist call end:`, dbErr);
   }
 
   setState(session, 'SUMMARIZING');
+
+  // Close provider connections before summary generation. A slow or hung LLM
+  // must never keep the STT/TTS sockets or the session alive.
+  const stt = session.stt;
+  session.stt = null;
+  if (stt) {
+    try { await stt.close(); } catch {}
+  }
+  try { await session.tts.close(); } catch {}
+
   const transcript = session.turns.map((t: SessionTurn) => `${t.role === 'agent' ? 'Agent' : 'Customer'}: ${t.text}`).join('\n');
   const callContext: llm.CallContext = {
     phoneStatus: session.phoneStatus,
@@ -798,7 +842,25 @@ export async function endSession(session: Session, reason: string) {
     collectedPhone: session.collectedPhone,
     turnCount: session.turns.filter((t: SessionTurn) => t.role === 'customer').length,
   };
-  const { parsed, raw, status: summaryStatus } = await llm.summarize(transcript, session.business, callContext);
+
+  let parsed: llm.StructuredSummary | null = null;
+  let raw = '';
+  let summaryStatus: 'completed' | 'unavailable' = 'unavailable';
+  try {
+    const result = await withStageTimeout(
+      llm.summarize(transcript, session.business, callContext),
+      20000,
+      'Summary generation'
+    );
+    parsed = result.parsed;
+    raw = result.raw;
+    summaryStatus = result.status;
+  } catch (summaryErr) {
+    const msg = summaryErr instanceof Error ? summaryErr.message : String(summaryErr);
+    console.error(`[session ${session.id}] Summary generation failed:`, sanitizeErrorMsg(msg));
+    raw = 'Summary generation failed or timed out.';
+  }
+
   const summaryId = uuidv4();
   const isUnavailable = summaryStatus === 'unavailable' || !parsed;
   const finalStatus = isUnavailable ? 'unavailable' : 'completed';
@@ -806,34 +868,31 @@ export async function endSession(session: Session, reason: string) {
   const summary = {
     id: summaryId,
     callId: session.id,
-    reason: isUnavailable ? 'Summary unavailable' : parsed.reason,
-    urgency: isUnavailable ? '' : parsed.urgency,
-    preferred_time: isUnavailable ? 'not specified' : parsed.preferred_time,
-    contact_details: isUnavailable ? 'not provided' : parsed.contact_details,
-    suggested_action: isUnavailable ? 'Manual follow-up needed' : parsed.suggested_action,
-    short_summary: isUnavailable ? 'Structured summary could not be extracted.' : parsed.short_summary,
-    sentiment: isUnavailable ? '' : parsed.sentiment,
+    reason: isUnavailable ? 'Summary unavailable' : parsed!.reason,
+    urgency: isUnavailable ? '' : parsed!.urgency,
+    preferred_time: isUnavailable ? 'not specified' : parsed!.preferred_time,
+    contact_details: isUnavailable ? 'not provided' : parsed!.contact_details,
+    suggested_action: isUnavailable ? 'Manual follow-up needed' : parsed!.suggested_action,
+    short_summary: isUnavailable ? 'Structured summary could not be extracted.' : parsed!.short_summary,
+    sentiment: isUnavailable ? '' : parsed!.sentiment,
     status: finalStatus,
   };
 
-  db.prepare(`INSERT INTO summaries (id, call_id, reason, urgency, preferred_time, contact_details, suggested_action, short_summary, sentiment, raw, status) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(summaryId, session.id,
-      summary.reason,
-      summary.urgency,
-      summary.preferred_time,
-      summary.contact_details,
-      summary.suggested_action,
-      summary.short_summary,
-      summary.sentiment,
-      raw,
-      finalStatus);
-
-  // close STT and TTS
-  if (session.stt) {
-    try { await session.stt.close(); } catch {}
-    session.stt = null;
+  try {
+    db.prepare(`INSERT INTO summaries (id, call_id, reason, urgency, preferred_time, contact_details, suggested_action, short_summary, sentiment, raw, status) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(summaryId, session.id,
+        summary.reason,
+        summary.urgency,
+        summary.preferred_time,
+        summary.contact_details,
+        summary.suggested_action,
+        summary.short_summary,
+        summary.sentiment,
+        raw,
+        finalStatus);
+  } catch (dbErr) {
+    console.error(`[session ${session.id}] Failed to persist summary:`, dbErr);
   }
-  try { await session.tts.close(); } catch {}
 
   setState(session, 'DONE');
   send(session, { type: 'summary', summary });
@@ -842,8 +901,11 @@ export async function endSession(session: Session, reason: string) {
   }, 500);
 
   sessions.delete(session.id);
-  events.broadcast('call_ended', { callId: session.id, summary });
-  events.broadcast('summary_ready', { callId: session.id, summary });
+
+  // Public SSE carries only the call id. Phone numbers and tokens stay out of
+  // broadcast payloads; the dashboard fetches details through its normal API.
+  events.broadcast('call_ended', { callId: session.id });
+  events.broadcast('summary_ready', { callId: session.id });
 
   // Fire-and-forget owner notification: send nothing if 0 customer turns, unless opted_out
   const customerTurns = (session.turns || []).filter((t: SessionTurn) => t.role === 'customer');

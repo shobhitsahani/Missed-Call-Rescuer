@@ -99,6 +99,8 @@ ensureColumn('calls', 'notify_error', 'TEXT');
 
 // Business settings columns
 ensureColumn('businesses', 'timezone', 'TEXT');
+ensureColumn('businesses', 'language', 'TEXT');
+ensureColumn('businesses', 'owner_email', 'TEXT');
 
 // Call token, expiry, single-use, and source columns on missed_calls
 ensureColumn('missed_calls', 'token', 'TEXT');
@@ -109,14 +111,25 @@ ensureColumn('missed_calls', 'phone_verified', 'INTEGER DEFAULT 0');
 ensureColumn('calls', 'phone_verified', 'INTEGER DEFAULT 0');
 ensureColumn('summaries', 'status', "TEXT NOT NULL DEFAULT 'completed'");
 
-db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_missed_calls_token ON missed_calls(token);`);
-
 // Backfill tokens for existing rows without one
 const rowsWithoutToken = db.prepare('SELECT id FROM missed_calls WHERE token IS NULL').all() as Array<{ id: string }>;
 for (const row of rowsWithoutToken) {
   const randomToken = crypto.randomBytes(16).toString('hex');
   db.prepare('UPDATE missed_calls SET token = ? WHERE id = ?').run(randomToken, row.id);
 }
+
+// Legacy tokens must not live forever. Expire them 30 minutes after the
+// original missed call rather than treating NULL as "never expires".
+const rowsWithoutExpiry = db.prepare(
+  'SELECT id, time FROM missed_calls WHERE token IS NOT NULL AND token_expires_at IS NULL'
+).all() as Array<{ id: string; time: string }>;
+for (const row of rowsWithoutExpiry) {
+  const calledAt = new Date(row.time).getTime();
+  const expiresAt = new Date((Number.isFinite(calledAt) ? calledAt : Date.now()) + 30 * 60 * 1000).toISOString();
+  db.prepare('UPDATE missed_calls SET token_expires_at = ? WHERE id = ?').run(expiresAt, row.id);
+}
+
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_missed_calls_token ON missed_calls(token);`);
 
 export const DEFAULT_BIZ = {
   id: DEFAULT_PRESET.id,

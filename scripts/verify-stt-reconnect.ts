@@ -7,14 +7,14 @@ import path from 'path';
 const API_BASE = 'http://localhost:4000';
 const WS_BASE = 'ws://localhost:4000/ws';
 
-async function simulateCall(): Promise<string> {
+async function simulateCall(): Promise<{ token: string; missedCallId: string }> {
   const res = await fetch(`${API_BASE}/api/missed-calls/simulate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ phone: '+1 (555) 012-9988' }),
   });
   const data = await res.json();
-  return data.missedCallId;
+  return { token: data.token, missedCallId: data.missedCallId };
 }
 
 async function forceDisconnectSTT(missedCallId?: string): Promise<boolean> {
@@ -56,7 +56,7 @@ async function testSttMidCallDisconnect(): Promise<void> {
   const turn1Pcm = fs.readFileSync(path.join(__dirname, 'fixtures', 'turn1.pcm'));
   const turn2Pcm = fs.readFileSync(path.join(__dirname, 'fixtures', 'turn2.pcm'));
 
-  const missedCallId = await simulateCall();
+  const { token, missedCallId } = await simulateCall();
   const ws = new WebSocket(WS_BASE);
 
   return new Promise<void>((resolve, reject) => {
@@ -79,7 +79,7 @@ async function testSttMidCallDisconnect(): Promise<void> {
     }
 
     ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'join', missedCallId }));
+      ws.send(JSON.stringify({ type: 'join', token }));
     });
 
     ws.on('message', async (data, isBinary) => {

@@ -592,6 +592,10 @@ export default function SettingsPage() {
       // 4. Fallback to HTMLAudioElement with ObjectURL
       const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
       const audioUrl = URL.createObjectURL(blob);
+      const previousUrl = blobUrlCacheRef.current.get(targetVoiceId);
+      if (previousUrl && previousUrl !== audioUrl) {
+        try { URL.revokeObjectURL(previousUrl); } catch {}
+      }
       blobUrlCacheRef.current.set(targetVoiceId, audioUrl);
 
       const audio = new Audio(audioUrl);
@@ -648,8 +652,8 @@ export default function SettingsPage() {
       clearTimeout(timeoutTimer);
       if (previewAbortRef.current === controller) {
         previewAbortRef.current = null;
+        setLoadingVoiceId(null);
       }
-      setLoadingVoiceId(null);
     }
   };
 
@@ -723,6 +727,13 @@ export default function SettingsPage() {
         const msg = 'Business settings saved successfully.';
         setSaveSuccessMsg(msg);
         toast.success(msg);
+        // Normalize the visible form to the values that were persisted so
+        // whitespace-only edits do not leave the unsaved-changes bar visible.
+        setName(trimmedName);
+        setHours(hours.trim());
+        setServices(cleanServices);
+        setFaqs(validFaqs);
+        setTone(tone.trim());
         setBaseline({
           name: trimmedName,
           hours: hours.trim(),

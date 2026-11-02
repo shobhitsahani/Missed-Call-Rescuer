@@ -154,11 +154,13 @@ export function MissedCallsView({
       header: () => <span className="text-right block">Action</span>,
       cell: ({ row }) => {
         const isJoinable = row.original.status === 'new' || row.original.status === 'queued';
+        const token = row.original.token;
+        const hasToken = typeof token === 'string' && /^[a-f0-9]{32}$/i.test(token);
         return (
           <div className="flex justify-end">
-            {isJoinable ? (
+            {isJoinable && hasToken ? (
               <Link
-                href={`/call/${row.original.token || row.original.id}`}
+                href={`/call/${token}`}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md bg-primary/10 hover:bg-primary/20 text-primary border border-primary/30 transition-colors"

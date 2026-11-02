@@ -37,6 +37,7 @@ import {
   isOriginAllowed,
   checkCallBudget,
 } from './security';
+import { maskPhone } from './phone';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -47,7 +48,7 @@ app.use(cors({
     if (!origin || isOriginAllowed(origin)) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      callback(Object.assign(new Error('Not allowed by CORS'), { status: 403 }));
     }
   },
   credentials: true,
@@ -55,6 +56,50 @@ app.use(cors({
 app.use(express.json({ limit: '100kb' }));
 
 const PORT = process.env.PORT || 4000;
+
+/**
+ * Administrative/diagnostic routes are open locally for development, but in
+ * production they require an explicit ADMIN_TOKEN header. This keeps the
+ * hackathon dashboard open without exposing destructive operations to the
+ * public internet.
+ */
+function isAdminAuthorized(req: express.Request): boolean {
+  const configured = process.env.ADMIN_TOKEN;
+  const provided = req.headers['x-admin-token'];
+  if (configured && typeof provided === 'string' && provided === configured) return true;
+  return process.env.NODE_ENV !== 'production';
+}
+
+function safeJsonArray(value: unknown): unknown[] {
+  if (typeof value !== 'string') return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function safeJsonObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function publicPhone(value: unknown): string {
+  return maskPhone(typeof value === 'string' ? value : null);
+}
+
+function publicCallRow(row: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...row,
+    customer_phone: publicPhone(row.customer_phone),
+  };
+}
 
 function isValidTimezone(tz: string): boolean {
   if (!tz || typeof tz !== 'string') return false;
@@ -73,14 +118,9 @@ app.get('/api/call-token/:token', (req, res) => {
     return res.status(400).json({ error: 'Callback token is required.' });
   }
 
-  // Reject guessable old IDs
-  if (token.startsWith('mc_')) {
-    return res.status(400).json({ error: 'Legacy or guessable IDs are not permitted. Please use a valid callback token.' });
-  }
-
-  const budget = checkCallBudget();
-  if (!budget.allowed) {
-    return res.status(429).json({ error: budget.reason || 'Demo is busy, try again in a minute.' });
+  // Reject guessable old IDs and malformed tokens
+  if (token.startsWith('mc_') || !/^[a-f0-9]{32}$/i.test(token)) {
+    return res.status(400).json({ error: 'Legacy or invalid IDs are not permitted. Please use a valid callback token.' });
   }
 
   interface MissedCallTokenRow {
@@ -117,12 +157,18 @@ app.get('/api/call-token/:token', (req, res) => {
     }
   }
 
+  // Only gate valid, unused links on live capacity.
+  const budget = checkCallBudget();
+  if (!budget.allowed) {
+    return res.status(429).json({ error: budget.reason || 'Demo is busy, try again in a minute.' });
+  }
+
   const biz = db.prepare('SELECT name, voice FROM businesses LIMIT 1').get() as { name?: string; voice?: string } | undefined;
   res.json({
     valid: true,
     missedCallId: missed.id,
     token: missed.token,
-    customerPhone: missed.customer_phone ? missed.customer_phone.replace(/\d(?=\d{4})/g, '*') : 'Unknown',
+    customerPhone: missed.customer_phone ? maskPhone(missed.customer_phone) : 'Unknown',
     businessName: biz?.name || 'Local Business',
     voice: biz?.voice || 'aai-jane',
     status: missed.status,
@@ -132,8 +178,11 @@ app.get('/api/call-token/:token', (req, res) => {
 app.get('/api/business', (_req, res) => {
   const b = db.prepare('SELECT * FROM businesses LIMIT 1').get() as BusinessRecord | undefined;
   if (!b) return res.status(404).json({ error: 'Business config not found' });
+  // Owner contact data is server-side only and is not needed by the public UI.
+  const publicBiz: Record<string, unknown> = { ...b };
+  delete publicBiz.owner_email;
   res.json({
-    ...b,
+    ...publicBiz,
     services: parseServices(b.services),
     faqs: parseFaqs(b.faqs),
     timezone: b.timezone || 'Asia/Kolkata',
@@ -488,8 +537,10 @@ app.put('/api/business', (req, res) => {
     );
 
   const updated = db.prepare('SELECT * FROM businesses WHERE id=?').get(bizId) as BusinessRecord | undefined;
+  const publicUpdated: Record<string, unknown> = { ...updated };
+  delete publicUpdated.owner_email;
   return res.json({
-    ...updated,
+    ...publicUpdated,
     services: cleanedServices,
     faqs: cleanedFaqs,
     timezone: updated?.timezone || timezone,
@@ -531,8 +582,9 @@ app.post('/api/business/reset', (req, res) => {
 });
 
 app.get('/api/missed-calls', (_req, res) => {
-  const rows = db.prepare('SELECT * FROM missed_calls ORDER BY time DESC').all();
-  res.json(rows);
+  const rows = db.prepare('SELECT * FROM missed_calls ORDER BY time DESC').all() as Array<Record<string, unknown>>;
+  // Public dashboard: keep callback tokens (needed to open call links) but mask phones.
+  res.json(rows.map(publicCallRow));
 });
 
 app.post('/api/missed-calls/simulate', (req, res) => {
@@ -542,29 +594,39 @@ app.post('/api/missed-calls/simulate', (req, res) => {
     return res.status(429).json({ error: 'Rate limit exceeded: max 5 simulations per minute per IP.' });
   }
 
-  const { phone, source, phone_verified } = req.body || {};
-  const id = 'mc_' + Date.now();
+  const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+  const rawPhone = typeof body.phone === 'string' ? body.phone.trim() : '';
+  if (rawPhone && (rawPhone.length > 40 || !/^[+()\d\s.\-]{7,40}$/.test(rawPhone))) {
+    return res.status(400).json({ error: 'Invalid phone number format.' });
+  }
+  if (body.phone !== undefined && typeof body.phone !== 'string') {
+    return res.status(400).json({ error: 'phone must be a string.' });
+  }
+  const source = body.source;
+  const id = 'mc_' + Date.now() + '_' + crypto.randomBytes(3).toString('hex');
   const token = crypto.randomBytes(16).toString('hex');
   const tokenExpiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
   const rowSource = source === 'test' ? 'test' : 'demo';
-  const isVerified = (phone_verified === true || phone_verified === 1) ? 1 : 0;
+  // The simulation endpoint has no carrier metadata, so it cannot establish a
+  // verified caller ID. Only honor the flag in local development for tests.
+  const isVerified = body.phone_verified === true && process.env.NODE_ENV !== 'production' ? 1 : 0;
 
   const business = db.prepare('SELECT id FROM businesses LIMIT 1').get() as { id: string } | undefined;
-  const phoneNumber = phone || '+1 (555) 010-' + Math.floor(1000 + Math.random() * 9000);
+  const phoneNumber = rawPhone || '+1 (555) 010-' + Math.floor(1000 + Math.random() * 9000);
 
   db.prepare(`
     INSERT INTO missed_calls (id, business_id, customer_phone, time, status, token, token_expires_at, source, phone_verified)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(id, business?.id || 'default', phoneNumber, new Date().toISOString(), 'new', token, tokenExpiresAt, rowSource, isVerified);
 
-  const jobId = 'job_' + Date.now();
+  const jobId = 'job_' + Date.now() + '_' + crypto.randomBytes(3).toString('hex');
   db.prepare('INSERT INTO callback_jobs (id, missed_call_id, attempts, schedule, state) VALUES (?,?,?,?,?)')
     .run(jobId, id, 0, new Date().toISOString(), 'queued');
   db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run('queued', id);
 
   events.broadcast('missed_call', {
     id,
-    customer_phone: phoneNumber.replace(/\d(?=\d{4})/g, '*'),
+    customer_phone: maskPhone(phoneNumber),
     source: rowSource,
   });
 
@@ -577,6 +639,9 @@ app.post('/api/missed-calls/simulate', (req, res) => {
 });
 
 app.post('/api/test/force-stt-disconnect', (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(403).json({ ok: false, error: 'Diagnostic test hook is disabled.' });
+  }
   const { callId, missedCallId } = req.body || {};
   let targetSession: sessionModule.Session | undefined = undefined;
   if (callId) {
@@ -615,12 +680,12 @@ app.get('/api/calls', (_req, res) => {
     const notFailedReason = !['error', 'no_answer', 'opt_out'].includes(String(r.end_reason || ''));
     const is_completed = Boolean(customerSpoke && validSummary && notFailedReason);
 
-    return {
+    return publicCallRow({
       ...r,
       is_completed,
-      latency: typeof r.latency_json === 'string' ? JSON.parse(r.latency_json) : [],
-      usage: typeof r.usage_json === 'string' ? JSON.parse(r.usage_json) : {},
-    };
+      latency: safeJsonArray(r.latency_json),
+      usage: safeJsonObject(r.usage_json),
+    });
   });
   res.json(callsWithDetails);
 });
@@ -631,11 +696,11 @@ app.get('/api/calls/:id', (req, res) => {
   const turns = db.prepare('SELECT * FROM turns WHERE call_id=? ORDER BY order_idx').all(req.params.id);
   const summary = db.prepare('SELECT * FROM summaries WHERE call_id=?').get(req.params.id);
   res.json({
-    call: {
+    call: publicCallRow({
       ...call,
-      latency: typeof call.latency_json === 'string' ? JSON.parse(call.latency_json) : [],
-      usage: typeof call.usage_json === 'string' ? JSON.parse(call.usage_json) : {},
-    },
+      latency: safeJsonArray(call.latency_json),
+      usage: safeJsonObject(call.usage_json),
+    }),
     turns,
     summary,
   });
@@ -654,11 +719,12 @@ app.get('/api/calls/:id/transcript', (req, res) => {
   const summary = db.prepare('SELECT * FROM summaries WHERE call_id=?').get(req.params.id) as Record<string, unknown> | undefined;
   const business = db.prepare('SELECT name FROM businesses LIMIT 1').get() as { name?: string } | undefined;
 
-  const parsedCall = {
+  const parsedCall = publicCallRow({
     ...call,
-    latency: typeof call.latency_json === 'string' ? JSON.parse(call.latency_json) : [],
-    usage: typeof call.usage_json === 'string' ? JSON.parse(call.usage_json) : {},
-  };
+    customer_phone: publicPhone(call.customer_phone),
+    latency: safeJsonArray(call.latency_json),
+    usage: safeJsonObject(call.usage_json),
+  });
 
   const filename = getTranscriptFilename(parsedCall, format as 'txt' | 'json');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
@@ -692,9 +758,8 @@ app.get('/api/summaries/:callId', (req, res) => {
 
 // Admin endpoint to clean dashboard data (preserves business configuration)
 app.post('/api/admin/clear-test-data', (req, res) => {
-  const adminEnabled = process.env.ADMIN_ENABLED === 'true' || process.env.NODE_ENV !== 'production';
-  if (!adminEnabled) {
-    return res.status(403).json({ error: 'Admin actions are disabled in production (ADMIN_ENABLED != true)' });
+  if (!isAdminAuthorized(req)) {
+    return res.status(403).json({ error: 'Admin actions are disabled. Set ADMIN_TOKEN and send it as the x-admin-token header.' });
   }
 
   const { scope } = req.body || {};
@@ -735,9 +800,17 @@ app.get('/api/events', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
   events.addClient(res);
   res.write(`event: connected\ndata: ${JSON.stringify({ ok: true })}\n\n`);
+
+  // Keep proxies (Render) from closing idle SSE streams.
+  const heartbeat = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch {}
+  }, 25000);
+  req.on('close', () => clearInterval(heartbeat));
+  res.on('close', () => clearInterval(heartbeat));
 });
 
 const resendTimestamps = new Map<string, number>();
@@ -835,9 +908,9 @@ function getComponentsHealth() {
   const voiceValid = isValidVoiceId(voiceId);
   const sttProvider = sessionModule.STT_PROVIDER;
   const sttKeySet = sttProvider === 'assemblyai' ? ttsKeySet : true;
-  const llmKeySet = Boolean(process.env.OPENAI_API_KEY);
+  const llmKeySet = Boolean(process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY);
   const llmModel = process.env.OPENAI_MODEL || 'qwen/qwen3.8-27b';
-  const llmBaseUrlSet = Boolean(process.env.OPENAI_BASE_URL);
+  const llmBaseUrlSet = Boolean(process.env.OPENAI_BASE_URL || process.env.OPENAI_API_BASE || process.env.GROQ_API_KEY);
 
   let dbOk = false;
   try {
@@ -893,7 +966,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
 
 server.on('upgrade', (req, socket, head) => {
   const origin = req.headers.origin;
@@ -903,7 +976,8 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
-  if (req.url && req.url.startsWith('/ws')) {
+  const pathname = (req.url || '').split('?')[0];
+  if (pathname === '/ws') {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
     });
@@ -914,9 +988,13 @@ server.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', (ws, req: http.IncomingMessage) => {
   let session: sessionModule.Session | null = null;
-  const ip = req.headers['x-forwarded-for']
-    ? String(req.headers['x-forwarded-for']).split(',')[0].trim()
-    : req.socket.remoteAddress || 'global';
+  let closed = false;
+  const forwarded = req.headers['x-forwarded-for']
+    ? String(req.headers['x-forwarded-for']).split(',').map((s) => s.trim()).filter(Boolean)
+    : [];
+  // Render appends the real client address as the final X-Forwarded-For hop.
+  // Using the last value avoids trusting a client-supplied leading value.
+  const ip = forwarded.length ? forwarded[forwarded.length - 1] : req.socket.remoteAddress || 'global';
 
   ws.on('message', async (data, isBinary) => {
     if (isBinary) {
@@ -927,7 +1005,7 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
       }
       return;
     }
-    let msg: { type?: string; token?: string; missedCallId?: string; final?: boolean; text?: string };
+    let msg: { type?: string; token?: string; final?: boolean; text?: string; reason?: string };
     try { msg = JSON.parse(data.toString()); } catch { return; }
     if (msg.type === 'join') {
       const joinLimit = checkRateLimit(`wsjoin:${ip}`, 10, 60000);
@@ -938,23 +1016,41 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
       }
 
       try {
-        session = await sessionModule.startSession(ws, msg.token || msg.missedCallId);
+        // Only the opaque callback token is accepted. Never fall back to the
+        // guessable missed-call database id.
+        const started = await sessionModule.startSession(ws, msg.token);
+        session = started;
+        if (closed && !started.ended) {
+          await sessionModule.endSession(started, 'disconnect');
+        }
       } catch (e: unknown) {
         const errMsg = e instanceof Error ? e.message : String(e);
-        ws.send(JSON.stringify({ type: 'error', message: errMsg }));
+        try { ws.send(JSON.stringify({ type: 'error', message: errMsg })); } catch {}
       }
       return;
     }
     if (!session) return;
     if (msg.type === 'transcript' && msg.final) {
-      await sessionModule.handleCustomerUtterance(session, msg.text);
+      try {
+        await sessionModule.handleCustomerUtterance(session, msg.text || '');
+      } catch (err) {
+        console.error('[ws] utterance handling failed:', err instanceof Error ? err.message : String(err));
+      }
     } else if (msg.type === 'barge_in') {
       sessionModule.bargeIn(session);
     } else if (msg.type === 'end') {
-      await sessionModule.endSession(session, msg.reason || 'user_ended');
+      try {
+        await sessionModule.endSession(session, msg.reason || 'user_ended');
+      } catch (err) {
+        console.error('[ws] endSession failed:', err instanceof Error ? err.message : String(err));
+      }
     }
   });
+  ws.on('error', (err) => {
+    console.error('[ws] socket error:', err.message);
+  });
   ws.on('close', () => {
+    closed = true;
     if (session && !session.ended) {
       sessionModule.endSession(session, 'disconnect').catch(() => {});
     }

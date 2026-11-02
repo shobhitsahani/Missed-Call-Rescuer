@@ -66,14 +66,27 @@ Judges can evaluate every core capability directly on the live website:
 
 ## 5. Pre-Submission Checklist
 
-- [x] Backend deployed on Render and `/api/health` returns `{"ok":true}`.
-- [x] Frontend deployed on Vercel (`https://missed-call-rescuer.vercel.app`).
-- [x] Security verified: Unguessable 128-bit call tokens, 30-minute expiry, single-use, CORS & WebSocket origin check.
-- [x] Automated security test suite (`scripts/test-security.ts`) passes 11/11 tests.
-- [x] Pipeline verification benchmark (`scripts/verify-pipeline.ts`) passes 3 consecutive runs.
+- [ ] Redeploy the latest `fix/final-hardening` backend to Render, then the frontend to Vercel, after local tests pass. The currently live hosts may be behind this branch.
+- [x] Security verified in automated tests: unguessable 128-bit call tokens, 30-minute expiry, single-use, CORS & WebSocket origin check, SSE phone masking.
+- [x] Automated security test suite (`scripts/test-security.ts`) covers open access, CORS, WebSocket origin, tokens, SSE privacy, budgets, rate limits, and admin gating.
 - [x] Honest metrics implemented: "Completed / missed calls", hidden when < 5 calls, latency averages state sample size.
 - [x] No untrue marketing claims ("autonomous", "appointment booking", "calls customers").
-- [x] Zero TypeScript errors (`npx tsc --noEmit`).
-- [x] Production build passes (`npm run build`).
+- [ ] Confirm `npx tsc --noEmit` and `npm run build` on the branch you submit.
 - [x] No `.env`, secrets, API keys, or `data/*.db` committed to git.
+- [ ] Record and upload the required hackathon demo video (live website is not a confirmed substitute).
 - [ ] Submit project URL (`https://missed-call-rescuer.vercel.app`) and GitHub repository link (`https://github.com/shobhitsahani/Missed-Call-Rescuer`) in the official hackathon submission portal.
+
+---
+
+## 6. Demo Video Shot List (you record this)
+
+The AssemblyAI Voice Hackathon form requires a demo video. Do not skip this unless an organizer-approved exception exists.
+
+Suggested 60–90 second sequence:
+
+1. Open the dashboard (no access code). Point out live metrics and missed-call list.
+2. Open Settings and preview two voices.
+3. Click **Simulate missed call**, then open the tokenized `/call/<token>` link.
+4. Start the call, hear the greeting, speak a request, and give a callback number.
+5. End the call and show the dashboard updating with the new record.
+6. Optionally mention Telegram/Discord if those are configured.
