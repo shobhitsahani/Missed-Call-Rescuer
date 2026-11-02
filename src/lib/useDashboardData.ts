@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { API_BASE, api, ApiError } from '@/lib/api';
+import { API_BASE, api } from '@/lib/api';
 import { CallDetails, SummaryDetails, TurnDetails, LatencyItem } from '@/components/Drawer';
 
 export type MissedCall = {
@@ -41,7 +41,6 @@ export function computeAverages(rawLatency: LatencyItem[] = []) {
 }
 
 export function useDashboardData() {
-  const [isAuthorized, setIsAuthorized] = useState<boolean>(true);
   const [business, setBusiness] = useState<Record<string, unknown> | null>(null);
   const [missed, setMissed] = useState<MissedCall[]>([]);
   const [calls, setCalls] = useState<CallDetails[]>([]);
@@ -54,34 +53,16 @@ export function useDashboardData() {
   const [lastCallToken, setLastCallToken] = useState<string | null>(null);
   const [sseConnected, setSseConnected] = useState(false);
 
-  useEffect(() => {
-    const handleUnauthorized = () => {
-      setIsAuthorized(false);
-    };
-    window.addEventListener('auth:unauthorized', handleUnauthorized);
-    return () => window.removeEventListener('auth:unauthorized', handleUnauthorized);
-  }, []);
-
   const load = useCallback(async () => {
     try {
       const [b, m, c] = await Promise.all([
-        api('/api/business').catch((err) => {
-          if (err instanceof ApiError && err.status === 401) setIsAuthorized(false);
-          return null;
-        }),
-        api('/api/missed-calls').catch((err) => {
-          if (err instanceof ApiError && err.status === 401) setIsAuthorized(false);
-          return [];
-        }),
-        api('/api/calls').catch((err) => {
-          if (err instanceof ApiError && err.status === 401) setIsAuthorized(false);
-          return [];
-        }),
+        api('/api/business').catch(() => null),
+        api('/api/missed-calls').catch(() => []),
+        api('/api/calls').catch(() => []),
       ]);
 
       if (b) {
         setBusiness(b);
-        setIsAuthorized(true);
       }
       setMissed(m || []);
       setCalls(c || []);
@@ -99,11 +80,7 @@ export function useDashboardData() {
         setSummaries((prev) => ({ ...prev, ...map }));
       }
     } catch (e: unknown) {
-      if (e instanceof ApiError && e.status === 401) {
-        setIsAuthorized(false);
-      } else {
-        console.error('Failed to load dashboard data:', e);
-      }
+      console.error('Failed to load dashboard data:', e);
     } finally {
       setInitialLoading(false);
     }
@@ -122,84 +99,65 @@ export function useDashboardData() {
     };
   }, [load]);
 
-  // Authenticated SSE event subscription
+  // Open SSE event subscription directly without stream token
   useEffect(() => {
-    if (!isAuthorized) return;
-
     let es: EventSource | null = null;
-    let isCancelled = false;
 
-    async function initSSE() {
-      try {
-        const tokenRes = await api('/api/events/token').catch(() => null);
-        if (isCancelled) return;
+    try {
+      es = new EventSource(`${API_BASE}/api/events`);
 
-        const streamToken = tokenRes?.streamToken;
-        const sseUrl = streamToken
-          ? `${API_BASE}/api/events?stream_token=${encodeURIComponent(streamToken)}`
-          : `${API_BASE}/api/events`;
+      es.onopen = () => setSseConnected(true);
+      es.onerror = () => {
+        setSseConnected(false);
+      };
 
-        es = new EventSource(sseUrl);
+      es.onmessage = () => {
+        setSseConnected(true);
+        load();
+      };
 
-        es.onopen = () => setSseConnected(true);
-        es.onerror = () => {
-          setSseConnected(false);
-          // If auth expired or disconnected, close
-        };
+      es.addEventListener('call_updated', () => {
+        setSseConnected(true);
+        load();
+      });
 
-        es.onmessage = () => {
-          setSseConnected(true);
-          load();
-        };
+      es.addEventListener('missed_call', () => {
+        setSseConnected(true);
+        load();
+      });
 
-        es.addEventListener('call_updated', () => {
-          setSseConnected(true);
-          load();
-        });
+      es.addEventListener('call_ended', () => {
+        setSseConnected(true);
+        load();
+      });
 
-        es.addEventListener('missed_call', () => {
-          setSseConnected(true);
-          load();
-        });
+      es.addEventListener('data_cleared', () => {
+        setSseConnected(true);
+        load();
+      });
 
-        es.addEventListener('call_ended', () => {
-          setSseConnected(true);
-          load();
-        });
-
-        es.addEventListener('data_cleared', () => {
-          setSseConnected(true);
-          load();
-        });
-
-        es.addEventListener('summary_ready', (e: Event) => {
-          setSseConnected(true);
-          try {
-            const me = e as MessageEvent;
-            const d = JSON.parse(me.data);
-            if (d.summary) {
-              setSummaries((prev) => ({ ...prev, [d.callId]: d.summary }));
-            }
-          } catch {}
-          load();
-        });
-      } catch (err: unknown) {
-        if (err instanceof ApiError && err.status === 401) {
-          setIsAuthorized(false);
-        }
-      }
+      es.addEventListener('summary_ready', (e: Event) => {
+        setSseConnected(true);
+        try {
+          const me = e as MessageEvent;
+          const d = JSON.parse(me.data);
+          if (d.summary) {
+            setSummaries((prev) => ({ ...prev, [d.callId]: d.summary }));
+          }
+        } catch {}
+        load();
+      });
+    } catch (err: unknown) {
+      console.error('Failed to initialize SSE connection:', err);
     }
 
-    initSSE();
-
     return () => {
-      isCancelled = true;
       if (es) {
         es.close();
       }
       setSseConnected(false);
     };
-  }, [isAuthorized, load]);
+  }, [load]);
 
   const simulate = useCallback(async () => {
     setSimulating(true);
@@ -218,9 +176,6 @@ export function useDashboardData() {
       await load();
       return r;
     } catch (e: unknown) {
-      if (e instanceof ApiError && e.status === 401) {
-        setIsAuthorized(false);
-      }
       console.error('Simulate missed call failed:', e);
       throw e;
     } finally {
@@ -237,9 +192,7 @@ export function useDashboardData() {
       });
       await load();
     } catch (e: unknown) {
-      if (e instanceof ApiError && e.status === 401) {
-        setIsAuthorized(false);
-      }
+      console.error('Clear test data failed:', e);
       throw e;
     }
   }, [load]);
@@ -283,8 +236,6 @@ export function useDashboardData() {
   }, [completedCallsCount, missed.length]);
 
   return {
-    isAuthorized,
-    setIsAuthorized,
     business,
     missed,
     calls,

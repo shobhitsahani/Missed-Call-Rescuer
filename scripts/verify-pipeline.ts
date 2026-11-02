@@ -4,18 +4,15 @@ import WebSocket from 'ws';
 import fs from 'fs';
 import path from 'path';
 import { TtsClient } from '../server/tts';
-import { signAuthToken } from '../server/auth';
 
 const API_BASE = process.env.API_BASE || 'http://localhost:4000';
 const WS_BASE = process.env.WS_BASE || 'ws://localhost:4000/ws';
 
 async function simulateCall(): Promise<string> {
-  const token = signAuthToken();
   const res = await fetch(`${API_BASE}/api/missed-calls/simulate`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`,
     },
     body: JSON.stringify({ phone: '+1 (555) 012-3456', source: 'test' }),
   });
@@ -423,9 +420,7 @@ async function testOptOut(fixtures: Record<string, Buffer>): Promise<boolean> {
         ws.close();
         // check DB status for this missed call
         setTimeout(async () => {
-          const res = await fetch(`${API_BASE}/api/missed-calls`, {
-            headers: { Authorization: `Bearer ${signAuthToken()}` },
-          });
+          const res = await fetch(`${API_BASE}/api/missed-calls`);
           const calls = await res.json();
           const mc = calls.find((c: any) => c.id === missedCallId || c.token === missedCallId);
           console.log(`Missed call DB status: ${mc?.status}`);

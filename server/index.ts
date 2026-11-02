@@ -23,20 +23,11 @@ import {
   getTranscriptFilename,
 } from '../src/lib/transcript';
 import {
-  validateStartupAuth,
-  verifyAccessCode,
-  signAuthToken,
-  signStreamToken,
-  requireAuth,
-} from './auth';
-import {
   securityHeadersMiddleware,
   checkRateLimit,
   isOriginAllowed,
   checkCallBudget,
 } from './security';
-
-validateStartupAuth();
 
 const app = express();
 app.set('trust proxy', 1);
@@ -65,33 +56,6 @@ function isValidTimezone(tz: string): boolean {
     return false;
   }
 }
-
-// Access code auth
-app.post('/api/auth', (req, res) => {
-  const ip = req.ip || req.socket.remoteAddress || 'global';
-  const limit = checkRateLimit(`auth:${ip}`, 5, 60000);
-  if (!limit.allowed) {
-    return res.status(429).json({ error: 'Too many authentication attempts. Please wait 1 minute.' });
-  }
-
-  const { code } = req.body || {};
-  if (!code || typeof code !== 'string') {
-    return res.status(400).json({ error: 'Access code is required.' });
-  }
-
-  if (!verifyAccessCode(code)) {
-    return res.status(401).json({ error: 'Invalid access code.' });
-  }
-
-  const token = signAuthToken();
-  res.json({ token, expiresIn: 43200 });
-});
-
-// Single-purpose short-lived stream token for SSE
-app.get('/api/events/token', requireAuth, (_req, res) => {
-  const streamToken = signStreamToken();
-  res.json({ streamToken });
-});
 
 // Tokenized customer callback session metadata (public link, unguessable token)
 app.get('/api/call-token/:token', (req, res) => {
@@ -156,7 +120,7 @@ app.get('/api/call-token/:token', (req, res) => {
   });
 });
 
-app.get('/api/business', requireAuth, (_req, res) => {
+app.get('/api/business', (_req, res) => {
   const b = db.prepare('SELECT * FROM businesses LIMIT 1').get() as BusinessRecord | undefined;
   if (!b) return res.status(404).json({ error: 'Business config not found' });
   res.json({
@@ -169,7 +133,7 @@ app.get('/api/business', requireAuth, (_req, res) => {
   });
 });
 
-app.get('/api/business/voices', requireAuth, (_req, res) => {
+app.get('/api/business/voices', (_req, res) => {
   res.json({ voices: ASSEMBLYAI_VOICES });
 });
 
@@ -194,7 +158,7 @@ const PREVIEW_TEXT = 'Thanks for calling. How can we help you today?';
 const PER_VOICE_COOLDOWN_MS = 3000;
 const GLOBAL_MAX_PER_MINUTE = 20;
 
-app.post('/api/business/voice-preview', requireAuth, async (req, res) => {
+app.post('/api/business/voice-preview', async (req, res) => {
   const ip = req.ip || req.socket.remoteAddress || 'global';
   const now = Date.now();
   const startTime = Date.now();
@@ -393,7 +357,7 @@ app.post('/api/business/voice-preview', requireAuth, async (req, res) => {
   }
 });
 
-app.put('/api/business', requireAuth, (req, res) => {
+app.put('/api/business', (req, res) => {
   const body = req.body;
   if (!body || typeof body !== 'object') {
     return res.status(400).json({ error: 'Request body must be a JSON object.' });
@@ -523,11 +487,11 @@ app.put('/api/business', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/business/presets', requireAuth, (_req, res) => {
+app.get('/api/business/presets', (_req, res) => {
   res.json({ presets: BUSINESS_PRESETS });
 });
 
-app.post('/api/business/reset', requireAuth, (req, res) => {
+app.post('/api/business/reset', (req, res) => {
   const existingBiz = db.prepare('SELECT id FROM businesses LIMIT 1').get() as { id?: string } | undefined;
   const bizId = existingBiz?.id || DEFAULT_BIZ.id;
 
@@ -557,12 +521,12 @@ app.post('/api/business/reset', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/missed-calls', requireAuth, (_req, res) => {
+app.get('/api/missed-calls', (_req, res) => {
   const rows = db.prepare('SELECT * FROM missed_calls ORDER BY time DESC').all();
   res.json(rows);
 });
 
-app.post('/api/missed-calls/simulate', requireAuth, (req, res) => {
+app.post('/api/missed-calls/simulate', (req, res) => {
   const ip = req.ip || req.socket.remoteAddress || 'global';
   const limit = checkRateLimit(`sim:${ip}`, 5, 60000);
   if (!limit.allowed) {
@@ -603,7 +567,7 @@ app.post('/api/missed-calls/simulate', requireAuth, (req, res) => {
   });
 });
 
-app.post('/api/test/force-stt-disconnect', requireAuth, (req, res) => {
+app.post('/api/test/force-stt-disconnect', (req, res) => {
   const { callId, missedCallId } = req.body || {};
   let targetSession: sessionModule.Session | undefined = undefined;
   if (callId) {
@@ -624,7 +588,7 @@ app.post('/api/test/force-stt-disconnect', requireAuth, (req, res) => {
   return res.status(404).json({ ok: false, error: 'No active session with STT found' });
 });
 
-app.get('/api/calls', requireAuth, (_req, res) => {
+app.get('/api/calls', (_req, res) => {
   const rows = db.prepare(`
     SELECT c.*,
       (SELECT COUNT(*) FROM turns t WHERE t.call_id = c.id AND t.role = 'customer') as customer_turns_count,
@@ -652,7 +616,7 @@ app.get('/api/calls', requireAuth, (_req, res) => {
   res.json(callsWithDetails);
 });
 
-app.get('/api/calls/:id', requireAuth, (req, res) => {
+app.get('/api/calls/:id', (req, res) => {
   const call = db.prepare('SELECT * FROM calls WHERE id=?').get(req.params.id) as Record<string, unknown> | undefined;
   if (!call) return res.status(404).json({ error: 'not found' });
   const turns = db.prepare('SELECT * FROM turns WHERE call_id=? ORDER BY order_idx').all(req.params.id);
@@ -668,7 +632,7 @@ app.get('/api/calls/:id', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/calls/:id/transcript', requireAuth, (req, res) => {
+app.get('/api/calls/:id/transcript', (req, res) => {
   const format = String(req.query.format || 'txt').toLowerCase();
   if (format !== 'txt' && format !== 'json') {
     return res.status(400).json({ error: 'Invalid format. Use "txt" or "json".' });
@@ -711,14 +675,14 @@ app.get('/api/calls/:id/transcript', requireAuth, (req, res) => {
   }
 });
 
-app.get('/api/summaries/:callId', requireAuth, (req, res) => {
+app.get('/api/summaries/:callId', (req, res) => {
   const s = db.prepare('SELECT * FROM summaries WHERE call_id=?').get(req.params.callId);
   if (!s) return res.status(404).json({ error: 'not found' });
   res.json(s);
 });
 
 // Admin endpoint to clean dashboard data (preserves business configuration)
-app.post('/api/admin/clear-test-data', requireAuth, (req, res) => {
+app.post('/api/admin/clear-test-data', (req, res) => {
   const adminEnabled = process.env.ADMIN_ENABLED === 'true' || process.env.NODE_ENV !== 'production';
   if (!adminEnabled) {
     return res.status(403).json({ error: 'Admin actions are disabled in production (ADMIN_ENABLED != true)' });
@@ -754,7 +718,7 @@ app.post('/api/admin/clear-test-data', requireAuth, (req, res) => {
   return res.json({ ok: true, message: 'All test and demo calls cleared. Business configuration preserved.' });
 });
 
-app.get('/api/events', requireAuth, (req, res) => {
+app.get('/api/events', (req, res) => {
   if (req.headers.origin && !isOriginAllowed(req.headers.origin)) {
     return res.status(403).json({ error: 'Origin not allowed' });
   }
@@ -769,7 +733,7 @@ app.get('/api/events', requireAuth, (req, res) => {
 
 const resendTimestamps = new Map<string, number>();
 
-app.post('/api/notify/test', requireAuth, async (req, res) => {
+app.post('/api/notify/test', async (req, res) => {
   const ip = req.ip || req.socket.remoteAddress || 'global';
   const limit = checkRateLimit(`notify_test:${ip}`, 5, 60000);
   if (!limit.allowed) {
@@ -801,7 +765,7 @@ app.post('/api/notify/test', requireAuth, async (req, res) => {
   });
 });
 
-app.post('/api/calls/:id/notify', requireAuth, async (req, res) => {
+app.post('/api/calls/:id/notify', async (req, res) => {
   const callId = req.params.id;
   const call = db.prepare('SELECT id FROM calls WHERE id=?').get(callId);
   if (!call) {

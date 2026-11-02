@@ -11,7 +11,6 @@ import { Drawer, CallDetails } from '@/components/Drawer';
 import { DemoModal } from '@/components/DemoModal';
 import { PageContainer } from '@/components/layout/PageContainer';
 import { useDashboardData } from '@/lib/useDashboardData';
-import { AccessScreen } from '@/components/AccessScreen';
 
 export default function DashboardPage() {
   const [currentView, setCurrentView] = useState<DashboardView>('overview');
@@ -22,7 +21,6 @@ export default function DashboardPage() {
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const {
-    isAuthorized,
     business,
     missed,
     calls,
@@ -101,10 +99,6 @@ export default function DashboardPage() {
       : currentView === 'missed'
       ? 'Missed calls'
       : 'Settings';
-
-  if (!isAuthorized) {
-    return <AccessScreen onSuccess={load} />;
-  }
 
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col md:flex-row antialiased selection:bg-primary/20 selection:text-primary">
