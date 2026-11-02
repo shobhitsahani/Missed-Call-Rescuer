@@ -15,8 +15,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Missed-Call Rescuer | Autonomous Voice AI Callbacks",
-  description: "B2B autonomous voice agent platform that calls back missed customers with natural neural conversation, urgency classification, and structured appointment booking.",
+  title: "Missed-Call Rescuer | Voice Callback Assistant",
+  description: "Turns a logged missed call into an in-browser voice callback session, collects caller intent, and gives business owners structured summaries.",
   icons: {
     icon: "/icon",
   },
