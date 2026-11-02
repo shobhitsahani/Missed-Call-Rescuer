@@ -66,12 +66,12 @@ Judges can evaluate every core capability directly on the live website:
 
 ## 5. Pre-Submission Checklist
 
-- [ ] Redeploy the latest `fix/final-hardening` backend to Render, then the frontend to Vercel, after local tests pass. The currently live hosts may be behind this branch.
+- [x] Redeploy verified `fix/final-hardening` backend to Render and frontend to Vercel (Merged into `main` and live at `https://missed-call-rescuer-api.onrender.com` & `https://missed-call-rescuer.vercel.app`).
 - [x] Security verified in automated tests: unguessable 128-bit call tokens, 30-minute expiry, single-use, CORS & WebSocket origin check, SSE phone masking.
 - [x] Automated security test suite (`scripts/test-security.ts`) covers open access, CORS, WebSocket origin, tokens, SSE privacy, budgets, rate limits, and admin gating.
 - [x] Honest metrics implemented: "Completed / missed calls", hidden when < 5 calls, latency averages state sample size.
 - [x] No untrue marketing claims ("autonomous", "appointment booking", "calls customers").
-- [ ] Confirm `npx tsc --noEmit` and `npm run build` on the branch you submit.
+- [x] `npm run typecheck`, `npm run lint`, `npm run test`, `npm run test:security`, `npm run test:reconnect`, `npm run check:secrets`, and `npm run build` all pass 100%.
 - [x] No `.env`, secrets, API keys, or `data/*.db` committed to git.
 - [ ] Record and upload the required hackathon demo video (live website is not a confirmed substitute).
 - [ ] Submit project URL (`https://missed-call-rescuer.vercel.app`) and GitHub repository link (`https://github.com/shobhitsahani/Missed-Call-Rescuer`) in the official hackathon submission portal.
