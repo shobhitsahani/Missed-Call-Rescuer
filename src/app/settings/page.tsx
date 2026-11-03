@@ -62,6 +62,14 @@ const TONE_PRESETS = [
   'calm, helpful, reassuring',
 ];
 
+const LANGUAGE_PRESETS = [
+  { label: 'English (en)', code: 'en' },
+  { label: 'Spanish (es)', code: 'es' },
+  { label: 'French (fr)', code: 'fr' },
+  { label: 'German (de)', code: 'de' },
+  { label: 'Hindi (hi)', code: 'hi' },
+];
+
 interface FaqItem {
   question: string;
   answer: string;
@@ -75,6 +83,7 @@ interface SavedBaseline {
   tone: string;
   voice: string;
   timezone: string;
+  language: string;
 }
 
 const SECTIONS = [
@@ -113,6 +122,7 @@ export default function SettingsPage() {
   const [tone, setTone] = useState('');
   const [voice, setVoice] = useState('aai-jane');
   const [timezone, setTimezone] = useState('Asia/Kolkata');
+  const [language, setLanguage] = useState('en');
 
   // Saved baseline for dirty detection
   const [baseline, setBaseline] = useState<SavedBaseline | null>(null);
@@ -231,6 +241,7 @@ export default function SettingsPage() {
     if (tone !== baseline.tone) return true;
     if (voice !== baseline.voice) return true;
     if (timezone !== baseline.timezone) return true;
+    if (language !== baseline.language) return true;
     if (services.length !== baseline.services.length) return true;
     for (let i = 0; i < services.length; i++) {
       if (services[i] !== baseline.services[i]) return true;
@@ -245,7 +256,7 @@ export default function SettingsPage() {
       }
     }
     return false;
-  }, [baseline, name, hours, tone, voice, timezone, services, faqs]);
+  }, [baseline, name, hours, tone, voice, timezone, language, services, faqs]);
 
   // Warn before navigating away if form has unsaved changes
   useEffect(() => {
@@ -280,6 +291,7 @@ export default function SettingsPage() {
         const loadedTone = data.tone || 'friendly, professional, concise';
         const loadedVoice = data.voice || 'aai-jane';
         const loadedTimezone = data.timezone || 'Asia/Kolkata';
+        const loadedLanguage = data.language || 'en';
 
         setName(loadedName);
         setHours(loadedHours);
@@ -288,6 +300,7 @@ export default function SettingsPage() {
         setTone(loadedTone);
         setVoice(loadedVoice);
         setTimezone(loadedTimezone);
+        setLanguage(loadedLanguage);
 
         setBaseline({
           name: loadedName,
@@ -297,6 +310,7 @@ export default function SettingsPage() {
           tone: loadedTone,
           voice: loadedVoice,
           timezone: loadedTimezone,
+          language: loadedLanguage,
         });
 
         if (resCalls && resCalls.ok) {
@@ -422,6 +436,7 @@ export default function SettingsPage() {
     setTone(preset.tone);
     setVoice(preset.voice);
     setTimezone(preset.timezone);
+    setLanguage(preset.language || 'en');
     setShowPresetConfirm(false);
     setPendingPreset(null);
     toast.success(`Loaded preset: ${preset.label}`);
@@ -707,6 +722,7 @@ export default function SettingsPage() {
           tone: tone.trim(),
           voice,
           timezone,
+          language: language.trim() || 'en',
         }),
       });
 
@@ -742,6 +758,7 @@ export default function SettingsPage() {
           tone: tone.trim(),
           voice,
           timezone,
+          language: language.trim() || 'en',
         });
         setTimeout(() => setSaveSuccessMsg(null), 4000);
       }
@@ -775,6 +792,7 @@ export default function SettingsPage() {
         const defTone = b.tone || 'friendly, professional, concise';
         const defVoice = b.voice || 'aai-jane';
         const defTimezone = b.timezone || 'Asia/Kolkata';
+        const defLanguage = b.language || 'en';
 
         setName(defName);
         setHours(defHours);
@@ -783,6 +801,7 @@ export default function SettingsPage() {
         setTone(defTone);
         setVoice(defVoice);
         setTimezone(defTimezone);
+        setLanguage(defLanguage);
 
         setBaseline({
           name: defName,
@@ -792,6 +811,7 @@ export default function SettingsPage() {
           tone: defTone,
           voice: defVoice,
           timezone: defTimezone,
+          language: defLanguage,
         });
 
         setShowResetConfirm(false);
@@ -1120,12 +1140,30 @@ export default function SettingsPage() {
                           <Input
                             id="biz-lang"
                             type="text"
-                            value="English (en-US)"
-                            disabled
-                            className="text-xs h-9 bg-muted/30 text-muted-foreground cursor-not-allowed"
+                            value={language}
+                            onChange={(e) => setLanguage(e.target.value)}
+                            maxLength={30}
+                            placeholder="e.g. en, en-US, es, fr"
+                            className="text-xs h-9"
                           />
+                          <div className="flex flex-wrap gap-1.5 pt-1">
+                            {LANGUAGE_PRESETS.map((lp) => (
+                              <button
+                                key={lp.code}
+                                type="button"
+                                onClick={() => setLanguage(lp.code)}
+                                className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors cursor-pointer ${
+                                  language === lp.code
+                                    ? 'bg-primary/10 border-primary text-primary font-medium'
+                                    : 'bg-muted/40 border-border text-muted-foreground hover:text-foreground hover:bg-muted'
+                                }`}
+                              >
+                                {lp.label}
+                              </button>
+                            ))}
+                          </div>
                           <p className="text-[11px] text-muted-foreground">
-                            Additional languages will be available in upcoming releases.
+                            Specify standard IETF language tag (e.g. en, en-US, es, fr, de, hi).
                           </p>
                         </div>
                       </CardContent>

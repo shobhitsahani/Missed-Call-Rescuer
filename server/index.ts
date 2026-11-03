@@ -111,6 +111,12 @@ function isValidTimezone(tz: string): boolean {
   }
 }
 
+function isValidLanguage(lang: unknown): boolean {
+  if (typeof lang !== 'string') return false;
+  const trimmed = lang.trim();
+  return /^[a-zA-Z]{2,4}(?:-[a-zA-Z0-9]{2,8})*$/.test(trimmed);
+}
+
 // Tokenized customer callback session metadata (public link, unguessable token)
 app.get('/api/call-token/:token', (req, res) => {
   const { token } = req.params;
@@ -193,6 +199,7 @@ app.get('/api/business', (_req, res) => {
     faqs: parseFaqs(b.faqs),
     timezone: b.timezone || 'Asia/Kolkata',
     voice: b.voice || 'aai-jane',
+    language: b.language || 'en',
     sttProvider: sessionModule.STT_PROVIDER,
   });
 });
@@ -517,6 +524,16 @@ app.put('/api/business', (req, res) => {
     errors.timezone = 'Please specify a valid IANA timezone (e.g. Asia/Kolkata, America/New_York).';
   }
 
+  // Validate language
+  let language = 'en';
+  if (body.language !== undefined && body.language !== null) {
+    if (typeof body.language !== 'string' || !isValidLanguage(body.language)) {
+      errors.language = 'Please specify a valid language code (e.g. en, en-US).';
+    } else {
+      language = body.language.trim();
+    }
+  }
+
   if (Object.keys(errors).length > 0) {
     return res.status(400).json({ errors });
   }
@@ -530,7 +547,7 @@ app.put('/api/business', (req, res) => {
   const existingBiz = db.prepare('SELECT id FROM businesses LIMIT 1').get() as { id?: string } | undefined;
   const bizId = existingBiz?.id || DEFAULT_BIZ.id;
 
-  db.prepare(`UPDATE businesses SET name=?, hours=?, services=?, faqs=?, tone=?, voice=?, timezone=? WHERE id=?`)
+  db.prepare(`UPDATE businesses SET name=?, hours=?, services=?, faqs=?, tone=?, voice=?, timezone=?, language=? WHERE id=?`)
     .run(
       name,
       hours,
@@ -539,6 +556,7 @@ app.put('/api/business', (req, res) => {
       tone,
       voice,
       timezone,
+      language,
       bizId
     );
 
@@ -550,6 +568,7 @@ app.put('/api/business', (req, res) => {
     services: cleanedServices,
     faqs: cleanedFaqs,
     timezone: updated?.timezone || timezone,
+    language: updated?.language || language,
   });
 });
 
@@ -1019,6 +1038,15 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
     let msg: { type?: string; token?: string; final?: boolean; text?: string; reason?: string };
     try { msg = JSON.parse(data.toString()); } catch { return; }
     if (msg.type === 'join') {
+      if (session && !session.ended) {
+        // Socket already has an active session; re-send current state and config idempotently
+        try {
+          ws.send(JSON.stringify({ type: 'config', sttProvider: sessionModule.STT_PROVIDER }));
+          ws.send(JSON.stringify({ type: 'state', state: session.state }));
+        } catch {}
+        return;
+      }
+
       const joinLimit = checkRateLimit(`wsjoin:${ip}`, 10, 60000);
       if (!joinLimit.allowed) {
         ws.send(JSON.stringify({ type: 'error', message: 'Too many call join requests. Please wait a moment.' }));
@@ -1044,19 +1072,28 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
     if (msg.type === 'transcript' && msg.final) {
       if (session.ended || session.finalizing) return;
       try {
+        if (session.generating) {
+          sessionModule.bargeIn(session);
+        }
         await sessionModule.handleCustomerUtterance(session, msg.text || '');
       } catch (err) {
         console.error('[ws] utterance handling failed:', err instanceof Error ? err.message : String(err));
       }
     } else if (msg.type === 'barge_in') {
-      sessionModule.bargeIn(session);
+      if (!session.ended && !session.finalizing) {
+        sessionModule.bargeIn(session);
+      }
     } else if (msg.type === 'playback_complete') {
-      sessionModule.handlePlaybackComplete(session);
+      if (!session.ended) {
+        sessionModule.handlePlaybackComplete(session);
+      }
     } else if (msg.type === 'end') {
-      try {
-        await sessionModule.endSession(session, msg.reason || 'user_ended');
-      } catch (err) {
-        console.error('[ws] endSession failed:', err instanceof Error ? err.message : String(err));
+      if (!session.ended) {
+        try {
+          await sessionModule.endSession(session, msg.reason || 'user_ended');
+        } catch (err) {
+          console.error('[ws] endSession failed:', err instanceof Error ? err.message : String(err));
+        }
       }
     }
   });

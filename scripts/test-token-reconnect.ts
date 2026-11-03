@@ -2,10 +2,61 @@ import assert from 'assert';
 import WebSocket from 'ws';
 import Database from 'better-sqlite3';
 import path from 'path';
+import { spawn, ChildProcess } from 'child_process';
 
 const BASE_URL = process.env.API_BASE || 'http://localhost:4000';
 const WS_URL = (process.env.WS_BASE || 'ws://localhost:4000/ws');
 const DB_PATH = path.join(process.cwd(), 'data', 'app.db');
+
+let serverProc: ChildProcess | null = null;
+
+async function ensureServerRunning(base: string): Promise<void> {
+  try {
+    const res = await fetch(`${base}/api/business`);
+    if (res.ok) return;
+  } catch {}
+
+  const url = new URL(base);
+  const port = url.port || '4000';
+
+  return new Promise((resolve, reject) => {
+    serverProc = spawn('npx', ['tsx', 'server/index.ts'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        PORT: port,
+        NODE_ENV: 'test',
+        ADMIN_TOKEN: 'test-admin-token',
+        MAX_CALLS_PER_DAY: '500',
+      },
+      shell: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    serverProc.stdout?.on('data', (d) => {
+      stdout += d.toString();
+      if (stdout.includes(`listening on http://localhost:${port}`)) {
+        resolve();
+      }
+    });
+
+    serverProc.on('error', reject);
+    setTimeout(() => reject(new Error('Server start timed out after 12s')), 12000);
+  });
+}
+
+async function stopServer() {
+  if (serverProc) {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(serverProc.pid), '/f', '/t']);
+    } else {
+      serverProc.kill('SIGTERM');
+    }
+    serverProc = null;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
 
 async function json(url: string, init?: RequestInit) {
   const res = await fetch(url, init);
@@ -14,7 +65,9 @@ async function json(url: string, init?: RequestInit) {
 }
 
 async function main() {
-  console.log('--- Running Token Lifecycle & Mid-Call Reconnect Test ---');
+  await ensureServerRunning(BASE_URL);
+  try {
+    console.log('--- Running Token Lifecycle & Mid-Call Reconnect Test ---');
 
   // 1. Simulate missed call
   const sim = await json(`${BASE_URL}/api/missed-calls/simulate`, {
@@ -136,7 +189,10 @@ async function main() {
   assert(replayError.includes('already been used'), `Expected replay rejection, got: ${replayError}`);
   console.log('✓ WebSocket replay attempt rejected:', replayError);
 
-  console.log('\n🎉 ALL TOKEN LIFECYCLE & RECONNECT TESTS PASSED!');
+    console.log('\n🎉 ALL TOKEN LIFECYCLE & RECONNECT TESTS PASSED!');
+  } finally {
+    await stopServer();
+  }
 }
 
 main().catch((err) => {

@@ -250,8 +250,14 @@ function isLikelyPhoneAttempt(text: string, digits: string, hasPending: boolean)
     return true;
   }
 
-  // Standalone single digit words only if the entire utterance is digit words
-  return tokens.every(t => WORD_TO_DIGIT[t] !== undefined || /^\d+$/.test(t));
+  // If fewer than 3 digits without pending digits:
+  // Only accept if explicit phone keywords are present (e.g. "my number is 5", "cell 2")
+  const hasPhoneKeyword = tokens.some(t => ['phone', 'number', 'cell', 'mobile', 'callback'].includes(t));
+  if (hasPhoneKeyword && digits.length >= 1) {
+    return true;
+  }
+
+  return false;
 }
 
 /**

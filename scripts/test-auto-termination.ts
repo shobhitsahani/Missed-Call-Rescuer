@@ -70,7 +70,9 @@ async function startTestServer(): Promise<void> {
 
     let stdout = '';
     serverProc.stdout?.on('data', (d) => {
-      stdout += d.toString();
+      const s = d.toString();
+      stdout += s;
+      console.log('[server stdout]', s.trim());
       if (stdout.includes(`listening on http://localhost:${TEST_PORT}`)) {
         resolve();
       }

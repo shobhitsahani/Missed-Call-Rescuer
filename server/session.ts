@@ -9,6 +9,7 @@ import { notifyCallSummary } from './notify';
 import { isValidVoiceId } from '../src/lib/voices';
 import { checkCallBudget, MAX_CALL_SECONDS } from './security';
 import { PhoneStatus, isPhoneRefusal, extractPhoneFromUtterance, maskPhone } from './phone';
+import { isCustomerUnavailable, validateCallbackTime, sanitizeTtsText } from './validation';
 
 export interface SessionTurn {
   role: string;
@@ -45,6 +46,13 @@ export interface SessionBusiness {
   [key: string]: unknown;
 }
 
+export type ConversationState =
+  | 'GREETING'
+  | 'ACTIVE'
+  | 'AWAITING_CALLBACK_TIME'
+  | 'WRAPPING_UP'
+  | 'COMPLETED';
+
 export interface Session {
   id: string;
   ws: WebSocket | null;
@@ -57,6 +65,11 @@ export interface Session {
   pendingPhoneDigits: string | null;
   lastPhonePromptTurn: number;
   state: string;
+  conversationState: ConversationState;
+  isUnavailable?: boolean;
+  preferredCallbackTime?: string | null;
+  lastCustomerText?: string;
+  lastCustomerTextTime?: number;
   turns: SessionTurn[];
   turnOrder: number;
   generating: boolean;
@@ -256,20 +269,45 @@ function extractNextChunk(buf: string, isFirst: boolean): { chunk: string; remai
 }
 
 function send(session: Session, msg: Record<string, unknown>) {
+  if (session.ended && msg.type !== 'state') return;
   if (session.ws && session.ws.readyState === 1) {
     try { session.ws.send(JSON.stringify(msg)); } catch {}
   }
 }
 
 function sendBinary(session: Session, data: Uint8Array) {
+  if (session.ended) return;
   if (session.ws && session.ws.readyState === 1) {
     try { session.ws.send(data, { binary: true }); } catch {}
   }
 }
 
+function clearSilenceTimer(session: Session) {
+  if (session.silenceTimer) {
+    clearTimeout(session.silenceTimer);
+    session.silenceTimer = null;
+  }
+}
+
+function resetSilenceTimer(session: Session) {
+  clearSilenceTimer(session);
+  if (session.ended || session.finalizing) return;
+  session.silenceTimer = setTimeout(() => {
+    if (!session.ended && !session.finalizing && session.state === 'LISTENING') {
+      console.log(`[session ${session.id}] Silence timeout triggered after 45s of inactivity`);
+      void endSession(session, 'silence_timeout');
+    }
+  }, 45000);
+}
+
 function setState(session: Session, state: string) {
   session.state = state;
   send(session, { type: 'state', state });
+  if (state === 'LISTENING') {
+    resetSilenceTimer(session);
+  } else {
+    clearSilenceTimer(session);
+  }
 }
 
 function addTurn(session: Session, role: string, text: string, interrupted = false, deferDb = false) {
@@ -460,6 +498,9 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
     pendingPhoneDigits: null,
     lastPhonePromptTurn: 0,
     state: 'GREETING',
+    conversationState: 'GREETING',
+    isUnavailable: false,
+    preferredCallbackTime: null,
     turns: [],
     turnOrder: 0,
     generating: false,
@@ -623,14 +664,25 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
   if (session.ended || session.finalizing) return;
   text = (text || '').trim();
   if (!text) return;
-  if (session.generating) {
-    // drop overlapping utterances to avoid garbled turns
+
+  // Deduplicate rapid identical customer utterances (e.g. duplicate network events or repeated STT frames)
+  const now = Date.now();
+  if (session.lastCustomerText && session.lastCustomerText === text && now - (session.lastCustomerTextTime || 0) < 1500) {
+    console.log(`[session ${session.id}] Deduplicated rapid customer utterance: "${text}"`);
     return;
+  }
+  session.lastCustomerText = text;
+  session.lastCustomerTextTime = now;
+
+  if (session.generating) {
+    // Customer spoke over the agent: cancel the current reply
+    bargeIn(session);
   }
 
   const t_turn_end = Date.now();
 
   if (detectOptOut(text)) {
+    session.conversationState = 'WRAPPING_UP';
     session.finalizing = true;
     session.pendingEndReason = 'opted_out';
     addTurn(session, 'customer', text, false);
@@ -646,6 +698,7 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
     return;
   }
   if (detectWrongNumber(text)) {
+    session.conversationState = 'WRAPPING_UP';
     session.finalizing = true;
     session.pendingEndReason = 'wrong_number';
     addTurn(session, 'customer', text, false);
@@ -660,6 +713,85 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
     scheduleFinalization(session, 'wrong_number', durationMs);
     return;
   }
+
+  // Conversation State Machine: Customer Unavailability & Callback Time Handling
+  if (session.conversationState === 'AWAITING_CALLBACK_TIME') {
+    addTurn(session, 'customer', text, false);
+    const cb = validateCallbackTime(text);
+    let reply = '';
+    if (cb.isValid && cb.timeText) {
+      session.preferredCallbackTime = cb.timeText;
+      reply = `Thank you. Our team will review your preferred callback time and follow up with you. Have a great day! [CALL_COMPLETE]`;
+    } else if (cb.isFlexible) {
+      session.preferredCallbackTime = 'flexible / anytime';
+      reply = `Understood. Our team will follow up with you as soon as possible. Have a great day! [CALL_COMPLETE]`;
+    } else {
+      session.preferredCallbackTime = 'not specified';
+      reply = `Understood. Our team will follow up with you. Have a great day! [CALL_COMPLETE]`;
+    }
+
+    session.conversationState = 'WRAPPING_UP';
+    session.finalizing = true;
+    session.pendingEndReason = 'customer_unavailable';
+    const cleanSpeak = sanitizeTtsText(reply);
+    session.state = 'SPEAKING';
+    session.currentAgentText = cleanSpeak;
+    session.agentSpeakingStartTime = Date.now();
+    send(session, { type: 'state', state: 'SPEAKING' });
+    const speakRes = await speakSentence(session, cleanSpeak, () => {});
+    addTurn(session, 'agent', cleanSpeak, false);
+    const durationMs = Math.round((speakRes.pcmBytes || 0) / 48);
+    scheduleFinalization(session, 'customer_unavailable', durationMs);
+    return;
+  }
+
+  const isGreetingTurn = session.conversationState === 'GREETING';
+  if (isCustomerUnavailable(text, isGreetingTurn)) {
+    session.isUnavailable = true;
+    addTurn(session, 'customer', text, false);
+
+    // If customer already stated callback time in this same turn (e.g. "I'm busy, call me tomorrow at 2 PM")
+    const cb = validateCallbackTime(text);
+    if (cb.isValid && cb.timeText) {
+      session.conversationState = 'WRAPPING_UP';
+      session.finalizing = true;
+      session.pendingEndReason = 'customer_unavailable';
+      let reply = '';
+      if (cb.isFlexible) {
+        session.preferredCallbackTime = 'flexible / anytime';
+        reply = `Understood. Our team will follow up with you as soon as possible. Have a great day! [CALL_COMPLETE]`;
+      } else {
+        session.preferredCallbackTime = cb.timeText;
+        reply = `Understood. I've noted that for our team. We'll follow up with you around ${cb.timeText}. Have a great day! [CALL_COMPLETE]`;
+      }
+      const cleanSpeak = sanitizeTtsText(reply);
+      session.state = 'SPEAKING';
+      session.currentAgentText = cleanSpeak;
+      session.agentSpeakingStartTime = Date.now();
+      send(session, { type: 'state', state: 'SPEAKING' });
+      const speakRes = await speakSentence(session, cleanSpeak, () => {});
+      addTurn(session, 'agent', cleanSpeak, false);
+      const durationMs = Math.round((speakRes.pcmBytes || 0) / 48);
+      scheduleFinalization(session, 'customer_unavailable', durationMs);
+      return;
+    }
+
+    // Customer is unavailable and has not provided callback time yet: ask for preferred callback time
+    session.conversationState = 'AWAITING_CALLBACK_TIME';
+    const askTime = "Understood. When would be a good time for our team to call you back?";
+    session.state = 'SPEAKING';
+    session.currentAgentText = askTime;
+    session.agentSpeakingStartTime = Date.now();
+    send(session, { type: 'state', state: 'SPEAKING' });
+    await speakSentence(session, askTime, () => {});
+    addTurn(session, 'agent', askTime, false);
+    if (!session.ended && !session.finalizing) {
+      setState(session, 'LISTENING');
+    }
+    return;
+  }
+
+  session.conversationState = 'ACTIVE';
 
   // 1. Phone refusal check
   if (session.phoneStatus !== 'verified' && session.phoneStatus !== 'validated' && session.phoneStatus !== 'confirmed') {
@@ -725,6 +857,9 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
     verifiedCallerPhone: session.verifiedCallerPhone,
     collectedPhone: session.collectedPhone,
     turnCount: customerTurnCount,
+    customerUnavailable: session.isUnavailable,
+    callbackTime: session.preferredCallbackTime,
+    endReason: session.pendingEndReason,
   };
 
   setState(session, 'THINKING');
@@ -884,8 +1019,8 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
       continue;
     }
     let chunk = chunkQueue.shift()!;
-    // Strip [CALL_COMPLETE] token from chunks so TTS never synthesizes it
-    chunk = chunk.replace(/\[CALL_COMPLETE\]/gi, '').trim();
+    // Strip [CALL_COMPLETE] token and sanitize markdown markup so TTS never speaks symbols
+    chunk = sanitizeTtsText(chunk);
     if (!chunk) continue;
 
     // Guard against redundant phone requests if phone is already verified or collected
@@ -952,6 +1087,7 @@ export async function handleCustomerUtterance(session: Session, text: string, tu
 export function scheduleFinalization(session: Session, reason: string, audioDurationMs = 0) {
   if (session.ended) return;
   session.finalizing = true;
+  session.conversationState = 'WRAPPING_UP';
   session.pendingEndReason = reason;
   setState(session, 'FINALIZING');
 
@@ -1042,6 +1178,7 @@ export async function endSession(session: Session, reason: string) {
   if (session.ended) return;
   session.ended = true;
   session.finalizing = true;
+  session.conversationState = 'COMPLETED';
   if (session.terminationTimer) {
     clearTimeout(session.terminationTimer);
     session.terminationTimer = null;
@@ -1054,7 +1191,7 @@ export async function endSession(session: Session, reason: string) {
     clearTimeout(session.disconnectTimer);
     session.disconnectTimer = null;
   }
-  if (session.silenceTimer) clearTimeout(session.silenceTimer);
+  clearSilenceTimer(session);
   if (session.maxTimer) clearTimeout(session.maxTimer);
   if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
   session.cancelGeneration = true;
@@ -1062,13 +1199,14 @@ export async function endSession(session: Session, reason: string) {
   if (session.abortController) {
     try { session.abortController.abort(); } catch {}
   }
+  try { session.tts.cancel(); } catch {}
 
   setState(session, 'ENDING');
   try {
     db.prepare('UPDATE calls SET end_time=?, end_reason=?, latency_json=?, usage_json=? WHERE id=?')
       .run(new Date().toISOString(), reason, JSON.stringify(session.latencies), JSON.stringify(session.usage), session.id);
     if (session.missedCallId) {
-      const status = reason === 'opted_out' ? 'opted_out' : 'done';
+      const status = reason === 'opted_out' ? 'opted_out' : reason === 'customer_unavailable' ? 'unavailable' : 'done';
       db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run(status, session.missedCallId);
     }
   } catch (dbErr) {
@@ -1092,6 +1230,9 @@ export async function endSession(session: Session, reason: string) {
     verifiedCallerPhone: session.verifiedCallerPhone,
     collectedPhone: session.collectedPhone,
     turnCount: session.turns.filter((t: SessionTurn) => t.role === 'customer').length,
+    customerUnavailable: session.isUnavailable || reason === 'customer_unavailable',
+    callbackTime: session.preferredCallbackTime,
+    endReason: reason,
   };
 
   let parsed: llm.StructuredSummary | null = null;
@@ -1116,14 +1257,24 @@ export async function endSession(session: Session, reason: string) {
   const isUnavailable = summaryStatus === 'unavailable' || !parsed;
   const finalStatus = isUnavailable ? 'unavailable' : 'completed';
 
+  const knownContact = session.collectedPhone || session.verifiedCallerPhone || 'not provided';
+  const knownCallbackTime = session.preferredCallbackTime || 'not specified';
+  const isCustomerUnavail = session.isUnavailable || reason === 'customer_unavailable';
+  const defaultReason = isCustomerUnavail
+    ? 'Customer unavailable for callback'
+    : 'Summary unavailable';
+  const defaultAction = isCustomerUnavail
+    ? `Call customer back${knownCallbackTime !== 'not specified' ? ' at ' + knownCallbackTime : ''}${knownContact !== 'not provided' ? ' at ' + knownContact : ''}.`
+    : 'Manual follow-up needed';
+
   const summary = {
     id: summaryId,
     callId: session.id,
-    reason: isUnavailable ? 'Summary unavailable' : parsed!.reason,
+    reason: isUnavailable ? defaultReason : parsed!.reason,
     urgency: isUnavailable ? '' : parsed!.urgency,
-    preferred_time: isUnavailable ? 'not specified' : parsed!.preferred_time,
-    contact_details: isUnavailable ? 'not provided' : parsed!.contact_details,
-    suggested_action: isUnavailable ? 'Manual follow-up needed' : parsed!.suggested_action,
+    preferred_time: isUnavailable ? knownCallbackTime : (session.preferredCallbackTime || parsed!.preferred_time),
+    contact_details: isUnavailable ? knownContact : parsed!.contact_details,
+    suggested_action: isUnavailable ? defaultAction : parsed!.suggested_action,
     short_summary: isUnavailable ? 'Structured summary could not be extracted.' : parsed!.short_summary,
     sentiment: isUnavailable ? '' : parsed!.sentiment,
     status: finalStatus,

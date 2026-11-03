@@ -1,6 +1,58 @@
+import { spawn, ChildProcess } from 'child_process';
+
+let serverProc: ChildProcess | null = null;
+
+async function ensureServerRunning(base: string): Promise<void> {
+  try {
+    const res = await fetch(`${base}/api/business`);
+    if (res.ok) return;
+  } catch {}
+
+  const url = new URL(base);
+  const port = url.port || '4000';
+
+  return new Promise((resolve, reject) => {
+    serverProc = spawn('npx', ['tsx', 'server/index.ts'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        PORT: port,
+        NODE_ENV: 'test',
+        ADMIN_TOKEN: 'test-admin-token',
+        MAX_CALLS_PER_DAY: '500',
+      },
+      shell: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    serverProc.stdout?.on('data', (d) => {
+      stdout += d.toString();
+      if (stdout.includes(`listening on http://localhost:${port}`)) {
+        resolve();
+      }
+    });
+
+    serverProc.on('error', reject);
+    setTimeout(() => reject(new Error('Server start timed out after 12s')), 12000);
+  });
+}
+
+async function stopServer() {
+  if (serverProc) {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(serverProc.pid), '/f', '/t']);
+    } else {
+      serverProc.kill('SIGTERM');
+    }
+    serverProc = null;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
 
 async function runTests() {
   const base = process.env.API_BASE || 'http://localhost:4000';
+  await ensureServerRunning(base);
   console.log(`Running settings validation tests against ${base}...`);
 
   // 1. GET /api/business
@@ -61,6 +113,28 @@ async function runTests() {
   if (badServicesRes.status !== 400) throw new Error(`Expected 400 for too many services`);
   console.log('✓ Rejected > 20 services list');
 
+  // 6b. Validation: Reject invalid language code
+  const badLangRes = await fetch(`${base}/api/business`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Valid Name', voice: 'aai-jane', timezone: 'Asia/Kolkata', language: 'invalid!language@' }),
+  });
+  if (badLangRes.status !== 400) throw new Error(`Expected 400 for bad language code`);
+  const badLangData = await badLangRes.json();
+  if (!badLangData.errors?.language) throw new Error('Expected field error for language');
+  console.log('✓ Rejected invalid language code with field error:', badLangData.errors.language);
+
+  // 6c. Persistence: Save valid language and verify retrieval
+  const saveLangRes = await fetch(`${base}/api/business`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Valid Name', voice: 'aai-jane', timezone: 'Asia/Kolkata', language: 'en' }),
+  });
+  if (!saveLangRes.ok) throw new Error(`Expected 200 for valid language save`);
+  const saveLangData = await saveLangRes.json();
+  if (saveLangData.language !== 'en') throw new Error(`Expected saved language to be 'en', got ${saveLangData.language}`);
+  console.log('✓ Successfully validated and persisted language setting');
+
   // 7. Reset to default
   const resetRes = await fetch(`${base}/api/business/reset`, { method: 'POST' });
   if (!resetRes.ok) throw new Error(`Reset failed: ${resetRes.status}`);
@@ -71,7 +145,9 @@ async function runTests() {
   console.log('ALL SETTINGS VALIDATION TESTS PASSED!');
 }
 
-runTests().catch((err) => {
-  console.error('Test failed:', err);
-  process.exit(1);
-});
+runTests()
+  .catch((err) => {
+    console.error('Test failed:', err);
+    process.exit(1);
+  })
+  .finally(() => stopServer());

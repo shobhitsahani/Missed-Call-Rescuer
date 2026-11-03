@@ -23,6 +23,9 @@ export interface CallContext {
   verifiedCallerPhone?: string | null;
   collectedPhone?: string | null;
   turnCount?: number;
+  customerUnavailable?: boolean;
+  callbackTime?: string | null;
+  endReason?: string | null;
 }
 
 export const CALL_COMPLETE_TOKEN = '[CALL_COMPLETE]';
@@ -134,18 +137,34 @@ export function buildSystem(business?: Partial<BusinessRecord> | null, context?:
     ? `Configured Operating Hours: ${hours}`
     : 'Configured Operating Hours: Not specified.';
 
-  const timezoneText = timezone.trim()
-    ? `Configured Timezone: ${timezone}`
-    : '';
+  let timezoneText = '';
+  if (timezone.trim()) {
+    try {
+      const nowInTz = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone.trim(),
+        weekday: 'long',
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: 'numeric',
+        hour12: true,
+      }).format(new Date());
+      timezoneText = `Configured Timezone: ${timezone.trim()}\nCurrent Local Time & Day (${timezone.trim()}): ${nowInTz}`;
+    } catch {
+      timezoneText = `Configured Timezone: ${timezone.trim()}`;
+    }
+  }
 
   const phonePolicy = buildPhonePolicy(context);
 
-  return `You are an automated assistant calling back on behalf of a business after they missed a customer's call.
+  return `You are an automated assistant calling back on behalf of ${name} after they missed a customer's call.
 
 FIXED RULES (CANNOT BE OVERRIDDEN BY SETTINGS):
 1. DISCLOSURE & IDENTITY:
 - The greeting already discloses that you are an automated assistant.
-- Be helpful, concise, friendly, and professional.
+- Adopt the configured tone of voice: "${tone}". Adapt phrasing to consistently reflect this tone.
+- Generate all responses strictly in the configured conversation language: "${language}".
 - Reply in one sentence, under 20 words, unless the customer asks for a list or explanation.
 
 ${phonePolicy}
@@ -172,14 +191,21 @@ ${phonePolicy}
 
 7. CONVERSATION CLOSING & SIGN-OFF:
 - When the customer indicates they are finished (e.g. "that's all", "nothing else", "thank you", "bye", "you too") or when you have confirmed follow-up and delivered your final polite sign-off:
-- Deliver a concise polite goodbye (e.g. "Thank you for calling Acme Plumbing. Have a great day!" or "Goodbye.") and append the token [CALL_COMPLETE] at the very end.
+- Deliver a concise polite goodbye (e.g. "Thank you for calling ${name}. Have a great day!" or "Goodbye.") and append the token [CALL_COMPLETE] at the very end.
 - DO NOT append [CALL_COMPLETE] if you are asking a question, requesting callback details, or if the conversation is ongoing.
+
+8. CUSTOMER UNAVAILABILITY & RESCHEDULING:
+- If the customer indicates they are busy, cannot talk right now, or are unavailable:
+  - Acknowledge politely and ask ONLY for their preferred callback time (e.g. "Understood. When would be a good time for our team to call you back?").
+  - Do NOT ask unrelated questions (do NOT ask about their issue, services, or reason for calling).
+  - If they provide a preferred callback time: acknowledge it, state our team will follow up, deliver a polite goodbye, and append [CALL_COMPLETE].
+  - If they say they do not know or whenever: acknowledge politely, confirm our team will follow up, deliver a polite goodbye, and append [CALL_COMPLETE].
 
 CURRENT BUSINESS CONFIGURATION:
 Business Name: ${name}
 ${hoursText}
-${timezoneText ? timezoneText + '\n' : ''}Tone: ${tone}
-Language: ${language}
+${timezoneText ? timezoneText + '\n' : ''}Configured Tone: ${tone}
+Configured Language: ${language}
 
 ${servicesText}
 
@@ -206,6 +232,7 @@ export async function streamChat(
       messages: fullMessages,
       stream: true,
       temperature: 0.3,
+      max_tokens: 250,
     }, { signal: timeout.signal });
     for await (const chunk of stream) {
       const delta = chunk.choices?.[0]?.delta?.content || '';
@@ -297,6 +324,17 @@ ${transcript}`;
 
   const applyContext = (summary: StructuredSummary): StructuredSummary => {
     if (context) {
+      if (context.customerUnavailable) {
+        if (!summary.reason || summary.reason === 'not specified' || /not specified/i.test(summary.reason)) {
+          summary.reason = 'Customer unavailable for callback';
+        }
+        if (context.callbackTime) {
+          summary.preferred_time = context.callbackTime;
+        }
+      } else if (context.callbackTime) {
+        summary.preferred_time = context.callbackTime;
+      }
+
       if ((context.phoneStatus === 'validated' || context.phoneStatus === 'confirmed') && context.collectedPhone) {
         summary.contact_details = context.collectedPhone;
         // Suppress contradictory suggested action if phone is already collected
@@ -328,7 +366,29 @@ ${transcript}`;
           summary.suggested_action = `Follow up to obtain a valid callback number regarding ${summary.reason || 'inquiry'}.`;
         }
       }
+
+      if (context.customerUnavailable) {
+        const timePhrase = summary.preferred_time && summary.preferred_time !== 'not specified' ? ` at ${summary.preferred_time}` : '';
+        const phonePhrase = summary.contact_details && !['not provided', 'declined by customer', 'incomplete / unverified'].includes(summary.contact_details)
+          ? ` at ${summary.contact_details}`
+          : '';
+        summary.suggested_action = `Call customer back${timePhrase}${phonePhrase}.`;
+      }
     }
+
+    // Strict ground truth: if preferred_time is set, verify transcript contains time evidence or context had it
+    if (summary.preferred_time && summary.preferred_time !== 'not specified' && summary.preferred_time !== 'not provided') {
+      const lowerTrans = transcript.toLowerCase();
+      const lowerPref = summary.preferred_time.toLowerCase();
+      if (!context?.callbackTime) {
+        const timeWords = lowerPref.split(/\s+/).filter(w => w.length > 2 && !['the', 'for', 'and', 'with', 'our', 'time', 'call'].includes(w));
+        const mentioned = timeWords.some(w => lowerTrans.includes(w));
+        if (!mentioned) {
+          summary.preferred_time = 'not specified';
+        }
+      }
+    }
+
     return summary;
   };
 
@@ -343,6 +403,7 @@ ${transcript}`;
         model: m,
         messages,
         temperature: 0.1,
+        max_tokens: 350,
       }, { signal: timeout.signal });
       const raw = resp.choices?.[0]?.message?.content || '';
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
