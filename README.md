@@ -473,9 +473,18 @@ flowchart TD
 
 ---
 
+## Preview
+https://github.com/user-attachments/assets/db845b12-1042-4ed4-bbfa-b76e05401655
+
+---
+
 ## License & Credits
 
 - **License**: Released under the [MIT License](LICENSE).
 - **Speech-to-Text**: Powered by [AssemblyAI Streaming STT](https://www.assemblyai.com/) (`universal-3-6-pro`).
 - **Text-to-Speech**: Powered by [AssemblyAI Streaming TTS](https://www.assemblyai.com/) (`assemblyai-tts-1`).
 - **LLM Inference**: Powered by [Groq](https://groq.com/) (`qwen/qwen3.8-27b`).
+
+
+
+
