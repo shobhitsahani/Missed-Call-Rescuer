@@ -24,6 +24,7 @@ import db, { parseServices, parseFaqs, DEFAULT_BIZ } from './db';
 import { BUSINESS_PRESETS, DEFAULT_PRESET } from '../src/lib/presets';
 import * as events from './events';
 import * as sessionModule from './session';
+import { logLifecycle, logFailure, maskToken, LifecycleEvent } from './logger';
 import { ASSEMBLYAI_VOICES, isValidVoiceId } from '../src/lib/voices';
 import { pcmToWav } from './wav';
 import {
@@ -128,6 +129,8 @@ app.get('/api/call-token/:token', (req, res) => {
   if (token.startsWith('mc_') || !/^[a-f0-9]{32}$/i.test(token)) {
     return res.status(400).json({ error: 'Legacy or invalid IDs are not permitted. Please use a valid callback token.' });
   }
+
+  logLifecycle({ correlationId: token, event: 'session_requested' });
 
   interface MissedCallTokenRow {
     id: string;
@@ -655,6 +658,12 @@ app.post('/api/missed-calls/simulate', (req, res) => {
     source: rowSource,
   });
 
+  logLifecycle({
+    correlationId: token,
+    event: 'token_created',
+    data: { missedCallId: id, source: rowSource },
+  });
+
   res.json({
     missedCallId: id,
     jobId,
@@ -1026,16 +1035,22 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
   // Using the last value avoids trusting a client-supplied leading value.
   const ip = forwarded.length ? forwarded[forwarded.length - 1] : req.socket.remoteAddress || 'global';
 
+  logLifecycle({ correlationId: 'socket_connect', event: 'websocket_open', data: { ip } });
+
   ws.on('message', async (data, isBinary) => {
     if (isBinary) {
       if (session && session.stt && !session.ended && !session.finalizing) {
+        if (!session.firstCustomerAudioLogged) {
+          session.firstCustomerAudioLogged = true;
+          logLifecycle({ correlationId: session.id, event: 'first_customer_audio_received' });
+        }
         session.stt.sendAudio(data as Buffer);
         if (!session.usage.sttSeconds) session.usage.sttSeconds = 0;
         session.usage.sttSeconds += (data as Buffer).length / 32000;
       }
       return;
     }
-    let msg: { type?: string; token?: string; final?: boolean; text?: string; reason?: string };
+    let msg: { type?: string; token?: string; event?: string; final?: boolean; text?: string; reason?: string };
     try { msg = JSON.parse(data.toString()); } catch { return; }
     if (msg.type === 'join') {
       if (session && !session.ended) {
@@ -1050,7 +1065,7 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
       const joinLimit = checkRateLimit(`wsjoin:${ip}`, 10, 60000);
       if (!joinLimit.allowed) {
         ws.send(JSON.stringify({ type: 'error', message: 'Too many call join requests. Please wait a moment.' }));
-        ws.close();
+        ws.close(1008, 'Rate limit exceeded');
         return;
       }
 
@@ -1059,22 +1074,44 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
         // guessable missed-call database id.
         const started = await sessionModule.startSession(ws, msg.token);
         session = started;
-        if (closed && !started.ended) {
+        logLifecycle({
+          correlationId: started.id,
+          event: 'websocket_authenticated',
+          data: { token: maskToken(msg.token) },
+        });
+        if (closed && !started.ended && started.ws === ws) {
           await sessionModule.endSession(started, 'disconnect');
         }
       } catch (e: unknown) {
         const errMsg = e instanceof Error ? e.message : String(e);
+        logFailure({
+          correlationId: msg.token || 'unknown',
+          category: 'auth',
+          origin: 'backend',
+          message: errMsg,
+        });
         try { ws.send(JSON.stringify({ type: 'error', message: errMsg })); } catch {}
+        try { ws.close(1008, errMsg); } catch {}
       }
       return;
     }
     if (!session) return;
-    if (msg.type === 'transcript' && msg.final) {
+    if (msg.type === 'client_event' && msg.event) {
+      const allowedEvents = new Set([
+        'microphone_permission_granted',
+        'audioworklet_ready',
+        'audio_stream_started',
+        'assistant_audio_played',
+      ]);
+      if (allowedEvents.has(msg.event)) {
+        logLifecycle({
+          correlationId: session.id,
+          event: msg.event as LifecycleEvent,
+        });
+      }
+    } else if (msg.type === 'transcript' && msg.final) {
       if (session.ended || session.finalizing) return;
       try {
-        if (session.generating) {
-          sessionModule.bargeIn(session);
-        }
         await sessionModule.handleCustomerUtterance(session, msg.text || '');
       } catch (err) {
         console.error('[ws] utterance handling failed:', err instanceof Error ? err.message : String(err));
@@ -1085,6 +1122,7 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
       }
     } else if (msg.type === 'playback_complete') {
       if (!session.ended) {
+        logLifecycle({ correlationId: session.id, event: 'assistant_audio_played' });
         sessionModule.handlePlaybackComplete(session);
       }
     } else if (msg.type === 'end') {
@@ -1099,10 +1137,22 @@ wss.on('connection', (ws, req: http.IncomingMessage) => {
   });
   ws.on('error', (err) => {
     console.error('[ws] socket error:', err.message);
+    logFailure({
+      correlationId: session?.id || 'unknown',
+      category: 'network',
+      origin: 'backend',
+      message: err.message,
+    });
   });
-  ws.on('close', () => {
+  ws.on('close', (code, reasonBuf) => {
     closed = true;
-    if (session && !session.ended) {
+    const reasonStr = reasonBuf ? reasonBuf.toString() : '';
+    logLifecycle({
+      correlationId: session?.id || 'unknown',
+      event: 'websocket_closed',
+      data: { code, reason: reasonStr },
+    });
+    if (session && !session.ended && session.ws === ws) {
       sessionModule.handleSocketDisconnect(session);
     }
   });

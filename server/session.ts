@@ -10,6 +10,7 @@ import { isValidVoiceId } from '../src/lib/voices';
 import { checkCallBudget, MAX_CALL_SECONDS } from './security';
 import { PhoneStatus, isPhoneRefusal, extractPhoneFromUtterance, maskPhone } from './phone';
 import { isCustomerUnavailable, validateCallbackTime, sanitizeTtsText } from './validation';
+import { logLifecycle, logFailure } from './logger';
 
 export interface SessionTurn {
   role: string;
@@ -96,6 +97,11 @@ export interface Session {
   fallbackTerminationTimer?: NodeJS.Timeout | null;
   playbackCompleted?: boolean;
   finalAudioSent?: boolean;
+  wsPingTimer?: NodeJS.Timeout | null;
+  firstCustomerAudioLogged?: boolean;
+  firstTranscriptLogged?: boolean;
+  firstLlmLogged?: boolean;
+  firstTtsAudioLogged?: boolean;
 }
 
 export const sessions = new Map<string, Session>();
@@ -268,8 +274,10 @@ function extractNextChunk(buf: string, isFirst: boolean): { chunk: string; remai
   }
 }
 
+const TERMINAL_MESSAGE_TYPES = new Set(['state', 'summary', 'error', 'agent_audio_end']);
+
 function send(session: Session, msg: Record<string, unknown>) {
-  if (session.ended && msg.type !== 'state') return;
+  if (session.ended && !TERMINAL_MESSAGE_TYPES.has(String(msg.type))) return;
   if (session.ws && session.ws.readyState === 1) {
     try { session.ws.send(JSON.stringify(msg)); } catch {}
   }
@@ -345,6 +353,7 @@ async function speakSentence(
   session.agentSpeakingStartTime = Date.now();
   send(session, { type: 'agent_text', text: sentence });
   session.usage.ttsChars += sentence.length;
+  logLifecycle({ correlationId: session.id, event: 'tts_started', data: { chars: sentence.length } });
 
   let totalBytes = 0;
   const trySpeak = async (): Promise<boolean> => {
@@ -356,6 +365,10 @@ async function speakSentence(
       }
       if (firstChunk) {
         firstChunk = false;
+        if (!session.firstTtsAudioLogged) {
+          session.firstTtsAudioLogged = true;
+          logLifecycle({ correlationId: session.id, event: 'first_tts_audio_received', data: { bytes: chunk.byteLength || chunk.length || 0 } });
+        }
         if (onFirstAudio) onFirstAudio();
       }
       totalBytes += chunk.byteLength || chunk.length || 0;
@@ -384,6 +397,22 @@ async function speakSentence(
       return { ok: false, pcmBytes: totalBytes };
     }
   }
+}
+
+export function isLatestSessionForMissedCall(session: Session): boolean {
+  if (!session.missedCallId) return false;
+  for (const s of sessions.values()) {
+    if (s.missedCallId === session.missedCallId && s.id !== session.id && !s.ended) {
+      return false;
+    }
+  }
+  try {
+    const latest = db.prepare('SELECT id FROM calls WHERE missed_call_id = ? ORDER BY start_time DESC, rowid DESC LIMIT 1').get(session.missedCallId) as { id: string } | undefined;
+    if (latest && latest.id !== session.id) {
+      return false;
+    }
+  } catch {}
+  return true;
 }
 
 export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) {
@@ -459,6 +488,13 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
     }
   }
 
+  if (ws.readyState !== 1) {
+    if (missed) {
+      try { db.prepare('UPDATE missed_calls SET call_started_at = NULL, status = ? WHERE id = ?').run('queued', missed.id); } catch {}
+    }
+    throw new Error('Client disconnected before session start');
+  }
+
   const business = rowToBiz(getBusinessRow());
   const callId = uuidv4();
   const isCallerVerified = Boolean(
@@ -522,6 +558,16 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
   };
   sessions.set(callId, session);
 
+  logLifecycle({ correlationId: callId, event: 'session_initialized', data: { businessId, missedCallId: missed?.id } });
+  logLifecycle({ correlationId: callId, event: 'assemblyai_connecting', data: { ttsVoice: voiceId, sttProvider: STT_PROVIDER } });
+
+  // Web browser keepalive ping to prevent proxy drops (Render/Cloudflare/reverse proxies)
+  session.wsPingTimer = setInterval(() => {
+    if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+      try { session.ws.ping(); } catch {}
+    }
+  }, 20000);
+
   // Inform client of session config and STT provider
   send(session, { type: 'config', sttProvider: STT_PROVIDER });
 
@@ -532,12 +578,30 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
   } catch (err: unknown) {
     const errorMsg = sanitizeErrorMsg(err instanceof Error ? err.message : String(err));
     console.error(`[session ${session.id}] stage=tts_connect error=${errorMsg}`);
+    logFailure({
+      correlationId: session.id,
+      category: 'provider',
+      origin: 'external_provider',
+      message: errorMsg,
+      state: session.state,
+    });
     send(session, {
       type: 'error',
       code: 'tts_connect',
       message: `Could not connect voice assistant audio: ${errorMsg}`,
     });
-    await endSession(session, 'error');
+    if (session.missedCallId && isLatestSessionForMissedCall(session)) {
+      try { db.prepare('UPDATE missed_calls SET call_started_at = NULL, status = ? WHERE id = ?').run('queued', session.missedCallId); } catch {}
+    }
+    await endSession(session, 'init_failed');
+    return session;
+  }
+
+  if (ws.readyState !== 1) {
+    if (session.missedCallId && isLatestSessionForMissedCall(session)) {
+      try { db.prepare('UPDATE missed_calls SET call_started_at = NULL, status = ? WHERE id = ?').run('queued', session.missedCallId); } catch {}
+    }
+    await endSession(session, 'disconnect');
     return session;
   }
 
@@ -573,6 +637,10 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
       session.stt?.clearRecentAudio();
       const cleaned = (text || '').trim();
       if (!cleaned) return;
+      if (!session.firstTranscriptLogged) {
+        session.firstTranscriptLogged = true;
+        logLifecycle({ correlationId: session.id, event: 'first_transcript_received', data: { textLength: cleaned.length } });
+      }
       send(session, { type: 'partial', text: '' });
       send(session, { type: 'customer_transcript', text: cleaned });
       if (session.generating) {
@@ -601,6 +669,13 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
       if (session.ended) return;
       const errorMsg = sanitizeErrorMsg(err?.message);
       console.error(`[session ${session.id}] stage=stt_runtime error=${errorMsg}`);
+      logFailure({
+        correlationId: session.id,
+        category: 'provider',
+        origin: 'external_provider',
+        message: errorMsg,
+        state: session.state,
+      });
       send(session, {
         type: 'error',
         code: 'stt_runtime',
@@ -614,14 +689,34 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
     } catch (err: unknown) {
       const errorMsg = sanitizeErrorMsg(err instanceof Error ? err.message : String(err));
       console.error(`[session ${session.id}] stage=stt_connect error=${errorMsg}`);
+      logFailure({
+        correlationId: session.id,
+        category: 'provider',
+        origin: 'external_provider',
+        message: errorMsg,
+        state: session.state,
+      });
       send(session, {
         type: 'error',
         code: 'stt_connect',
         message: `Could not connect speech recognition: ${errorMsg}`,
       });
-      await endSession(session, 'error');
+      if (session.missedCallId && isLatestSessionForMissedCall(session)) {
+        try { db.prepare('UPDATE missed_calls SET call_started_at = NULL, status = ? WHERE id = ?').run('queued', session.missedCallId); } catch {}
+      }
+      await endSession(session, 'init_failed');
       return session;
     }
+  }
+
+  logLifecycle({ correlationId: callId, event: 'assemblyai_ready' });
+
+  if (ws.readyState !== 1) {
+    if (session.missedCallId && isLatestSessionForMissedCall(session)) {
+      try { db.prepare('UPDATE missed_calls SET call_started_at = NULL, status = ? WHERE id = ?').run('queued', session.missedCallId); } catch {}
+    }
+    await endSession(session, 'disconnect');
+    return session;
   }
 
   session.maxTimer = setTimeout(() => endSession(session, 'timeout'), MAX_CALL_SECONDS * 1000);
@@ -644,12 +739,22 @@ export async function startSession(ws: WebSocket, missedCallTokenOrId?: string) 
   } catch (err: unknown) {
     const errorMsg = sanitizeErrorMsg(err instanceof Error ? err.message : String(err));
     console.error(`[session ${session.id}] stage=greeting error=${errorMsg}`);
+    logFailure({
+      correlationId: session.id,
+      category: 'provider',
+      origin: 'external_provider',
+      message: errorMsg,
+      state: session.state,
+    });
     send(session, {
       type: 'error',
       code: 'greeting',
       message: `Could not start assistant greeting: ${errorMsg}`,
     });
-    await endSession(session, 'error');
+    if (session.missedCallId && isLatestSessionForMissedCall(session)) {
+      try { db.prepare('UPDATE missed_calls SET call_started_at = NULL, status = ? WHERE id = ?').run('queued', session.missedCallId); } catch {}
+    }
+    await endSession(session, 'init_failed');
     return session;
   }
 
@@ -1194,6 +1299,10 @@ export async function endSession(session: Session, reason: string) {
   clearSilenceTimer(session);
   if (session.maxTimer) clearTimeout(session.maxTimer);
   if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
+  if (session.wsPingTimer) {
+    clearInterval(session.wsPingTimer);
+    session.wsPingTimer = null;
+  }
   session.cancelGeneration = true;
   session.generating = false;
   if (session.abortController) {
@@ -1205,9 +1314,14 @@ export async function endSession(session: Session, reason: string) {
   try {
     db.prepare('UPDATE calls SET end_time=?, end_reason=?, latency_json=?, usage_json=? WHERE id=?')
       .run(new Date().toISOString(), reason, JSON.stringify(session.latencies), JSON.stringify(session.usage), session.id);
-    if (session.missedCallId) {
-      const status = reason === 'opted_out' ? 'opted_out' : reason === 'customer_unavailable' ? 'unavailable' : 'done';
-      db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run(status, session.missedCallId);
+    if (session.missedCallId && isLatestSessionForMissedCall(session)) {
+      const hasCustomerTurn = (session.turns || []).some((t: SessionTurn) => t.role === 'customer');
+      if (!hasCustomerTurn && (reason === 'init_failed' || reason === 'error' || (reason === 'disconnect' && session.turnOrder <= 1))) {
+        db.prepare('UPDATE missed_calls SET call_started_at = NULL, status = ? WHERE id = ?').run('queued', session.missedCallId);
+      } else {
+        const status = reason === 'opted_out' ? 'opted_out' : reason === 'customer_unavailable' ? 'unavailable' : 'done';
+        db.prepare('UPDATE missed_calls SET status=? WHERE id=?').run(status, session.missedCallId);
+      }
     }
   } catch (dbErr) {
     console.error(`[session ${session.id}] Failed to persist call end:`, dbErr);
@@ -1223,6 +1337,7 @@ export async function endSession(session: Session, reason: string) {
     try { await stt.close(); } catch {}
   }
   try { await session.tts.close(); } catch {}
+  logLifecycle({ correlationId: session.id, event: 'assemblyai_closed' });
 
   const transcript = session.turns.map((t: SessionTurn) => `${t.role === 'agent' ? 'Agent' : 'Customer'}: ${t.text}`).join('\n');
   const callContext: llm.CallContext = {
@@ -1238,19 +1353,24 @@ export async function endSession(session: Session, reason: string) {
   let parsed: llm.StructuredSummary | null = null;
   let raw = '';
   let summaryStatus: 'completed' | 'unavailable' = 'unavailable';
-  try {
-    const result = await withStageTimeout(
-      llm.summarize(transcript, session.business, callContext),
-      20000,
-      'Summary generation'
-    );
-    parsed = result.parsed;
-    raw = result.raw;
-    summaryStatus = result.status;
-  } catch (summaryErr) {
-    const msg = summaryErr instanceof Error ? summaryErr.message : String(summaryErr);
-    console.error(`[session ${session.id}] Summary generation failed:`, sanitizeErrorMsg(msg));
-    raw = 'Summary generation failed or timed out.';
+  if (callContext.turnCount === 0) {
+    summaryStatus = 'unavailable';
+    raw = reason === 'init_failed' ? 'Call initialization failed before connection.' : 'No customer interaction recorded.';
+  } else {
+    try {
+      const result = await withStageTimeout(
+        llm.summarize(transcript, session.business, callContext),
+        20000,
+        'Summary generation'
+      );
+      parsed = result.parsed;
+      raw = result.raw;
+      summaryStatus = result.status;
+    } catch (summaryErr) {
+      const msg = summaryErr instanceof Error ? summaryErr.message : String(summaryErr);
+      console.error(`[session ${session.id}] Summary generation failed:`, sanitizeErrorMsg(msg));
+      raw = 'Summary generation failed or timed out.';
+    }
   }
 
   const summaryId = uuidv4();
@@ -1303,6 +1423,16 @@ export async function endSession(session: Session, reason: string) {
   }, 500);
 
   sessions.delete(session.id);
+
+  logLifecycle({
+    correlationId: session.id,
+    event: 'session_terminated',
+    data: {
+      reason,
+      durationMs: Date.now() - session.startedAt,
+      turns: session.turns.length,
+    },
+  });
 
   // Public SSE carries only the call id. Phone numbers and tokens stay out of
   // broadcast payloads; the dashboard fetches details through its normal API.

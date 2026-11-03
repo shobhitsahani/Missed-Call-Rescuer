@@ -69,6 +69,10 @@ export default function CallPage() {
   const finalTimerRef = useRef<NodeJS.Timeout | null>(null);
   const stateRef = useRef(state);
   const transcriptBottomRef = useRef<HTMLDivElement | null>(null);
+  const hasSpecificErrorRef = useRef(false);
+  const audioStreamStartedRef = useRef(false);
+  const assistantPlayedLoggedRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
 
   useEffect(() => {
     stateRef.current = state;
@@ -244,6 +248,14 @@ export default function CallPage() {
     src.start(nextStartRef.current);
     nextStartRef.current += buf.duration;
     sourcesRef.current.push(src);
+
+    if (!assistantPlayedLoggedRef.current) {
+      assistantPlayedLoggedRef.current = true;
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: 'client_event', event: 'assistant_audio_played' })); } catch {}
+      }
+    }
     src.onended = () => {
       sourcesRef.current = sourcesRef.current.filter((s) => s !== src);
       if (finalAudioSentRef.current && sourcesRef.current.length === 0) {
@@ -345,9 +357,13 @@ export default function CallPage() {
     return ratio > 0.6;
   }
 
-  async function connect() {
+  async function connect(isAutoReconnect = false) {
     if (connectingRef.current) return;
     connectingRef.current = true;
+    if (!isAutoReconnect) {
+      reconnectAttemptsRef.current = 0;
+    }
+    hasSpecificErrorRef.current = false;
     endedRef.current = false;
     summaryReceivedRef.current = false;
     finalAudioSentRef.current = false;
@@ -392,6 +408,9 @@ export default function CallPage() {
           return;
         }
         mediaStreamRef.current = stream;
+        if (target === wsRef.current && target.readyState === WebSocket.OPEN) {
+          try { target.send(JSON.stringify({ type: 'client_event', event: 'microphone_permission_granted' })); } catch {}
+        }
 
         const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
         const micCtx = new AudioCtx();
@@ -401,6 +420,9 @@ export default function CallPage() {
         }
 
         await micCtx.audioWorklet.addModule('/audio-processor.js');
+        if (target === wsRef.current && target.readyState === WebSocket.OPEN) {
+          try { target.send(JSON.stringify({ type: 'client_event', event: 'audioworklet_ready' })); } catch {}
+        }
         const micSource = micCtx.createMediaStreamSource(stream);
         const workletNode = new AudioWorkletNode(micCtx, 'pcm-audio-processor', {
           processorOptions: { targetSampleRate: 16000, chunkSamples: 800 },
@@ -409,6 +431,10 @@ export default function CallPage() {
 
         workletNode.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
           if (target === wsRef.current && target.readyState === WebSocket.OPEN) {
+            if (!audioStreamStartedRef.current) {
+              audioStreamStartedRef.current = true;
+              try { target.send(JSON.stringify({ type: 'client_event', event: 'audio_stream_started' })); } catch {}
+            }
             target.send(event.data);
           }
         };
@@ -417,6 +443,7 @@ export default function CallPage() {
         setProgressMessage('Listening...');
       } catch (err: unknown) {
         if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+        hasSpecificErrorRef.current = true;
         try { target.close(); } catch {}
         if (target === wsRef.current) wsRef.current = null;
         connectingRef.current = false;
@@ -659,12 +686,13 @@ export default function CallPage() {
           break;
         case 'error':
           if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
+          hasSpecificErrorRef.current = true;
           setError(msg.message || 'An unexpected error occurred during the call.');
           break;
       }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event: CloseEvent) => {
       connectingRef.current = false;
       setStatus('closed');
       if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
@@ -673,12 +701,36 @@ export default function CallPage() {
         stopAllAudio();
         return;
       }
-      // Unexpected disconnect before the summary: release devices and return to
-      // the pre-call screen so the user can retry without a dead audio graph.
       releaseMedia();
       stopAllAudio();
       setStarted(false);
       setStatus('idle');
+
+      // If a specific error was received from backend or mic, preserve it
+      if (hasSpecificErrorRef.current) {
+        return;
+      }
+
+      // If close reason exists from backend
+      if (event.reason) {
+        hasSpecificErrorRef.current = true;
+        setError(event.reason);
+        return;
+      }
+
+      // Bounded reconnection if active call dropped unexpectedly
+      if (stateRef.current !== 'GREETING' && reconnectAttemptsRef.current < 3) {
+        reconnectAttemptsRef.current += 1;
+        setProgressMessage(`Connection interrupted. Reconnecting (attempt ${reconnectAttemptsRef.current}/3)...`);
+        const delay = reconnectAttemptsRef.current * 1000;
+        setTimeout(() => {
+          if (!endedRef.current && !summaryReceivedRef.current) {
+            void connect(true);
+          }
+        }, delay);
+        return;
+      }
+
       setError('The call connection closed before the assistant finished. Please try again.');
     };
 
@@ -724,6 +776,10 @@ export default function CallPage() {
   function retryCall() {
     endedRef.current = true;
     connectingRef.current = false;
+    hasSpecificErrorRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    audioStreamStartedRef.current = false;
+    assistantPlayedLoggedRef.current = false;
     if (connectionTimeoutRef.current) clearTimeout(connectionTimeoutRef.current);
     if (endFallbackRef.current) clearTimeout(endFallbackRef.current);
     releaseMedia();
@@ -829,7 +885,7 @@ export default function CallPage() {
               <div className="mt-8 w-full sm:w-auto">
                 <Button
                   size="lg"
-                  onClick={connect}
+                  onClick={() => void connect()}
                   disabled={validatingToken || !!tokenError}
                   className="w-full sm:w-auto px-8 py-6 text-base font-semibold gap-2 shadow-sm"
                 >

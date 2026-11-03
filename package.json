@@ -18,6 +18,7 @@
     "test:preview": "tsx scripts/test-preview-abort.ts",
     "test:reconnect": "tsx scripts/test-token-reconnect.ts",
     "test:termination": "tsx scripts/test-auto-termination.ts",
+    "test:lifecycle": "tsx scripts/test-connection-lifecycle.ts",
     "test:e2e": "tsx scripts/verify-live-voice-workflow.ts",
     "check:secrets": "tsx scripts/check-secrets.ts"
   },
